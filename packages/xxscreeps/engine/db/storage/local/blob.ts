@@ -88,15 +88,12 @@ export class BlobStorage extends AsyncDisposableResource {
 		} else if (this.path === null) {
 			return false;
 		} else {
-			// Ensure it actually exists on disk
+			// Ensure it actually exists on disk. The pending-deletion marker must not be set until
+			// `stat` succeeds, otherwise a concurrent `save` would try to unlink a file which was
+			// never written.
 			const path = Path.join(this.path, key);
 			try {
-				this.cache.set(key, {
-					saveId: this.saveId,
-					value: null,
-				});
 				await fs.stat(path);
-				return true;
 			} catch {
 				this.cache.set(key, {
 					saveId: -1,
@@ -104,6 +101,11 @@ export class BlobStorage extends AsyncDisposableResource {
 				});
 				return false;
 			}
+			this.cache.set(key, {
+				saveId: this.saveId,
+				value: null,
+			});
+			return true;
 		}
 	}
 
