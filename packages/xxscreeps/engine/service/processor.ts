@@ -9,6 +9,7 @@ import * as Async from 'xxscreeps/utility/async.js';
 import { negotiateResponderClient } from 'xxscreeps/utility/responder.js';
 import { clamp } from 'xxscreeps/utility/utility.js';
 import { handleInterruptSignal } from './signal.js';
+import { requestWorkerWake, runWorkerUntilIdle } from './wakeable-worker.js';
 import { checkIsEntry, getServiceChannel } from './index.js';
 
 const isEntry = checkIsEntry();
@@ -73,7 +74,10 @@ const workers = await Fn.pipe(
 			...client,
 			affinity: [] as string[],
 			checkAffinity: true,
+			currentTime: -Infinity,
+			finalizedTime: -Infinity,
 			idle: true,
+			pendingTime: undefined as number | undefined,
 			processed: [] as string[],
 		};
 	}));
@@ -108,6 +112,22 @@ async function *consumeRoomsQueue(worker: RoomWorker, time: number): AsyncIterab
 		}
 		break;
 	}
+}
+
+function startWorker(worker: RoomWorker, time: number) {
+	Async.mustNotReject(async () => {
+		await runWorkerUntilIdle(worker, time, async requestedTime => {
+			// Continue processing until the queue is empty. Empty queue may not mean processing is
+			// done, it also may mean we're waiting on runner intents. A notification received while
+			// this drain is unwinding forces another drain before sleeping. The requested time is
+			// carried with the wake because finalization can advance the tick during that window.
+			for await (const roomName of consumeRoomsQueue(worker, requestedTime)) {
+				worker.processed.push(roomName);
+				await worker.responder({ type: 'process', roomName, time: requestedTime });
+				log(`${roomName}, `);
+			}
+		});
+	});
 }
 
 // Initialize workers and rooms
@@ -148,20 +168,20 @@ loop: for await (const message of Async.breakable(processorMessages, breaker => 
 				}
 			}();
 
-			// Activate a worker per room
+			// Prefer idle workers, then latch enough busy workers to cover notifications that arrived
+			// while every worker was transitioning to idle.
+			const busyWorkers = workers.filter(worker => !worker.idle);
 			for (const worker of workers) {
-				if (worker.idle) {
-					worker.idle = false;
-					Async.mustNotReject(async () => {
-						// Continue processing until the queue is empty. Empty queue may not mean processing is
-						// done, it also may mean we're waiting on workers
-						for await (const roomName of consumeRoomsQueue(worker, time)) {
-							worker.processed.push(roomName);
-							await worker.responder({ type: 'process', roomName, time });
-							log(`${roomName}, `);
-						}
-						worker.idle = true;
-					});
+				if (worker.idle && requestWorkerWake(worker, time)) {
+					startWorker(worker, time);
+					if (--activations <= 0) {
+						break;
+					}
+				}
+			}
+			if (activations > 0) {
+				for (const worker of busyWorkers) {
+					requestWorkerWake(worker, time);
 					if (--activations <= 0) {
 						break;
 					}
@@ -181,6 +201,9 @@ loop: for await (const message of Async.breakable(processorMessages, breaker => 
 					await worker.responder({ type: 'finalize', time });
 				}
 			}));
+			for (const worker of workers) {
+				worker.finalizedTime = Math.max(worker.finalizedTime, time);
+			}
 			processing = false;
 			if (halted) {
 				// We check for interrupts at the end of tick
