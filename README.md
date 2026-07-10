@@ -133,8 +133,16 @@ npx xxscreeps manage bot add <name> <dir> --spawn <room>
 `<dir>` is a flat directory of a bot's built modules — `main.js` (CommonJS), `main.mjs` (ESM), or a
 `main.wasm`/`*.wasm` binary. Subdirectories are ignored, so point it at the build output (often `src`
 or `dist`), not the source tree of a bot that still needs compiling. `--spawn` also places the bot's
-first spawn, whether or not a server is running; drop it to just save the code. Open-source bots
-published for vanilla servers work as-is:
+first spawn, whether or not a server is running; drop it to just save the code.
+
+This repo ships **Apex**, a multi-room empire sample (economy, remotes, combat, expansion):
+
+```
+npx xxscreeps manage bot add apex samples/bots/apex --spawn W5N5
+```
+
+See [samples/bots/README.md](samples/bots/README.md). Open-source bots published for vanilla servers
+also work as-is:
 
 ```
 npm install screeps-bot-tooangel
