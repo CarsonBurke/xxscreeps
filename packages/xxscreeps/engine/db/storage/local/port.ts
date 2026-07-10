@@ -343,18 +343,33 @@ interface WorkerConnectedMessage {
 export async function *messagePortToIterable<Message>(port: MessagePort): AsyncIterable<Message> {
 	using disposable = new DisposableStack();
 	disposable.defer(() => port.close());
+	let closed = false;
 	let deferred = Promise.withResolvers<boolean>();
 	let queue: Message[] = [];
-	port.on('close', () => { deferred.resolve(false); });
+	const hasMessages = () => queue.length > 0;
+	const isClosed = () => closed;
+	port.on('close', () => {
+		closed = true;
+		deferred.resolve(true);
+	});
 	port.on('error', error => deferred.reject(error));
 	port.on('message', (message: Message) => {
 		queue.push(message);
 		deferred.resolve(true);
-		deferred = Promise.withResolvers();
 	});
-	while (await deferred.promise) {
+	while (true) {
+		if (!hasMessages()) {
+			if (isClosed()) {
+				return;
+			}
+			await deferred.promise;
+			if (!hasMessages() && isClosed()) {
+				return;
+			}
+		}
 		const next = queue;
 		queue = [];
+		deferred = Promise.withResolvers();
 		yield* next;
 	}
 }

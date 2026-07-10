@@ -47,6 +47,7 @@ export class LocalKeyValResponder extends AsyncDisposableResource implements May
 	readonly blob;
 	private readonly data = new Map<string, InternalValue>();
 	private readonly expires = new Set<string>();
+	private readonly loadedScripts = new Map<string, (instance: LocalKeyValResponder, keys: string[], argv: Pr.Value[]) => unknown>();
 	private readonly scripts = new Map<string, (instance: LocalKeyValResponder, keys: string[], argv: Pr.Value[]) => unknown>();
 	private readonly url;
 	private saveWait: Promise<void> | undefined;
@@ -748,7 +749,7 @@ export class LocalKeyValResponder extends AsyncDisposableResource implements May
 		return this._evaluateInline(script.local, keys, argv) as Pr.Value | Pr.Value[] | null;
 	}
 
-	load() {}
+	load(_script: KeyvalScript) {}
 
 	async flushdb() {
 		await this.blob.flushdb();
@@ -797,12 +798,27 @@ export class LocalKeyValResponder extends AsyncDisposableResource implements May
 	}
 
 	_evaluateInline(script: string, keys: string[], argv: Pr.Value[]) {
-		const fn = getOrSet(this.scripts, script, () => {
+		return this.compileScript(script)(this, keys, argv);
+	}
+
+	_loadInline(id: string, script: string) {
+		this.loadedScripts.set(id, this.compileScript(script));
+	}
+
+	_evaluateLoaded(id: string, keys: string[], argv: Pr.Value[]) {
+		const fn = this.loadedScripts.get(id);
+		if (fn === undefined) {
+			throw new Error(`Local keyval script '${id}' has not been loaded`);
+		}
+		return fn(this, keys, argv);
+	}
+
+	private compileScript(script: string) {
+		return getOrSet(this.scripts, script, () => {
 			// eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
 			const make = new Function(`return ${script}`) as () => LocalKeyValScript;
 			return make();
 		});
-		return fn(this, keys, argv);
 	}
 
 	private lookupObject<Type>(key: string, constructor: abstract new(...args: any[]) => Type): Extract<InternalValue, Type> | undefined {
@@ -853,11 +869,36 @@ class LocalKeyValClient extends makeClient(LocalKeyValResponder) {
 	declare hmGet: (...args: unknown[]) => any;
 	declare req: (...args: unknown[]) => any;
 	declare set: (...args: unknown[]) => any;
+	private readonly loadedScripts = new Map<string, true | Promise<void>>();
 
 	// https://github.com/microsoft/TypeScript/issues/27689
 	// @ts-expect-error
-	eval(script: KeyvalScript, keys: string[], argv: Pr.Value[]): any {
-		return this._evaluateInline(script.local, keys, argv);
+	async eval(script: KeyvalScript, keys: string[], argv: Pr.Value[]): Promise<any> {
+		if (this.loadedScripts.get(script.localId) !== true) {
+			await this.load(script);
+		}
+		return this._evaluateLoaded(script.localId, keys, argv);
+	}
+
+	// https://github.com/microsoft/TypeScript/issues/27689
+	// @ts-expect-error
+	load(script: KeyvalScript): Promise<void> {
+		const { localId } = script;
+		const loaded = this.loadedScripts.get(localId);
+		if (loaded === true) {
+			return Promise.resolve();
+		} else if (loaded) {
+			return loaded;
+		}
+		const loading = this._loadInline(localId, script.local).then(
+			() => { this.loadedScripts.set(localId, true); },
+			error => {
+				this.loadedScripts.delete(localId);
+				throw error;
+			},
+		);
+		this.loadedScripts.set(localId, loading);
+		return loading;
 	}
 }
 

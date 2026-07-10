@@ -1,5 +1,41 @@
+import { MessageChannel } from 'node:worker_threads';
+import { KeyvalScript } from 'xxscreeps/engine/db/storage/script.js';
 import { instantiateTestShard } from 'xxscreeps/test/import.js';
 import { assert, describe, test } from 'xxscreeps/test/index.js';
+import { messagePortToIterable } from './port.js';
+
+describe('Local MessagePort', () => {
+	test('does not lose a wake while its consumer is handling the previous message', async () => {
+		const { port1, port2 } = new MessageChannel();
+		const messages = messagePortToIterable<string>(port1)[Symbol.asyncIterator]();
+		try {
+			port2.postMessage('first');
+			assert.deepStrictEqual(await messages.next(), { done: false, value: 'first' });
+
+			// The generator is suspended at its previous yield when this message arrives.
+			port2.postMessage('second');
+			await new Promise<void>(resolve => {
+				setImmediate(resolve);
+			});
+			assert.deepStrictEqual(await messages.next(), { done: false, value: 'second' });
+		} finally {
+			port2.close();
+			await messages.return?.();
+		}
+	});
+});
+
+describe('Local keyval scripts', () => {
+	test('derive stable identifiers from script content', () => {
+		const first = new KeyvalScript(() => 1);
+		const same = new KeyvalScript(() => 1);
+		const different = new KeyvalScript(() => 2);
+
+		assert.strictEqual(first.localId, same.localId);
+		assert.notStrictEqual(first.localId, different.localId);
+		assert.strictEqual(first.localId.length, 16);
+	});
+});
 
 describe('LocalKeyValResponder', () => {
 	test('zUnionStore applies WEIGHTS to single-set members', async () => {
