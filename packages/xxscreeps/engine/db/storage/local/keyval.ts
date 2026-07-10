@@ -70,6 +70,8 @@ export class LocalKeyValResponder extends AsyncDisposableResource implements May
 						case 'set': return new Set(value.$);
 						case 'zset': return new SortedSet(value.$);
 						case 'uint8': return latin1ToBuffer(value.$);
+						// Plain objects, e.g. the `$` payload of a tagged value
+						default: return value;
 					}
 				}
 			}) as SerializedValue;
