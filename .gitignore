@@ -4,5 +4,6 @@
 /dump.rdb
 /package.nw
 /screeps
+/worktrees/
 dist
 node_modules
