@@ -27,4 +27,14 @@ export class BackendContext extends AsyncDisposableResource {
 		const context = new BackendContext(disposable.move(), db, shard, world, new Set(rooms));
 		return context;
 	}
+
+	/**
+	 * Wrap already-open database connections (e.g. the in-process test shard used by `simulate`)
+	 * so the HTTP/SockJS backend can serve them. Does **not** take ownership — disposing this
+	 * context will not close the database or shard.
+	 */
+	static async attach(db: Database, shard: Shard, world: World) {
+		const rooms = await shard.data.sMembers('rooms');
+		return new BackendContext(new AsyncDisposableStack(), db, shard, world, new Set(rooms));
+	}
 }

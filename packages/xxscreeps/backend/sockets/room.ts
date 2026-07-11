@@ -5,6 +5,7 @@ import type { Effect } from 'xxscreeps/utility/types.js';
 import { hooks } from 'xxscreeps/backend/index.js';
 import { Render } from 'xxscreeps/backend/symbols.js';
 import { config } from 'xxscreeps/config/index.js';
+import { Channel } from 'xxscreeps/engine/db/channel.js';
 import * as User from 'xxscreeps/engine/db/user/index.js';
 import { getRoomChannel } from 'xxscreeps/engine/processor/model.js';
 import { Fn } from 'xxscreeps/functional/fn.js';
@@ -69,8 +70,15 @@ export async function subscribeToRoom(shard: Shard, roomName: string, listener: 
 			}
 		}));
 
-		// Listen for game time updates
-		disposable.defer(shard.channel.listen(event => {
+		// Listen for game time updates on a *separate* pubsub subscription.
+		// Do NOT use `shard.channel.listen` — that is the same Subscription instance
+		// simulate()/main uses to *publish* ticks, and local pubsub never delivers a
+		// message back to its publishing subscription. In multi-process production the
+		// backend has its own shard connection so it works; in-process headful BM
+		// (simulate + listenBackend) was frozen until room resubscribe.
+		disposable.defer(await new Channel<{ type: 'tick'; time: number } | { type: null }>(
+			shard.pubsub, 'channel/game',
+		).listen(event => {
 			if (event.type === 'tick') {
 				time = event.time;
 				timer.set(0);
@@ -97,11 +105,19 @@ export async function subscribeToRoom(shard: Shard, roomName: string, listener: 
 				// tick so the blob is rendered at its own tick, not a later one — otherwise decay fields
 				// (e.g. rampart `#nextDecayTime`) read as overdue and throw `Invalid expiry time`.
 				const renderTime = time;
-				if (didUpdate) {
+				// Always reload the room blob on tick advance. Finalization may use
+				// `copyRoomFromPreviousTick` (no `didUpdate` pubsub event) which still writes a valid
+				// blob for the new time. Skipping load + sending didUpdate=false leaves the Screeps
+				// client with empty `objects` diffs so the room view freezes until resubscribe
+				// (map → room). That shows up especially under simulate()/headful BM watching.
+				try {
 					state.room = await shard.loadRoom(roomName, renderTime);
+				} catch {
+					// Keep previous room if blob is briefly unavailable
 				}
 				state.time = renderTime;
-				publish(state.room, renderTime, didUpdate);
+				// Force object re-render so the client always gets a payload with gameTime.
+				publish(state.room, renderTime, true);
 				didUpdate = false;
 				timer.set(config.backend.socketThrottle);
 			});
