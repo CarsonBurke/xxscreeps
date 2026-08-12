@@ -46,7 +46,8 @@ export async function loadScreepsClientPackage() {
 				[ '.steam', 'root', 'steam' ], // steam root symlink
 				[ '.steam', 'steam' ], // ubuntu's multiverse repository
 				[ '.local', 'share', 'Steam' ], // steam.deb on steampowered site
-				[ '.var', 'app', 'com.valvesoftware.Steam', '.steam' ], // flatpak
+				[ '.var', 'app', 'com.valvesoftware.Steam', '.local', 'share', 'Steam' ], // flatpak
+				[ '.var', 'app', 'com.valvesoftware.Steam', '.steam' ], // flatpak (legacy layout)
 				[ 'snap', 'steam' ], // snapcraft
 			]) {
 				const steamPath = path.join(os.homedir(), ...dir);
