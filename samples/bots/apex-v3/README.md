@@ -1,77 +1,62 @@
-# Apex v3
+# Apex v4 (TypeScript)
 
-Delegated multi-room empire bot for **xxscreeps**.
+Phase-aware multi-room empire bot for **xxscreeps** (package path still `apex-v3`).
 
-## Install
+## Build
 
 ```bash
-npx xxscreeps manage bot add apex-v3 samples/bots/apex-v3 --spawn W5N5
+cd samples/bots/apex-v3 && npx tsc -p tsconfig.json
 ```
 
-## Role delegation (economy)
-
-| Role | Behavior |
-|------|----------|
-| **harvester** | Sits on a source; harvests; **drops** energy or fills adjacent **container** (never hauls home) |
-| **hauler** | Picks drops/containers at sources; delivers to storage / spawn-side container / spawn network |
-| **filler** | Parks on reserved **filler pads** next to spawn; fills spawn/extensions/towers from nearby energy |
-| **upgrader** | Parks at controller; only takes energy from **nearby** containers/drops (haulers feed them) |
-| **builder** | Builds/repairs from containers/drops/storage — **does not harvest** (except pioneers) |
-| **bootstrap** | Early multi-skill only until capacity ≥ `specializeCapacity` |
-
-## Heuristic empire (`empire.js`)
-
-Dynamic scoring every ~10 ticks into `Memory.empire.plan`:
-
-- **Colony strength** — RCL, energy capacity, storage, towers, creeps, threat
-- **Expand ASAP** — if free GCL ≥ 1, pick claim targets (prefer 2-source, adjacent, low threat)
-- **Support assignment** — strongest nearby colonies send claimers / pioneers / escorts (multi-home)
-- **Remote budget** — remotes scale with strength (not a fixed RCL7 gate)
-- **Modes** — `bootstrap` | `grow` | `expand` per colony
-
-## Base planner (`planner.js`) — utility scoring, not a fixed ladder
-
-Construction is **not** a hard-coded “containers → roads → storage” list.
-
-Each pass the planner:
-
-1. **Analyzes bottlenecks** — spawn capacity, missing logistics, defense pressure, storage readiness, site backlog  
-2. **Enumerates candidates** — any legal job we could place now  
-3. **Scores** with soft factors: bottleneck relief, leverage, readiness penalties, saturation (diminishing returns), backlog  
-4. **Places** highest scores until a site budget is used  
-
-So extensions can beat roads when spawn energy is the binding constraint; source containers beat storage when miners drop on open ground; storage only scores well once logistics can feed it. Remotes use the same idea. Filler pads: reserved walkable tiles beside spawn.
-
-## Optional modules
-
-| File | Purpose |
-|------|---------|
-| `war.js` + `combat.js` | Campaigns for remotes/claims, abandon-on-fail |
-| `economy.js` | Finer remote upkeep / income projections |
-
-Core bot runs without them.
-
-## Flags
-
-| Prefix | Effect |
-|--------|--------|
-| `attack_*` | War / siege target |
-| `claim_*` | Claim expansion |
-| `remote_*` | Force remote mining |
-| `ignore_*` | Never remote there |
-| `rally_*` | Military rally |
-| `defend_*` | Priority defense room |
-
-## Metrics
-
-Segment **87** → TensorBoard (see [../PROTOCOL.md](../PROTOCOL.md)).
+Install from **`dist/`** (flat CommonJS):
 
 ```bash
+npx xxscreeps manage bot add apex-v3 samples/bots/apex-v3/dist --spawn W5N5
+```
+
+## RCL phases (v4)
+
+| RCL | Mode | Behavior |
+|-----|------|----------|
+| 1 | `rcl_push` | Bootstraps fill spawn then **upgrade**; planner places **nothing** |
+| 2 | `infra` | Extensions first; upgraders self-feed; no roads yet |
+| 3+ | `grow` | Containers, remotes (min RCL3), roads (min RCL3) |
+| 4+ | `expand` | Claim/expand gated (`expandMinRcl`) |
+
+```bash
+# 20k sim from repo root (Node 24+)
 mise exec node@24 -- node --import xxscreeps/loader \
-  samples/bots/apex/bench.mjs 5000 ../apex-v3
+  samples/bots/apex/bench.mjs 20000 samples/bots/apex-v3/dist
 ```
 
-## Docs
+## Memory (char-cost aware)
 
-- [WAR.md](./WAR.md) — campaigns / abandon (when present)
-- [ECONOMY.md](./ECONOMY.md) — projection formulas (when present)
+Screeps serializes Memory by character count. Apex v3 follows The International:
+
+| Technique | Where |
+|-----------|--------|
+| **Numeric enums** as object keys | `CreepMem`, `RoomApexMem` (`memoryKeys.ts`) |
+| **Short string keys** for metrics | `MetricKey` (`t`,`r`,`c`,`h`,…) in segment 87 |
+| **Coords only** in Memory | `{x,y}` via `codec.ts` — never store `RoomPosition` |
+| **packId / packCoord** | Optional denser packing for IDs & tiles |
+| **Memhack** | `memoryHack.ts` — reuse Memory object across ticks |
+
+Positions example:
+
+```ts
+// store
+memory.seatCoord = asCoord(creep.pos); // {x, y}
+// use
+const pos = asPos(memory.seatCoord, room.name);
+```
+
+## Architecture
+
+- **Roles** — harvester / hauler / filler / upgrader / builder (strict delegation)
+- **empire.ts** — GCL-first expansion, colony strength heuristics
+- **planner.ts** — utility-scored construction (not a fixed structure ladder)
+- **war.ts / combat.ts** — campaigns + abandon
+- **economy.ts / projections.ts** — remote affordability math
+- **metrics.ts** — dense segment samples for TensorBoard watcher
+
+See `WAR.md`, `ECONOMY.md`, `../PROTOCOL.md`.

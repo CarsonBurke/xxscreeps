@@ -1,3 +1,5 @@
+// @ts-nocheck — ported from JS; tighten types incrementally
+/* eslint-disable */
 /**
  * Empire heuristics — dynamic scoring for expansion, remotes, and support assignment.
  *
@@ -10,12 +12,12 @@
  *
  * Writes Memory.empire.plan each tick for spawn / war / construction to read.
  */
-const config = require('config');
-const intel = require('intel');
+const config = require('./config');
+const intel = require('./intel');
 const {
 	ownedRooms, adjacentRoomNames, isHighway, isSourceKeeperRoom,
 	energyOf, hostileThreat, estimatePathLength,
-} = require('util');
+} = require('./util');
 
 const PLAN_INTERVAL = 10;
 
@@ -56,9 +58,10 @@ function colonyStrength(room) {
 		filter: s => s.structureType === STRUCTURE_TOWER,
 	}).length;
 	const threat = hostileThreat(room);
+	const { getHome } = require('./creepMem');
 	const creeps = Object.keys(Game.creeps).filter(n => {
 		const c = Game.creeps[n];
-		return c.memory && c.memory.home === room.name;
+		return getHome(c) === room.name;
 	}).length;
 
 	// Weighted score
@@ -201,22 +204,15 @@ function assignSupport(targetRoom, colonies, need) {
  * Remote capacity heuristic per colony — without full economy.js.
  * e/t spare ≈ sources*10 * efficiency - upkeep; remotes cost ~15-30 e/t each rough.
  */
-function remoteBudget(room, strength) {
-	const rcl = room.controller.level;
-	if (rcl < (config.remoteMinRcl || 2)) return 0;
-	// Base: how many remotes strength can sustain
-	let n = 0;
-	if (strength > 150) n = 1;
-	if (strength > 350) n = 2;
-	if (strength > 550) n = 3;
-	if (strength > 800) n = 4;
-	// Economy module override (byColony or colonies map)
-	const ecoMap = Memory.empire.economy &&
-		(Memory.empire.economy.byColony || Memory.empire.economy.colonies);
-	if (ecoMap && ecoMap[room.name] && ecoMap[room.name].maxRemotes != null) {
-		n = Math.min(n, ecoMap[room.name].maxRemotes);
-	}
-	return Math.min(n, config.maxRemotesPerColony || 4);
+/**
+ * How many remote *rooms* to attach. No magic 6 / RCL ladder.
+ * Return a large number so pickRemotes is the real filter (all positive-score rooms).
+ * Spawn duty + EV in spawn.ts decide how many packages we can sustain.
+ */
+function remoteBudget(room, _strength) {
+	if (!room.find(FIND_MY_SPAWNS).length) return 0; // no spawn uptime
+	// Unbounded for practical purposes — pickRemotes already ranks/filters
+	return 99;
 }
 
 /**
@@ -280,10 +276,23 @@ function tick() {
 
 	// Per-colony plan
 	const byColony = {};
+	const { RoomIntent, setRoomIntent, getRoomIntent } = require('./intents');
 	for (const room of colonies) {
 		const str = strengths[room.name];
 		const maxRemotes = remoteBudget(room, str);
-		const remotes = intel.pickRemotes(room).slice(0, maxRemotes);
+		// pickRemotes already returns all viable rooms (no artificial cap)
+		const remotes = maxRemotes > 0 ? intel.pickRemotes(room) : [];
+		// Reassert RoomIntent.remote so flag sync wipe does not drop auto remotes
+		for (const r of remotes) {
+			const cur = getRoomIntent(r);
+			if (
+				cur === RoomIntent.attack ||
+				cur === RoomIntent.claim ||
+				cur === RoomIntent.ignore ||
+				cur === RoomIntent.defend
+			) continue;
+			setRoomIntent(r, RoomIntent.remote);
+		}
 		// Expansions this room should help
 		const help = expansions.filter(e =>
 			e.primaryHome === room.name || (e.supportHomes || []).includes(room.name));
@@ -301,24 +310,32 @@ function tick() {
 		};
 	}
 
-	// Global intent list for spawn merge
+	// Global intent list for spawn merge (Role / CreepMem numeric keys)
+	const { Role, CreepMem, memInit } = require('./creepMem');
 	const spawnIntents = [];
 	for (const exp of expansions) {
 		if (exp.needClaimer && exp.primaryHome) {
 			spawnIntents.push({
 				home: exp.primaryHome,
-				role: 'claimer',
+				role: Role.claimer,
 				priority: 15, // high — GCL is the scarce resource
-				memory: { targetRoom: exp.room, role: 'claimer' },
+				memory: memInit({
+					[CreepMem.role]: Role.claimer,
+					[CreepMem.targetRoom]: exp.room,
+				}),
 				reason: 'free-gcl-expand',
 			});
 		}
 		for (const home of exp.supportHomes || []) {
 			spawnIntents.push({
 				home,
-				role: 'builder',
+				role: Role.builder,
 				priority: 18,
-				memory: { pioneer: true, targetRoom: exp.room, role: 'builder' },
+				memory: memInit({
+					[CreepMem.role]: Role.builder,
+					[CreepMem.pioneer]: true,
+					[CreepMem.targetRoom]: exp.room,
+				}),
 				context: {},
 				reason: 'pioneer-support',
 			});
@@ -326,9 +343,13 @@ function tick() {
 		if (exp.needEscort && exp.primaryHome) {
 			spawnIntents.push({
 				home: exp.primaryHome,
-				role: 'attacker',
+				role: Role.attacker,
 				priority: 22,
-				memory: { targetRoom: exp.room, role: 'attacker', squad: `exp_${exp.room}` },
+				memory: memInit({
+					[CreepMem.role]: Role.attacker,
+					[CreepMem.targetRoom]: exp.room,
+					[CreepMem.squad]: `exp_${exp.room}`,
+				}),
 				reason: 'expand-escort',
 			});
 		}
@@ -371,3 +392,5 @@ module.exports = {
 	freeGcl,
 	scoreClaimTarget,
 };
+
+export {};

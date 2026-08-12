@@ -1,3 +1,5 @@
+// @ts-nocheck — ported from JS; tighten types incrementally
+/* eslint-disable */
 /**
  * Apex v3 — economy projections API + Memory.empire.economy writer.
  *
@@ -10,7 +12,7 @@
  *   static harvesters (drop/container), haulers, fillers, upgraders, builders
  *
  * Usage:
- *   const economy = require('economy');
+ *   const economy = require('./economy');
  *   economy.tick(colonies); // colonies: Room[] or { room, remotesIntel }[]
  *
  * Memory.empire.economy = {
@@ -21,11 +23,13 @@
 
 'use strict';
 
-// Flat sandbox: require('projections'). Host Node may treat files as ESM — normalize.
+// Flat sandbox: require('./projections'). Host Node may treat files as ESM — normalize.
 const P = (function loadProjections() {
-	const mod = require('projections');
+	const mod = require('./projections');
 	return mod.CONST ? mod : (mod.default || mod);
 })();
+const { Role } = require('./creepMem');
+const { getRemotes } = require('./roomMem');
 
 const CONST = P.CONST || {};
 const estimateSource = P.estimateSource;
@@ -318,7 +322,7 @@ function projectColony(room, remotesIntel) {
 		freeCpu: freeCpuRough(),
 		localSpawnBusyFrac: local.spawnBusyFrac,
 		candidatePackages: ranked,
-		maxRemotes: CONST.MAX_REMOTES_SOFT,
+		maxRemotes: CONST.MAX_REMOTES_SOFT || 99,
 	});
 
 	const afforded = afford.afforded || [];
@@ -352,14 +356,14 @@ function projectColony(room, remotesIntel) {
 
 	if (local.harvesterCount > 0) {
 		recommendations.push({
-			role: 'harvester',
+			role: Role.harvester,
 			count: local.harvesterCount,
 			reason: `static miner per local source (${local.sourceCount})`,
 		});
 	}
 	if (local.haulerCount > 0) {
 		recommendations.push({
-			role: 'hauler',
+			role: Role.hauler,
 			count: local.haulerCount,
 			reason: `local pipeline haulers for ${local.sourceCount} sources`,
 		});
@@ -375,21 +379,21 @@ function projectColony(room, remotesIntel) {
 	}
 	if (remoteHarvesters > 0) {
 		recommendations.push({
-			role: 'remoteHarvester',
+			role: Role.remoteHarvester,
 			count: remoteHarvesters,
 			reason: `1 per source across ${afforded.length} remotes`,
 		});
 	}
 	if (remoteHaulers > 0) {
 		recommendations.push({
-			role: 'remoteHauler',
+			role: Role.remoteHauler,
 			count: remoteHaulers,
 			reason: 'pathLen × e/t pipeline demand',
 		});
 	}
 	if (reservers > 0) {
 		recommendations.push({
-			role: 'reserver',
+			role: Role.reserver,
 			count: reservers,
 			reason: '1 CLAIM upkeep per remote room',
 		});
@@ -540,17 +544,13 @@ function remotesFromMemory(room) {
 	if (!room || typeof Memory === 'undefined') return [];
 	const name = room.name;
 	try {
-		// v3 preferred: Memory.empire.colonies[name].remotes
-		if (Memory.empire && Memory.empire.colonies && Memory.empire.colonies[name]) {
-			const c = Memory.empire.colonies[name];
+		// RoomApexMem.remotes via room bag `a`
+		const fromBag = getRemotes(name);
+		if (fromBag.length) return fromBag;
+		// empire plan cache
+		if (Memory.empire && Memory.empire.plan && Memory.empire.plan.byColony && Memory.empire.plan.byColony[name]) {
+			const c = Memory.empire.plan.byColony[name];
 			if (c.remotes) return c.remotes;
-		}
-		// v2: room.memory.apex.remotes
-		if (room.memory && room.memory.apex && room.memory.apex.remotes) {
-			return room.memory.apex.remotes;
-		}
-		if (Memory.rooms && Memory.rooms[name] && Memory.rooms[name].apex && Memory.rooms[name].apex.remotes) {
-			return Memory.rooms[name].apex.remotes;
 		}
 	} catch (_e) { /* ignore */ }
 	return [];
@@ -609,3 +609,5 @@ module.exports = {
 	// projections module (escape hatch)
 	projections: P,
 };
+
+export {};

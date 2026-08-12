@@ -1,38 +1,34 @@
+// @ts-nocheck — ported from JS; tighten types incrementally
+/* eslint-disable */
 /**
  * Apex v3 war / campaign strategy.
  *
- * High-level state machine over Memory.empire.campaigns:
- *   - remote  — secure remote harvest rooms (hostiles / invader cores)
- *   - claim   — support claim/expand until a spawn is up
- *   - attack  — flag-driven siege / hold
+ * Room orders are RoomIntent enums on Memory.rooms[name].a (synced by intel from
+ * flag *colors*, never flag names). Example:
+ *   if (getRoomIntent(room) === RoomIntent.attack) open attack campaign
  *
- * Progress indicators (preferred over pure energy):
- *   - Hostiles present vs cleared
- *   - Our military deaths this campaign
- *   - Ticks without progress (no kill, no claim, no reservation gain, no core kill)
- *   - Room still unsafe for civilian remotes
+ * Campaign types: remote | claim | attack | defend
  *
- * Abandon when (constants WAR_CFG below):
- *   1. spentEnergy > energyBudget with no recent progress
- *   2. deaths > deathLimit without clearing the room
- *   3. no progress for stallTicks
- *   4. enemy RCL / tower count too high for our home RCL (intel)
- *
- * After abandon → status 'cooldown' for cooldownTicks so we do not re-open
- * the same war immediately. Won campaigns also cool briefly.
- *
- * Public API for spawn.js / main.js / roles.js:
- *   war.tick()                      — each tick (after intel flag scan)
- *   war.spawnRequests(homeRoom)     — [{ role, priority, memory, context }]
- *   war.runners / re-exports combat role runners
+ * Public API:
+ *   war.tick()                  — after intel.tick() (intents already synced)
+ *   war.spawnRequests(homeRoom)
  */
-const config = require('config');
-const combat = require('combat');
+const config = require('./config');
+const combat = require('./combat');
 const {
 	hostileThreat,
 	ownedRooms,
 	lowBucket,
-} = require('util');
+} = require('./util');
+const {
+	RoomIntent,
+	getRoomIntent,
+	getIntentSnapshot,
+} = require('./intents');
+const {
+	getRole, getCampaignId, memInit, Role, CreepMem,
+} = require('./creepMem');
+const { getRemotes } = require('./roomMem');
 
 // ---------------------------------------------------------------------------
 // Tunables (override via config.war if present)
@@ -246,7 +242,7 @@ function homeRcl(homeName) {
 // Campaign open / progress / abandon
 // ---------------------------------------------------------------------------
 
-function openCampaign({ type, room, home, goal, flag, squad }) {
+function openCampaign({ type, room, home, goal, squad }) {
 	const c = cfg();
 	if (inCooldown(room, type, home)) return null;
 	if (activeCampaigns(home).length >= c.maxActivePerHome) return null;
@@ -257,10 +253,7 @@ function openCampaign({ type, room, home, goal, flag, squad }) {
 		camp.room === room &&
 		camp.type === type &&
 		camp.home === home);
-	if (existing) {
-		if (flag) existing.flag = flag;
-		return existing;
-	}
+	if (existing) return existing;
 
 	const camp = {
 		id: nextCampaignId(room, type),
@@ -275,11 +268,10 @@ function openCampaign({ type, room, home, goal, flag, squad }) {
 		safeTicks: 0,
 		goal: goal || defaultGoal(type),
 		status: 'active',
-		flag: flag || null,
+		/** Player/empire RoomIntent that opened this; null = auto (e.g. remote security) */
+		intent: type === 'remote' ? null : typeToIntent(type),
 		squad: squad || c.squads[type] || c.squads.attack,
-		// Snapshot of assigned creep body costs for spent/death accounting.
 		assigned: {},
-		// Last observed hostile count (for kill progress).
 		lastHostileCount: null,
 		lastReservation: null,
 		abandonReason: null,
@@ -289,6 +281,20 @@ function openCampaign({ type, room, home, goal, flag, squad }) {
 	ensureEmpire().campaigns[camp.id] = camp;
 	console.log(`Apex v3 WAR open ${camp.id} ${type}→${room} from ${home} goal=${camp.goal}`);
 	return camp;
+}
+
+/** Player-order campaign type → RoomIntent. Auto remotes use null, not this. */
+function typeToIntent(type) {
+	if (type === 'attack') return RoomIntent.attack;
+	if (type === 'defend') return RoomIntent.defend;
+	if (type === 'claim') return RoomIntent.claim;
+	return RoomIntent.none;
+}
+
+/** True while player/empire still wants this order on the room. Auto campaigns always active. */
+function intentStillActive(camp) {
+	if (camp.intent == null || camp.intent === RoomIntent.none) return true;
+	return getRoomIntent(camp.room) === camp.intent;
 }
 
 function defaultGoal(type) {
@@ -342,8 +348,8 @@ function tickCampaign(camp) {
 	const living = {};
 	for (const name in Game.creeps) {
 		const creep = Game.creeps[name];
-		if (!creep.memory || creep.memory.campaignId !== camp.id) continue;
-		if (!combat.MILITARY_ROLES.includes(creep.memory.role)) continue;
+		if (getCampaignId(creep) !== camp.id) continue;
+		if (!combat.MILITARY_ROLES.includes(getRole(creep))) continue;
 		const cost = combat.creepBodyCost(creep);
 		living[name] = cost;
 		if (camp.assigned[name] == null) {
@@ -406,26 +412,26 @@ function tickCampaign(camp) {
 		camp._hadCore = obs.core;
 	}
 
-	// --- Win conditions ---
+	// --- Win conditions (RoomIntent status, not flag name presence) ---
 	if (camp.type === 'remote' || camp.type === 'attack' || camp.type === 'defend') {
-		const flagGone = camp.flag && !Game.flags[camp.flag];
-		if (camp.type === 'attack' && flagGone && (camp.safeTicks || 0) >= c.clearSafeTicks) {
-			endCampaign(camp, 'won', 'flag_cleared');
+		const orderLifted = !intentStillActive(camp);
+		if (camp.type === 'attack' && orderLifted && (camp.safeTicks || 0) >= c.clearSafeTicks) {
+			endCampaign(camp, 'won', 'intent_cleared');
 			return;
 		}
 		if ((camp.goal === 'clear_hostiles' || camp.goal === 'hold') &&
 			(camp.safeTicks || 0) >= c.clearSafeTicks &&
 			obs.hostileCount === 0 && !obs.core) {
-			// Defend goals hold until flag removed.
-			if (camp.type === 'defend' && camp.flag && Game.flags[camp.flag]) {
-				// Stay active while flag exists; progress already marked.
+			// Defend holds while RoomIntent.defend remains.
+			if (camp.type === 'defend' && intentStillActive(camp)) {
+				// stay active
 			} else if (camp.type !== 'defend') {
 				endCampaign(camp, 'won', 'cleared');
 				return;
 			}
 		}
-		if (camp.type === 'defend' && camp.flag && !Game.flags[camp.flag]) {
-			endCampaign(camp, 'won', 'defend_flag_removed');
+		if (camp.type === 'defend' && orderLifted) {
+			endCampaign(camp, 'won', 'defend_intent_cleared');
 			return;
 		}
 	}
@@ -435,12 +441,7 @@ function tickCampaign(camp) {
 			endCampaign(camp, 'won', 'spawn_established');
 			return;
 		}
-		// Claim flag removed and we own the room (even without spawn yet) — keep
-		// supporting until spawn, unless no claim creeps and flag gone for a while.
-		if (camp.flag && !Game.flags[camp.flag] && !obs.myController &&
-			Game.time - camp.started > 500) {
-			// Fall through to abandon checks / stall.
-		}
+		// Intent lifted and we never got the room — stall/abandon paths handle it.
 	}
 
 	// --- Abandon: enemy too strong ---
@@ -472,48 +473,8 @@ function tickCampaign(camp) {
 }
 
 // ---------------------------------------------------------------------------
-// Campaign discovery (flags, remotes, claims)
+// Campaign discovery (RoomIntent enums — never flag-name strings)
 // ---------------------------------------------------------------------------
-
-/**
- * Sync flag-derived empire lists. Safe to call even if intel.tick already did.
- * Also handles defend_* which intel may not know about.
- */
-function scanFlags() {
-	const empire = ensureEmpire();
-	empire.attacks = [];
-	empire.claims = [];
-	empire.defends = [];
-	// Keep forcedRemotes / ignoreRooms cumulative unless rewritten by intel.
-
-	for (const name in Game.flags) {
-		const flag = Game.flags[name];
-		const lower = name.toLowerCase();
-		const room = flag.pos.roomName;
-		const entry = {
-			room,
-			flag: name,
-			pos: { x: flag.pos.x, y: flag.pos.y, roomName: room },
-		};
-		if (lower.startsWith('attack')) {
-			empire.attacks.push(entry);
-		} else if (lower.startsWith('claim')) {
-			empire.claims.push(entry);
-		} else if (lower.startsWith('defend')) {
-			empire.defends.push(entry);
-		} else if (lower.startsWith('remote')) {
-			empire.forcedRemotes[room] = room;
-		} else if (lower.startsWith('ignore')) {
-			empire.ignoreRooms[room] = Game.time;
-		} else if (lower.startsWith('rally')) {
-			empire.rally = {
-				room,
-				pos: { x: flag.pos.x, y: flag.pos.y, roomName: room },
-				flag: name,
-			};
-		}
-	}
-}
 
 function nearestHome(roomName) {
 	const owned = ownedRooms();
@@ -529,45 +490,54 @@ function nearestHome(roomName) {
 	return best;
 }
 
-function openFromFlags() {
-	const empire = ensureEmpire();
+/**
+ * Open campaigns from room intent status:
+ *   getRoomIntent(room) === RoomIntent.attack | defend | claim
+ * Snapshot is filled by intel.syncIntentsFromFlags (color → enum).
+ */
+function openFromIntents() {
+	const snap = getIntentSnapshot();
+	if (!snap) return;
 	const c = cfg();
 
-	for (const atk of empire.attacks) {
-		const home = nearestHome(atk.room);
+	for (const room of snap.attacks) {
+		const home = nearestHome(room);
 		if (!home) continue;
 		openCampaign({
 			type: 'attack',
-			room: atk.room,
+			room,
 			home,
 			goal: 'clear_hostiles',
-			flag: atk.flag,
 			squad: c.squads.attack,
 		});
 	}
 
-	for (const cl of empire.claims) {
-		const home = nearestHome(cl.room);
+	for (const room of snap.claims) {
+		// Already established colony — don't thrash claim campaigns.
+		const owned = Game.rooms[room];
+		if (owned && owned.controller && owned.controller.my &&
+			owned.find(FIND_MY_SPAWNS).length > 0) {
+			continue;
+		}
+		const home = nearestHome(room);
 		if (!home) continue;
 		openCampaign({
 			type: 'claim',
-			room: cl.room,
+			room,
 			home,
 			goal: 'claim',
-			flag: cl.flag,
 			squad: c.squads.claim,
 		});
 	}
 
-	for (const def of empire.defends) {
-		const home = nearestHome(def.room);
+	for (const room of snap.defends) {
+		const home = nearestHome(room);
 		if (!home) continue;
 		openCampaign({
 			type: 'defend',
-			room: def.room,
+			room,
 			home,
 			goal: 'hold',
-			flag: def.flag,
 			squad: c.squads.defend,
 		});
 	}
@@ -575,7 +545,7 @@ function openFromFlags() {
 
 /**
  * Open remote-security campaigns for remotes that show hostiles / cores.
- * Reads colony remotes from room.memory.apex.remotes or remoteState keys.
+ * Reads colony remotes from RoomApexMem bag (getRemotes).
  */
 function openRemoteSecurity() {
 	const c = cfg();
@@ -583,11 +553,7 @@ function openRemoteSecurity() {
 
 	for (const homeRoom of ownedRooms()) {
 		const home = homeRoom.name;
-		const apex = homeRoom.memory.apex || {};
-		const remotes = new Set(apex.remotes || []);
-		if (apex.remoteState) {
-			for (const r of Object.keys(apex.remoteState)) remotes.add(r);
-		}
+		const remotes = new Set(getRemotes(home));
 		// Forced remotes adjacent-ish to this home.
 		for (const r of Object.keys(Memory.empire.forcedRemotes || {})) {
 			if (Game.map.getRoomLinearDistance(home, r) <= 2) remotes.add(r);
@@ -595,17 +561,11 @@ function openRemoteSecurity() {
 
 		for (const remoteName of remotes) {
 			if (Memory.empire.ignoreRooms && Memory.empire.ignoreRooms[remoteName]) continue;
-			const rs = apex.remoteState && apex.remoteState[remoteName];
-			if (rs && rs.phase === 'abandoned') {
-				// Remote FSM already abandoned civilians — still worth a war campaign
-				// only if threat is current; otherwise skip.
-			}
 
 			const obs = observeRoom(remoteName);
 			const need =
 				obs.threat >= c.remoteThreatOpen ||
-				(c.remoteOpenOnCore && obs.core) ||
-				(rs && (rs.threatTicks || 0) >= 10);
+				(c.remoteOpenOnCore && obs.core);
 
 			if (!need) continue;
 
@@ -682,59 +642,72 @@ function pruneCampaigns() {
 // ---------------------------------------------------------------------------
 
 function roleKey(role) {
-	// Map role → squad field name.
+	// Role enum → squad field name in WAR_CFG.squads
 	const map = {
-		attacker: 'attackers',
-		healer: 'healers',
-		ranged: 'ranged',
-		dismantler: 'dismantlers',
-		defender: 'defenders',
+		[Role.attacker]: 'attackers',
+		[Role.healer]: 'healers',
+		[Role.ranged]: 'ranged',
+		[Role.dismantler]: 'dismantlers',
+		[Role.defender]: 'defenders',
 	};
 	return map[role];
 }
 
 /**
  * @param {Room|string} homeRoom
- * @returns {{ role: string, priority: number, memory: object, context: object }[]}
+ * @returns {{ role: Role, priority: number, memory: CreepMemory, context: object }[]}
  */
 function spawnRequests(homeRoom) {
 	const home = typeof homeRoom === 'string' ? homeRoom : homeRoom.name;
 	const c = cfg();
 	const reqs = [];
+	// Real gate: need a spawn + active campaign. No RCL ladder.
+	const homeRoomObj = Game.rooms[home];
+	if (!homeRoomObj || !homeRoomObj.find(FIND_MY_SPAWNS).length) return reqs;
+
 	const camps = activeCampaigns(home);
 
 	for (const camp of camps) {
 		const counts = combat.squadCounts(camp.room, camp.id);
 		const want = camp.squad || c.squads[camp.type] || c.squads.attack;
 		const squadId = camp.id;
-		const baseMem = {
-			targetRoom: camp.room,
-			defendRoom: camp.type === 'defend' ? camp.room : undefined,
-			squad: squadId,
-			campaignId: camp.id,
-			flag: camp.flag,
-			home,
-			marching: false,
-		};
 
-		const order = [ 'defender', 'attacker', 'healer', 'ranged', 'dismantler' ];
+		const order = [
+			Role.defender, Role.attacker, Role.healer, Role.ranged, Role.dismantler,
+		];
+		const prioName = {
+			[Role.defender]: 'defender',
+			[Role.attacker]: 'attacker',
+			[Role.healer]: 'healer',
+			[Role.ranged]: 'ranged',
+			[Role.dismantler]: 'dismantler',
+		};
 		for (const role of order) {
 			const key = roleKey(role);
 			const need = (want && want[key]) || 0;
 			if (need <= 0) continue;
 			const have = counts[role] || 0;
 			if (have >= need) continue;
-			// Request one at a time per role to avoid over-spawn in one tick.
+			const pn = prioName[role];
+			const fields = {
+				[CreepMem.role]: role,
+				[CreepMem.home]: home,
+				[CreepMem.targetRoom]: camp.room,
+				[CreepMem.squad]: squadId,
+				[CreepMem.campaignId]: camp.id,
+				[CreepMem.marching]: false,
+			};
+			if (camp.type === 'defend') fields[CreepMem.defendRoom] = camp.room;
 			reqs.push({
 				role,
-				priority: c.priority[role] != null ? c.priority[role] : 40,
-				memory: Object.assign({}, baseMem, { role }),
+				priority: c.priority[pn] != null ? c.priority[pn] : 40,
+				memory: memInit(fields),
 				context: { campaignId: camp.id, campaignType: camp.type },
 			});
 		}
 	}
 
-	// Local home defense is handled by spawn.js — war only requests campaign military.
+	// Local home defense is handled by spawn — war only requests campaign military.
 	return reqs;
 }
 
@@ -747,8 +720,8 @@ function spawnRequests(homeRoom) {
  */
 function tick(_colonies) {
 	ensureEmpire();
-	scanFlags();
-	openFromFlags();
+	// Intents already synced in intel.tick() → RoomIntent on room memory.
+	openFromIntents();
 	openRemoteSecurity();
 	openClaimSupport();
 
@@ -797,3 +770,5 @@ module.exports = {
 	runDefense: combat.runDefense,
 	runTowers: combat.runTowers,
 };
+
+export {};

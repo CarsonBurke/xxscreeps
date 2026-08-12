@@ -1,3 +1,5 @@
+// @ts-nocheck — ported from JS; tighten types incrementally
+/* eslint-disable */
 /**
  * General construction planner — utility scoring, not a fixed structure ladder.
  *
@@ -15,7 +17,14 @@
  *
  * Remotes use the same scorer with a smaller candidate set.
  */
-const config = require('config');
+const config = require('./config');
+const { getFillerPads, setFillerPads, setPlanDebug, getPlanAt } = require('./roomMem');
+
+function maxOpenSites() {
+	// Game hard limit is 100; leave headroom. Not an RCL ladder.
+	const soft = config.maxOpenSites != null ? config.maxOpenSites : 40;
+	return Math.min(100, Math.max(1, soft));
+}
 
 // ---------------------------------------------------------------------------
 // Terrain / placement primitives
@@ -54,8 +63,8 @@ function trySite(room, x, y, type) {
 	if (pos.lookFor(LOOK_CONSTRUCTION_SITES).length) return false;
 
 	// Soft reservation: filler pads stay clear of bulky buildings
-	const pads = room.memory.apex && room.memory.apex.fillerPads;
-	if (pads && type !== STRUCTURE_ROAD && type !== STRUCTURE_CONTAINER) {
+	const pads = getFillerPads(room.name);
+	if (pads.length && type !== STRUCTURE_ROAD && type !== STRUCTURE_CONTAINER) {
 		for (const p of pads) {
 			if (p.x === x && p.y === y) return false;
 		}
@@ -92,8 +101,8 @@ function openNear(pos, range, opts = {}) {
 }
 
 function ensureFillerPads(room, spawn) {
-	const apex = room.memory.apex ||= {};
-	if (apex.fillerPads && apex.fillerPads.length) return apex.fillerPads;
+	const existing = getFillerPads(room.name);
+	if (existing.length) return existing;
 	const pads = [];
 	const terrain = room.getTerrain();
 	const cands = [];
@@ -114,7 +123,7 @@ function ensureFillerPads(room, spawn) {
 			s.structureType !== STRUCTURE_ROAD && s.structureType !== STRUCTURE_RAMPART)) continue;
 		pads.push({ x: c.x, y: c.y });
 	}
-	apex.fillerPads = pads;
+	setFillerPads(room.name, pads);
 	return pads;
 }
 
@@ -204,6 +213,13 @@ function candidates(room, spawn, remotes, ctx) {
 	const jobs = [];
 	const rcl = ctx.rcl;
 	const pads = ensureFillerPads(room, spawn);
+	// Containers/roads have no RCL unlock — only CONTROLLER_STRUCTURES / energy.
+	// Prefer extensions while spawn cap < 550 (real: unlock 5W bodies).
+	const extensionRush = slotsLeft(room, STRUCTURE_EXTENSION) > 0 &&
+		countTotal(room, STRUCTURE_EXTENSION) < maxOf(STRUCTURE_EXTENSION, rcl) &&
+		ctx.spawnCap < 550;
+	const allowContainers = !extensionRush;
+	const allowRoads = !extensionRush && ctx.spawnCap >= 400;
 
 	const push = (type, x, y, tag, meta) => {
 		if (slotsLeft(room, type) <= 0 && type !== STRUCTURE_ROAD && type !== STRUCTURE_RAMPART &&
@@ -216,53 +232,7 @@ function candidates(room, spawn, remotes, ctx) {
 		jobs.push({ type, x, y, tag, meta: meta || {} });
 	};
 
-	// --- Logistics nodes (containers / links near features) ---
-	for (const source of ctx.sources) {
-		const has = source.pos.findInRange(FIND_STRUCTURES, 1, {
-			filter: s => s.structureType === STRUCTURE_CONTAINER,
-		}).length;
-		const site = source.pos.findInRange(FIND_MY_CONSTRUCTION_SITES, 1, {
-			filter: s => s.structureType === STRUCTURE_CONTAINER,
-		}).length;
-		if (!has && !site) {
-			const spot = openNear(source.pos, 1)[0];
-			if (spot) push(STRUCTURE_CONTAINER, spot.pos.x, spot.pos.y, 'container:source', { feature: 'source', id: source.id });
-		}
-		// Link candidates near sources when unlocked
-		if (maxOf(STRUCTURE_LINK, rcl) > 0) {
-			const hasL = source.pos.findInRange(FIND_MY_STRUCTURES, 2, {
-				filter: s => s.structureType === STRUCTURE_LINK,
-			}).length;
-			if (!hasL && slotsLeft(room, STRUCTURE_LINK) > 0) {
-				const spot = openNear(source.pos, 2, { avoidPads: pads })[0];
-				if (spot) push(STRUCTURE_LINK, spot.pos.x, spot.pos.y, 'link:source', { feature: 'source' });
-			}
-		}
-	}
-
-	if (!ctx.ctrlHasEnergySpot && room.controller) {
-		const spot = openNear(room.controller.pos, 2)[0];
-		if (spot) push(STRUCTURE_CONTAINER, spot.pos.x, spot.pos.y, 'container:controller', { feature: 'controller' });
-		if (maxOf(STRUCTURE_LINK, rcl) > 0 && slotsLeft(room, STRUCTURE_LINK) > 0) {
-			const spotL = openNear(room.controller.pos, 2, { avoidPads: pads })[0];
-			if (spotL) push(STRUCTURE_LINK, spotL.pos.x, spotL.pos.y, 'link:controller', { feature: 'controller' });
-		}
-	}
-
-	if (!ctx.spawnHasStaging && !ctx.storage) {
-		const spot = openNear(spawn.pos, 2, { avoidPads: pads })[0];
-		if (spot) push(STRUCTURE_CONTAINER, spot.pos.x, spot.pos.y, 'container:spawn', { feature: 'spawn' });
-	}
-
-	// Filler pad roads
-	for (const p of pads) {
-		const pos = new RoomPosition(p.x, p.y, room.name);
-		if (!pos.lookFor(LOOK_STRUCTURES).some(s => s.structureType === STRUCTURE_ROAD)) {
-			push(STRUCTURE_ROAD, p.x, p.y, 'road:fillerPad', { feature: 'filler' });
-		}
-	}
-
-	// --- Extensions (checkerboard around spawn) ---
+	// --- Extensions first (RCL2 capacity is the binding constraint) ---
 	if (slotsLeft(room, STRUCTURE_EXTENSION) > 0) {
 		let n = 0;
 		for (let r = 1; r <= 7 && n < 12; r++) {
@@ -277,6 +247,59 @@ function candidates(room, spawn, remotes, ctx) {
 					n++;
 				}
 			}
+		}
+	}
+
+	// During extension rush, skip containers/roads so all build energy grows spawn bandwidth.
+	if (extensionRush) return jobs;
+
+	// --- Logistics nodes (containers / links near features) ---
+	if (allowContainers) {
+		for (const source of ctx.sources) {
+			const has = source.pos.findInRange(FIND_STRUCTURES, 1, {
+				filter: s => s.structureType === STRUCTURE_CONTAINER,
+			}).length;
+			const site = source.pos.findInRange(FIND_MY_CONSTRUCTION_SITES, 1, {
+				filter: s => s.structureType === STRUCTURE_CONTAINER,
+			}).length;
+			if (!has && !site) {
+				const spot = openNear(source.pos, 1)[0];
+				if (spot) push(STRUCTURE_CONTAINER, spot.pos.x, spot.pos.y, 'container:source', { feature: 'source', id: source.id });
+			}
+			// Link candidates near sources when unlocked
+			if (maxOf(STRUCTURE_LINK, rcl) > 0) {
+				const hasL = source.pos.findInRange(FIND_MY_STRUCTURES, 2, {
+					filter: s => s.structureType === STRUCTURE_LINK,
+				}).length;
+				if (!hasL && slotsLeft(room, STRUCTURE_LINK) > 0) {
+					const spot = openNear(source.pos, 2, { avoidPads: pads })[0];
+					if (spot) push(STRUCTURE_LINK, spot.pos.x, spot.pos.y, 'link:source', { feature: 'source' });
+				}
+			}
+		}
+
+		if (!ctx.ctrlHasEnergySpot && room.controller) {
+			const spot = openNear(room.controller.pos, 2)[0];
+			if (spot) push(STRUCTURE_CONTAINER, spot.pos.x, spot.pos.y, 'container:controller', { feature: 'controller' });
+			if (maxOf(STRUCTURE_LINK, rcl) > 0 && slotsLeft(room, STRUCTURE_LINK) > 0) {
+				const spotL = openNear(room.controller.pos, 2, { avoidPads: pads })[0];
+				if (spotL) push(STRUCTURE_LINK, spotL.pos.x, spotL.pos.y, 'link:controller', { feature: 'controller' });
+			}
+		}
+
+		if (!ctx.spawnHasStaging && !ctx.storage) {
+			const spot = openNear(spawn.pos, 2, { avoidPads: pads })[0];
+			if (spot) push(STRUCTURE_CONTAINER, spot.pos.x, spot.pos.y, 'container:spawn', { feature: 'spawn' });
+		}
+	}
+
+	if (!allowRoads) return jobs;
+
+	// Filler pad roads
+	for (const p of pads) {
+		const pos = new RoomPosition(p.x, p.y, room.name);
+		if (!pos.lookFor(LOOK_STRUCTURES).some(s => s.structureType === STRUCTURE_ROAD)) {
+			push(STRUCTURE_ROAD, p.x, p.y, 'road:fillerPad', { feature: 'filler' });
 		}
 	}
 
@@ -515,21 +538,24 @@ function scoreJob(job, room, ctx) {
 // Public API
 // ---------------------------------------------------------------------------
 
-const SITE_BUDGET = 6;
 const MIN_SCORE = 12;
-const PLAN_COOLDOWN = 10;
 
 function run(room, remotes) {
 	if (!room.controller || !room.controller.my) return;
 	const spawn = room.find(FIND_MY_SPAWNS)[0];
 	if (!spawn) return;
 
-	const apex = room.memory.apex ||= {};
-	if (apex._planAt && Game.time - apex._planAt < PLAN_COOLDOWN) return;
-	apex._planAt = Game.time;
+	const rcl = room.controller.level || 1;
+	const planCooldown = config.plannerCooldown || 10;
+	const planAt = getPlanAt(room.name);
+	if (planAt && Game.time - planAt < planCooldown) return;
 
-	// Don't pile infinite sites — builders are the real constraint
-	if (room.find(FIND_MY_CONSTRUCTION_SITES).length >= 18) return;
+	const siteCap = maxOpenSites();
+	const open = room.find(FIND_MY_CONSTRUCTION_SITES).length;
+	if (open >= siteCap) {
+		setPlanDebug(room.name, `site_cap:${open}`, 0, []);
+		return;
+	}
 
 	const ctx = analyze(room, spawn);
 	ensureFillerPads(room, spawn);
@@ -548,10 +574,14 @@ function run(room, remotes) {
 	const scored = unique.map(j => ({ job: j, score: scoreJob(j, room, ctx) }));
 	scored.sort((a, b) => b.score - a.score);
 
+	const siteBudget = Math.min(
+		config.plannerSiteBudget || 4,
+		Math.max(0, siteCap - open),
+	);
 	let placed = 0;
 	const placedTags = [];
 	for (const { job, score } of scored) {
-		if (placed >= SITE_BUDGET) break;
+		if (placed >= siteBudget) break;
 		if (score < MIN_SCORE) break;
 		if (trySite(room, job.x, job.y, job.type)) {
 			placed++;
@@ -559,16 +589,46 @@ function run(room, remotes) {
 		}
 	}
 
-	apex.planTop = scored[0] ? `${scored[0].job.tag}@${scored[0].score.toFixed(1)}` : 'none';
-	apex.planPlaced = placed;
-	apex.planTags = placedTags.slice(0, 5);
-	// Keep planTier name for old visuals
-	apex.planTier = scored[0] ? scored[0].job.tag : 'idle';
+	const top = scored[0] ? `${scored[0].job.tag}@${scored[0].score.toFixed(1)}` : 'none';
+	setPlanDebug(room.name, top, placed, placedTags.slice(0, 5));
 }
 
 function runRemote(room) {
 	if (!room) return;
-	// Same philosophy: score remote jobs; containers usually win when missing.
+	// Use highest owned RCL + spawn capacity as gate — don't steal builders
+	// from home extension rush with remote containers/roads.
+	let homeRcl = 0;
+	let homeCap = 0;
+	for (const n in Game.rooms) {
+		const r = Game.rooms[n];
+		if (!r.controller || !r.controller.my) continue;
+		if (r.controller.level > homeRcl) homeRcl = r.controller.level;
+		for (const s of r.find(FIND_MY_STRUCTURES)) {
+			if (s.structureType === STRUCTURE_SPAWN || s.structureType === STRUCTURE_EXTENSION) {
+				homeCap += s.store.getCapacity(RESOURCE_ENERGY) || 0;
+			}
+		}
+	}
+	// Remote infra only after home can field 5W (cap≥550) — real: don't steal builders
+	// from extension rush. No RCL magic number.
+	// Wait until home can field 5W miners (capacity ≥ 550) before remote infra
+	if (homeCap < 550) return;
+	// Cooldown + site budget (shared with home pressure)
+	const key = `_remotePlan_${room.name}`;
+	const last = Memory.empire && Memory.empire[key];
+	if (last && Game.time - last < (config.plannerCooldown || 10)) return;
+	if (Memory.empire) Memory.empire[key] = Game.time;
+
+	const homeSites = (() => {
+		let n = 0;
+		for (const rn in Game.rooms) {
+			const r = Game.rooms[rn];
+			if (r.controller && r.controller.my) n += r.find(FIND_MY_CONSTRUCTION_SITES).length;
+		}
+		return n;
+	})();
+	if (homeSites >= maxSitesForRcl(homeRcl)) return;
+
 	const jobs = [];
 	const sources = room.find(FIND_SOURCES);
 	for (const source of sources) {
@@ -585,20 +645,20 @@ function runRemote(room) {
 					type: STRUCTURE_CONTAINER,
 					x: spot.pos.x,
 					y: spot.pos.y,
-					score: 100, // missing remote container is almost always correct
+					score: 100,
 					tag: 'remote-container',
 				});
 			}
 		}
 	}
-	// Roads only if containers exist or are queued
+	// Roads once home can afford logistics (cap≥400); not an RCL number
 	const needContainer = jobs.some(j => j.type === STRUCTURE_CONTAINER);
-	if (!needContainer) {
+	if (!needContainer && homeCap >= 400) {
 		const center = new RoomPosition(25, 25, room.name);
 		for (const source of sources) {
 			const path = source.pos.findPathTo(center, { ignoreCreeps: true, maxOps: 2000 });
 			let i = 0;
-			for (const step of path.slice(0, 10)) {
+			for (const step of path.slice(0, 8)) {
 				jobs.push({
 					type: STRUCTURE_ROAD,
 					x: step.x,
@@ -612,8 +672,9 @@ function runRemote(room) {
 	}
 	jobs.sort((a, b) => b.score - a.score);
 	let placed = 0;
+	const budget = Math.min(2, (config.plannerSiteBudget || 4));
 	for (const j of jobs) {
-		if (placed >= 3) break;
+		if (placed >= budget) break;
 		if (trySite(room, j.x, j.y, j.type)) placed++;
 	}
 }
@@ -626,3 +687,5 @@ module.exports = {
 	candidates,
 	scoreJob,
 };
+
+export { run, runRemote, ensureFillerPads, analyze, candidates, scoreJob };

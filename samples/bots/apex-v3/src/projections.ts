@@ -1,3 +1,5 @@
+// @ts-nocheck — ported from JS; tighten types incrementally
+/* eslint-disable */
 /**
  * Apex v3 — pure economy projection math.
  *
@@ -11,6 +13,13 @@
  */
 
 'use strict';
+
+// Role numbers match memoryKeys.Role (avoid requiring memoryKeys here — COLOR_* globals)
+const Role = {
+	filler: 5,
+	upgrader: 6,
+	builder: 7,
+};
 
 // ---------------------------------------------------------------------------
 // Constants (mirror Screeps; overridable via exports.CONST for tests)
@@ -64,10 +73,10 @@ const CONST = {
 	/** Fraction of energy surplus reserved for military after economy needs. */
 	MILITARY_BUDGET_FACTOR: 0.35,
 
-	/** RCL gate before remotes are considered affordable. */
-	REMOTE_MIN_RCL: 3,
-	/** Soft cap remotes per colony (spawn / CPU sanity). */
-	MAX_REMOTES_SOFT: 6,
+	/** No RCL ladder — remotes from first spawn. Kept 0 for affordRemotes API. */
+	REMOTE_MIN_RCL: 0,
+	/** No artificial room cap; spawn duty filters packages. */
+	MAX_REMOTES_SOFT: 99,
 
 	/** Spawn priority order for consumers (spawn.js, combat). Lower index = higher prio. */
 	SPAWN_PRIORITY: [
@@ -747,13 +756,12 @@ function estimateStaffing(ctx) {
 	// needed ≈ spawnCap / 50 ticks average drain under load → scale carry.
 	let fillerCount = 0;
 	let fillerCarry = 4;
-	if (ext > 0 || rcl >= 2) {
-		fillerCount = 1;
-		// More extensions → bigger filler (2C per ~5 extensions, min 4, max 16)
+	if (ext > 0 || spawnCap > 300) {
+		// Scale fillers with spawn network size (not RCL). ~1 per 10 extensions.
+		fillerCount = Math.max(1, Math.ceil((ext + 1) / 10));
 		fillerCarry = clamp(4 + Math.floor(ext / 5) * 2, 4, 16);
-		if (ext >= 30) fillerCount = 2; // RCL 6+ comfort
 		recommendations.push({
-			role: 'filler',
+			role: Role.filler,
 			count: fillerCount,
 			reason: `extensions=${ext}; carry≈${fillerCarry} to keep spawns topped`,
 			carryParts: fillerCarry,
@@ -786,10 +794,11 @@ function estimateStaffing(ctx) {
 		if (upgradeBudget >= 2 || storageEnergy > 10_000) {
 			upgraderWork = Math.max(2, Math.floor(upgradeBudget));
 			// ~5 WORK per upgrader mid-game
-			const workEach = rcl >= 6 ? 10 : rcl >= 4 ? 5 : 2;
-			upgraderCount = Math.max(1, Math.min(6, Math.ceil(upgraderWork / workEach)));
+			const workEach = Math.min(15, Math.max(2, Math.floor(spawnCap / 100)));
+			// No max-upgrader count — ceil by WORK demand only
+			upgraderCount = Math.max(1, Math.ceil(upgraderWork / workEach));
 			recommendations.push({
-				role: 'upgrader',
+				role: Role.upgrader,
 				count: upgraderCount,
 				reason: `surplus≈${surplusEt.toFixed(1)} e/t; budget ${upgradeBudget.toFixed(1)} e/t upgrade`,
 				workParts: workEach,
@@ -798,7 +807,7 @@ function estimateStaffing(ctx) {
 			// Always keep a minimal upgrader so controller never decays hard
 			upgraderCount = 1;
 			recommendations.push({
-				role: 'upgrader',
+				role: Role.upgrader,
 				count: 1,
 				reason: 'minimal controller progress / safety',
 				workParts: 2,
@@ -808,7 +817,7 @@ function estimateStaffing(ctx) {
 		// RCL8: 15 WORK cap on upgrade; 1–2 upgraders
 		upgraderCount = storageEnergy > 50_000 ? 2 : 1;
 		recommendations.push({
-			role: 'upgrader',
+			role: Role.upgrader,
 			count: upgraderCount,
 			reason: 'RCL8 maintenance upgrade (15 WORK cap)',
 			workParts: 15,
@@ -822,7 +831,7 @@ function estimateStaffing(ctx) {
 		// Don't starve upgrade: if surplus thin, cap builders
 		if (surplusEt < 5) builderCount = Math.min(builderCount, 1);
 		recommendations.push({
-			role: 'builder',
+			role: Role.builder,
 			count: builderCount,
 			reason: `constructionSites=${sites}`,
 		});
@@ -830,7 +839,7 @@ function estimateStaffing(ctx) {
 		// Walls / idle build pressure
 		builderCount = 1;
 		recommendations.push({
-			role: 'builder',
+			role: Role.builder,
 			count: 1,
 			reason: 'storage high — wall grind / repair pressure',
 		});
@@ -930,3 +939,5 @@ module.exports = {
 	estimateLocalSources,
 	buildHaulerBody,
 };
+
+export {};

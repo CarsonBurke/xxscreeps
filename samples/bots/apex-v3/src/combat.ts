@@ -1,3 +1,5 @@
+// @ts-nocheck — ported from JS; tighten types incrementally
+/* eslint-disable */
 /**
  * Apex v3 combat role runners + tower helpers.
  *
@@ -7,8 +9,12 @@
  *
  * Exports runners for roles.js and attackTarget / tower helpers for defense.
  */
-const config = require('config');
-const { militaryParts, energyOf, hostileThreat, moveToRoom, goDo } = require('util');
+const config = require('./config');
+const { militaryParts, energyOf, hostileThreat, moveToRoom, goDo } = require('./util');
+const {
+	getRole, getHome, getTargetRoom, getSquad, getMarching, setMarching,
+	getDefendRoom, getCampaignId, getSafeTicks, setSafeTicks, Role,
+} = require('./creepMem');
 
 /** Role-tuned moveTo wrapper (apex-v3 has no traffic.js). */
 function moveCreep(creep, target, opts = {}) {
@@ -30,12 +36,18 @@ function moveCreep(creep, target, opts = {}) {
  * Falls back to hostile structures (towers → spawns → ramparts → rest).
  * Also targets invader cores when no creeps.
  */
+const { isSourceKeeperCreep } = require('./util');
+
 function attackTarget(room) {
 	if (!room) return null;
 
 	const hostiles = room.find(FIND_HOSTILE_CREEPS);
 	if (hostiles.length) {
+		// SK rooms: kill keepers first so miners can sit on sources
 		hostiles.sort((a, b) => {
+			const ka = isSourceKeeperCreep(a) ? 0 : 1;
+			const kb = isSourceKeeperCreep(b) ? 0 : 1;
+			if (ka !== kb) return ka - kb;
 			const ha = a.getActiveBodyparts(HEAL);
 			const hb = b.getActiveBodyparts(HEAL);
 			if (ha !== hb) return hb - ha;
@@ -110,7 +122,7 @@ function rallyPos(creep) {
 		const p = empire.rally.pos;
 		return new RoomPosition(p.x, p.y, p.roomName || empire.rally.room);
 	}
-	const home = creep.memory.home;
+	const home = getHome(creep);
 	if (home && Game.rooms[home]) {
 		const spawn = Game.rooms[home].find(FIND_MY_SPAWNS)[0];
 		if (spawn) return spawn.pos;
@@ -123,10 +135,10 @@ function rallyPos(creep) {
  */
 function squadReadyToMarch(creep) {
 	if (config.squadRallyBeforeMarch === false) return true;
-	if (creep.memory.marching) return true;
+	if (getMarching(creep)) return true;
 
-	const squadId = creep.memory.squad;
-	const targetRoom = creep.memory.targetRoom;
+	const squadId = getSquad(creep);
+	const targetRoom = getTargetRoom(creep);
 	if (!squadId || !targetRoom) return true;
 
 	const want = config.attackSquad || { attackers: 2, healers: 2, ranged: 1 };
@@ -141,11 +153,11 @@ function squadReadyToMarch(creep) {
 	let atRally = 0;
 	for (const name in Game.creeps) {
 		const c = Game.creeps[name];
-		if (!c.memory || c.memory.squad !== squadId) continue;
+		if (getSquad(c) !== squadId) continue;
 		if (c.spawning) continue;
 		members++;
-		if (c.memory.marching) {
-			creep.memory.marching = true;
+		if (getMarching(c)) {
+			setMarching(creep, true);
 			return true;
 		}
 		if (rally && c.pos.inRangeTo(rally, range + 2)) atRally++;
@@ -156,7 +168,7 @@ function squadReadyToMarch(creep) {
 	if (atRally >= Math.ceil(expected * 0.75) && members >= Math.ceil(need * 0.5)) {
 		for (const name in Game.creeps) {
 			const c = Game.creeps[name];
-			if (c.memory && c.memory.squad === squadId) c.memory.marching = true;
+			if (getSquad(c) === squadId) setMarching(c, true);
 		}
 		return true;
 	}
@@ -207,13 +219,16 @@ function kiteAway(creep, enemy, range = 3) {
 // ---------------------------------------------------------------------------
 
 function runAttacker(creep) {
-	const targetRoom = creep.memory.targetRoom;
+	const targetRoom = getTargetRoom(creep);
 	if (!targetRoom) {
 		// No assignment: defend home.
 		return runDefender(creep);
 	}
 
-	if (!squadReadyToMarch(creep)) {
+	// Solo SK killers: no war-squad rally — go kill keepers immediately
+	const squadId = getSquad(creep);
+	const isSkDuty = squadId && String(squadId).indexOf('sk_') === 0;
+	if (!isSkDuty && !squadReadyToMarch(creep)) {
 		goToRally(creep);
 		return;
 	}
@@ -225,8 +240,15 @@ function runAttacker(creep) {
 
 	const target = attackTarget(creep.room);
 	if (!target) {
-		const flag = creep.memory.flag && Game.flags[creep.memory.flag];
-		if (flag && !creep.pos.inRangeTo(flag, 2)) moveCreep(creep, flag);
+		// SK clear: park near a source / lair so we re-engage on respawn
+		const lair = creep.room.find(FIND_STRUCTURES, {
+			filter: s => s.structureType === 'keeperLair' ||
+				(typeof STRUCTURE_KEEPER_LAIR !== 'undefined' &&
+					s.structureType === STRUCTURE_KEEPER_LAIR),
+		})[0];
+		const src = creep.pos.findClosestByRange(FIND_SOURCES);
+		const hold = lair || src || creep.room.controller || new RoomPosition(25, 25, creep.room.name);
+		if (!creep.pos.inRangeTo(hold, 3)) moveCreep(creep, hold);
 		return;
 	}
 	meleeEngage(creep, target);
@@ -234,7 +256,7 @@ function runAttacker(creep) {
 }
 
 function runRanged(creep) {
-	const targetRoom = creep.memory.targetRoom;
+	const targetRoom = getTargetRoom(creep);
 	if (!targetRoom) return runDefender(creep);
 
 	if (!squadReadyToMarch(creep)) {
@@ -269,15 +291,15 @@ function runRanged(creep) {
 }
 
 function runHealer(creep) {
-	const targetRoom = creep.memory.targetRoom;
-	const squadId = creep.memory.squad;
+	const targetRoom = getTargetRoom(creep);
+	const squadId = getSquad(creep);
 
 	// Stick to lowest-HP ally in squad (or any nearby ally).
 	let patients = [];
 	for (const name in Game.creeps) {
 		const c = Game.creeps[name];
 		if (!c.my) continue;
-		if (squadId && c.memory && c.memory.squad === squadId) patients.push(c);
+		if (squadId && getSquad(c) === squadId) patients.push(c);
 	}
 	if (!patients.length) {
 		patients = creep.pos.findInRange(FIND_MY_CREEPS, 10);
@@ -318,7 +340,7 @@ function runHealer(creep) {
 }
 
 function runDismantler(creep) {
-	const targetRoom = creep.memory.targetRoom;
+	const targetRoom = getTargetRoom(creep);
 	if (!targetRoom) return;
 
 	if (!squadReadyToMarch(creep)) {
@@ -360,12 +382,12 @@ function runDismantler(creep) {
 }
 
 /**
- * Home (or defend-flag) military. Recycles after long safe stretch.
- * memory.defendRoom / memory.targetRoom can station defender off-home.
+ * Home / defend-station military. Recycles after long safe stretch.
+ * CreepMem.defendRoom / targetRoom station defender off-home.
  */
 function runDefender(creep) {
-	const home = creep.memory.home || creep.room.name;
-	const station = creep.memory.defendRoom || creep.memory.targetRoom || home;
+	const home = getHome(creep) || creep.room.name;
+	const station = getDefendRoom(creep) || getTargetRoom(creep) || home;
 
 	// Hunt hostiles in current room first.
 	let hostiles = creep.room.find(FIND_HOSTILE_CREEPS);
@@ -384,15 +406,16 @@ function runDefender(creep) {
 	}
 
 	if (!hostiles.length) {
-		creep.memory.safeTicks = (creep.memory.safeTicks || 0) + 1;
+		const safe = getSafeTicks(creep) + 1;
+		setSafeTicks(creep, safe);
 		const recycleAfter = (config.defenderRecycleSafeTicks != null)
 			? config.defenderRecycleSafeTicks
 			: 200;
 
-		// Campaign / flag defenders do not auto-recycle while assigned.
-		const sticky = !!(creep.memory.campaignId || creep.memory.defendRoom);
+		// Campaign / intent defenders do not auto-recycle while assigned.
+		const sticky = !!(getCampaignId(creep) || getDefendRoom(creep));
 
-		if (!sticky && creep.memory.safeTicks >= recycleAfter) {
+		if (!sticky && safe >= recycleAfter) {
 			const homeRoom = Game.rooms[home];
 			const spawn = homeRoom && homeRoom.find(FIND_MY_SPAWNS)[0];
 			if (spawn) {
@@ -407,7 +430,7 @@ function runDefender(creep) {
 				moveCreep(creep, spawn, { range: 1, reusePath: 20 });
 				return;
 			}
-			if (creep.memory.safeTicks > recycleAfter + 100) creep.suicide();
+			if (safe > recycleAfter + 100) creep.suicide();
 			return;
 		}
 
@@ -424,7 +447,7 @@ function runDefender(creep) {
 		return;
 	}
 
-	creep.memory.safeTicks = 0;
+	setSafeTicks(creep, 0);
 	hostiles.sort((a, b) => militaryParts(b) - militaryParts(a) || a.hits - b.hits);
 	const target = hostiles[0];
 	if (creep.getActiveBodyparts(RANGED_ATTACK) && creep.pos.inRangeTo(target, 3)) {
@@ -530,16 +553,37 @@ function runDefense(room) {
 // Squad counting (used by war.js and legacy attack lists)
 // ---------------------------------------------------------------------------
 
-const MILITARY_ROLES = [ 'attacker', 'ranged', 'healer', 'dismantler', 'defender' ];
+const MILITARY_ROLES = [
+	Role.attacker, Role.ranged, Role.healer, Role.dismantler, Role.defender,
+];
 
 function squadCounts(targetRoom, campaignId) {
-	const counts = { attacker: 0, ranged: 0, healer: 0, dismantler: 0, defender: 0 };
+	const counts = {
+		[Role.attacker]: 0,
+		[Role.ranged]: 0,
+		[Role.healer]: 0,
+		[Role.dismantler]: 0,
+		[Role.defender]: 0,
+		// string aliases for war squad field mapping
+		attacker: 0, ranged: 0, healer: 0, dismantler: 0, defender: 0,
+	};
 	for (const name in Game.creeps) {
 		const c = Game.creeps[name];
-		if (!c.memory) continue;
-		if (campaignId && c.memory.campaignId !== campaignId) continue;
-		if (!campaignId && c.memory.targetRoom !== targetRoom) continue;
-		if (counts[c.memory.role] != null) counts[c.memory.role]++;
+		if (campaignId && getCampaignId(c) !== campaignId) continue;
+		if (!campaignId && getTargetRoom(c) !== targetRoom) continue;
+		const role = getRole(c);
+		if (counts[role] != null) {
+			counts[role]++;
+			// keep string keys in sync for war.spawnRequests
+			const alias = {
+				[Role.attacker]: 'attacker',
+				[Role.ranged]: 'ranged',
+				[Role.healer]: 'healer',
+				[Role.dismantler]: 'dismantler',
+				[Role.defender]: 'defender',
+			}[role];
+			if (alias) counts[alias]++;
+		}
 	}
 	return counts;
 }
@@ -581,3 +625,5 @@ module.exports = {
 	creepBodyCost,
 	MILITARY_ROLES,
 };
+
+export {};

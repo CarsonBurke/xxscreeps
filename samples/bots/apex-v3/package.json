@@ -1,0 +1,8 @@
+{
+  "name": "apex-v3",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "watch": "tsc -p tsconfig.json -w"
+  }
+}

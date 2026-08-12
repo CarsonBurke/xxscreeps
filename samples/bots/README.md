@@ -8,13 +8,14 @@ Player scripts you can load into an xxscreeps world. Directories are **flat modu
 |---------|------|--------|
 | v1 | [`apex/`](./apex/) | Original multi-room sample |
 | v2 | [`apex-v2/`](./apex-v2/) | Traffic / FSM remotes / stats |
-| **v3** | [`apex-v3/`](./apex-v3/) | **Delegated roles**, GCL-first expansion heuristics, priority base planner, war + economy |
+| **v3** | [`apex-v3/`](./apex-v3/) | **TypeScript** · enum memory keys · coords · delegated roles · utility planner · war/economy |
 
 ```bash
-npx xxscreeps manage bot add apex-v3 samples/bots/apex-v3 --spawn W5N5
+cd samples/bots/apex-v3 && npx tsc -p tsconfig.json
+npx xxscreeps manage bot add apex-v3 samples/bots/apex-v3/dist --spawn W5N5
 ```
 
-See [apex-v3/README.md](./apex-v3/README.md).
+See [apex-v3/README.md](./apex-v3/README.md). Memory keys follow International-style short/enum packing (char-count cost).
 
 ## Metrics → TensorBoard
 

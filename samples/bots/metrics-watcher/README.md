@@ -8,21 +8,25 @@ The bot never imports TensorBoard / torch.
 
 ## Quick path (bench)
 
+Bench **generates TensorBoard on the fly** (default on):
+
 ```bash
-# 1) Run a sim (Node 24+)
+# Run sim — metrics.jsonl + tb/ event files (watch.py --follow)
 mise exec node@24 -- node --import xxscreeps/loader \
-  samples/bots/apex/bench.mjs 5000
+  samples/bots/apex/bench.mjs 5000 samples/bots/apex-v3/dist
 
-# 2) Convert JSONL → TensorBoard
-python3 samples/bots/metrics-watcher/watch.py \
-  --jsonl samples/bots/apex/runs/latest/metrics.jsonl \
-  --logdir samples/bots/apex/runs/latest/tb
-
-# 3) View
 tensorboard --logdir samples/bots/apex/runs/latest/tb
 ```
 
-Follow a live dump:
+Disable TB:
+
+```bash
+mise exec node@24 -- node --import xxscreeps/loader \
+  samples/bots/apex/bench.mjs 5000 samples/bots/apex-v3/dist --no-tb
+# or: APEX_BENCH_TB=0 …
+```
+
+Manual convert / follow (still supported):
 
 ```bash
 python3 samples/bots/metrics-watcher/watch.py \
@@ -40,12 +44,18 @@ python3 samples/bots/metrics-watcher/watch.py \
 | `empire/creeps` | Live creep count |
 | `empire/sites` | Construction backlog |
 | `empire/stored_energy` | Sum of storage energy |
-| `energy/*_total` / `*_rate` | Harvest / build / upgrade / spawn body cost |
-| `controller/*` | Control points, progress |
+| `energy/*_total` | Lifetime harvest / build / upgrade / spawn cost |
+| **`energy/harvested_per_tick`** | **Harvest e/t** (primary income meter) |
+| `energy/build_per_tick` | Build spend e/t |
+| `energy/upgrade_per_tick` | Upgrade spend e/t |
+| **`controller/control_points_per_tick`** | **Control points / tick** |
+| `controller/*_total`, `progress` | Lifetime CP, controller progress |
 | `gcl/level` | GCL |
 | `cpu/used`, `cpu/bucket` | End-of-tick CPU |
 
-Step = **game tick**. Bot writes segment every 5 ticks; counters still accumulate every tick.
+Step = **game tick**. Bot writes segment every 5 ticks with windowed rates (`hr`/`cr`/`ur`/`br`); watcher falls back to Δtotals if rates missing.
+
+Target income with full local + remotes: **≥ 40 e/t** (`harvested_per_tick`).
 
 ## Dependencies
 

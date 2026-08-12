@@ -1,10 +1,7 @@
-/**
- * Tower defense + safe mode.
- */
-const config = require('config');
-const { energyOf, militaryParts, hostileThreat } = require('util');
+import config = require('./config');
+import { energyOf, hostileThreat, militaryParts } from './util';
 
-function hostileScore(creep) {
+function hostileScore(creep: Creep): number {
 	let score = 0;
 	score += creep.getActiveBodyparts(HEAL) * 1000;
 	score += creep.getActiveBodyparts(RANGED_ATTACK) * 40;
@@ -13,21 +10,22 @@ function hostileScore(creep) {
 	return score;
 }
 
-function run(room) {
+export function run(room: Room): void {
 	const towers = room.find(FIND_MY_STRUCTURES, {
-		filter: s => s.structureType === STRUCTURE_TOWER && energyOf(s.store) > 0,
-	});
+		filter: s => s.structureType === STRUCTURE_TOWER && energyOf((s as StructureTower).store) > 0,
+	}) as StructureTower[];
+
 	if (towers.length) {
 		const hostiles = room.find(FIND_HOSTILE_CREEPS);
 		if (hostiles.length) {
 			hostiles.sort((a, b) => hostileScore(b) - hostileScore(a));
-			for (const tower of towers) tower.attack(hostiles[0]);
+			for (const tower of towers) tower.attack(hostiles[0]!);
 		} else {
 			const hurt = room.find(FIND_MY_CREEPS, { filter: c => c.hits < c.hitsMax });
 			if (hurt.length) {
 				hurt.sort((a, b) => a.hits / a.hitsMax - b.hits / b.hitsMax);
 				for (const tower of towers) {
-					if (energyOf(tower.store) > 200) tower.heal(hurt[0]);
+					if (energyOf(tower.store) > 200) tower.heal(hurt[0]!);
 				}
 			}
 		}
@@ -47,5 +45,3 @@ function run(room) {
 		if (ctrl.activateSafeMode() === OK) console.log(`Apex v3 SAFE MODE ${room.name}`);
 	}
 }
-
-module.exports = { run };
