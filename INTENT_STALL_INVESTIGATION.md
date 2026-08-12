@@ -1,7 +1,7 @@
 # Intent-handoff stalls at high tick rates — investigation notes
 
-**Status:** diagnosed to a probable root cause, not yet fixed. This doc is a handoff for whoever
-picks it up.
+**Status:** resolved. The processor's idle transition lost wakeups; the tick-aware wake latch
+described below fixes the race and passed the sustained-load acceptance run.
 
 ## Symptom
 
@@ -113,17 +113,20 @@ A subtlety for the "all four rooms at once" case: the runner runs all 4 users an
 four `process` publishes into the same delivery burst while both workers are mid-unwind, losing
 all four wakeups together.
 
-### Suggested fix directions (pick one, verify under load)
+### Resolution
 
-- **Re-check after declaring idle**: after `worker.idle = true`, do one more
-  `ZPopByScore`/`zCard` on `processRoomsSetKey(time)`; if non-empty, flip back and loop. Closes
-  the window because the publisher's decrement is already visible in scratch by the time the
-  wakeup would be lost. (The publish-after-write ordering in `publishRunnerIntentsForRooms` is
-  correct; only the consumer-side sleep transition is racy.)
-- **Buffer missed activations**: in the `process` handler, when no worker is idle, record a
-  pending-activation flag; workers check it before setting `idle = true`.
-- Don't try to fix it by making the message handler retry/spin — the queue state in scratch is the
-  source of truth; the fix belongs at the sleep transition.
+The processor now buffers missed activations on each busy worker. The buffer carries the requested
+tick rather than a boolean because finalization can finish while the previous tick's terminal queue
+poll is still unwinding. Before a worker becomes idle it drains the newest requested tick; same-tick
+wakes force another drain, older wakes are rejected, and notifications for an already finalized tick
+are ignored. Idle workers are still preferred, with only the required number of busy workers latched.
+
+The idle decision and latch check are synchronous, so a `process` handler must either observe an idle
+worker and start it or update the pending tick before the worker can sleep. Scratch remains the queue
+source of truth; no polling or retry loop was added.
+
+Regression tests cover same-tick wakes, cross-tick wakes during unwind, newest-tick coalescing, stale
+older notifications in active and idle states, and notifications equal to a finalized tick.
 
 A useful diagnostic while validating: log (or count) transitions where a `process` message with
 `roomNames` finds zero idle workers, and correlate with the `Abandoning` lines. That signature
@@ -184,3 +187,14 @@ after.
    250 ms-timeout mitigation.
 3. Bots remain in `activeUsers` with live creeps (check with a room scan; creep lifetime is 1500
    ticks ≈ 2 s of wall time at these speeds, so momentary zero-creep rooms are normal churn).
+
+## Validation result (2026-07-10)
+
+- Fresh default-world import, `tickSpeed: 0`, `intentAbandonTimeout: 5000`.
+- 600 uninterrupted seconds, 466,783 ticks: **778.0 TPS overall**.
+- **Zero** `Abandoning intents` lines, including startup.
+- All four bot IDs remained in `activeUsers`. A minute-5 room scan found eight live creeps across
+  the bot rooms; zero-creep rooms remained represented by their intent users.
+- Workspace build and strict lint of the changed files passed. All six deterministic wake-scheduler
+  regression tests passed. An adversarial follow-up review found no remaining material issue in the
+  changed scope.
