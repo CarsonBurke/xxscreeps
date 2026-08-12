@@ -1,4 +1,12 @@
-"""PPO with monolithic torch.compile(reduce-overhead) of Agent / Actor / Critic."""
+"""PPO with torch.compile(reduce-overhead) of Actor / Critic (no third agent graph).
+
+GPU focus:
+  · one compiled graph per trunk (actor + critic) — not a third agent monolith
+  · static last-mb pad so reduce-overhead CUDA graphs stay captured
+  · warmup at real minibatch B (not num_envs) so update path does not recompile
+  · sequential actor→critic update (only one trunk's activations live)
+  · TF32 + cudnn.benchmark; contiguous H2D
+"""
 from __future__ import annotations
 
 import time
@@ -10,15 +18,35 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .constants import INTENT_SLOTS, MAX_ACTORS, PPO_CFG
-from .model import Actor, Agent, Critic, maybe_compile
+from .constants import (
+    INTENT_SLOTS,
+    MAX_ACTORS,
+    MAX_TARGETS,
+    N_AMOUNT,
+    N_DIR,
+    N_INTENT,
+    PPO_CFG,
+)
+from .model import Actor, Agent, Critic, configure_cuda_backends, maybe_compile
+
+
+def _mean_actor_then_transition(values: Tensor, live: Tensor) -> Tensor:
+    """Equal-weight team states regardless of their current population.
+
+    A shared team advantage is one sample per transition. Averaging every actor
+    globally would make a 64-creep colony count 64 times more than a bootstrap
+    state with one creep.
+    """
+    live_f = live.to(values.dtype)
+    per_state = (values * live_f).sum(dim=-1) / live_f.sum(dim=-1).clamp_min(1.0)
+    return per_state.mean()
 
 
 @dataclass
 class RolloutBatch:
     obs: dict[str, Tensor]
     actions: dict[str, Tensor]
-    logprob: Tensor
+    logprob: Tensor  # [B, A] per-actor factors; PPO never clips the team product
     value: Tensor
     reward: Tensor
     done: Tensor
@@ -51,6 +79,9 @@ class PPOTrainer:
         self.device = torch.device(device)
         self.compile_model = bool(compile_model)
 
+        if self.device.type == "cuda":
+            configure_cuda_backends()
+
         if agent is not None:
             self.actor = agent.actor
             self.critic = agent.critic
@@ -67,25 +98,18 @@ class PPOTrainer:
         self.actor = self.agent.actor
         self.critic = self.agent.critic
 
-        # Monolithic compiles (whole modules — not subgraph pieces):
-        #   agent_c  — rollout act (actor+critic in one graph, reduce-overhead)
-        #   actor_c  — full Actor for PPO policy update
-        #   critic_c — full Critic for PPO value update
-        # Eager refs kept for optim / state_dict; compiled handles call.
-        self.agent_c = maybe_compile(self.agent, compile_model, "agent-monolith")
+        # Two compiled graphs only (actor + critic). Avoid a third agent-monolith
+        # CUDA graph — that duplicated capture VRAM without saving launches.
         self.actor_c = maybe_compile(self.actor, compile_model, "actor-monolith")
         self.critic_c = maybe_compile(self.critic, compile_model, "critic-monolith")
 
         self.use_bf16 = bool(use_bf16 and self.device.type == "cuda" and torch.cuda.is_bf16_supported())
         actor_lr = lr if lr is not None else float(self.cfg["lr"])
-        # VAPO: critic learns faster
         c_lr = critic_lr if critic_lr is not None else actor_lr * 2.0
 
         self.actor_opt = torch.optim.AdamW(self.actor.parameters(), lr=actor_lr, eps=1e-5)
         self.critic_opt = torch.optim.AdamW(self.critic.parameters(), lr=c_lr, eps=1e-5)
 
-        # Asymmetric policy clip: ratio ∈ [1 − clip, 1 + clipHigh]
-        # Low side stays conservative (0.2); high side allows more probability growth (0.28).
         self.clip = clip if clip is not None else float(self.cfg["clip"])
         self.clip_high = (
             clip_high if clip_high is not None else float(self.cfg.get("clipHigh", self.clip))
@@ -95,74 +119,117 @@ class PPOTrainer:
         self.max_grad_norm = max_grad_norm if max_grad_norm is not None else float(self.cfg["maxGradNorm"])
         self.epochs = epochs if epochs is not None else int(self.cfg["epochs"])
         self.minibatch = minibatch if minibatch is not None else int(self.cfg["minibatch"])
+        self.target_kl = float(self.cfg.get("targetKl", 0.02))
         self._warmed = False
+        # Pinned host scratch for mb staging (set in warmup / first update).
+        self._pin_hold: list[torch.Tensor] = []
 
-    @property
-    def policy(self) -> Agent:
-        """Back-compat for train.py checkpointing."""
-        return self.agent
+    def _autocast(self):
+        if self.use_bf16:
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return nullcontext()
 
     @torch.inference_mode()
     def act(self, obs: dict[str, Tensor], deterministic: bool = False):
-        """Rollout via monolithic agent_c (policy + value, reduce-overhead)."""
-        self.agent.eval()
+        """Rollout: actor then critic (two graphs; no third agent monolith)."""
+        self.actor.eval()
+        self.critic.eval()
         model_obs = {k: v for k, v in obs.items() if not k.startswith("_")}
-        ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if self.use_bf16 else nullcontext()
-        with ctx:
-            out = self.agent_c(model_obs, deterministic=deterministic)
+        with self._autocast():
+            out = self.actor_c(model_obs, deterministic=deterministic)
+            out.value = self.critic_c(model_obs)
         out.logprob = out.logprob.float()
         out.entropy = out.entropy.float()
+        out.actor_logprob = out.actor_logprob.float()
+        out.actor_entropy = out.actor_entropy.float()
         out.value = out.value.float()
         return out
 
+    @torch.inference_mode()
+    def value_only(self, obs: dict[str, Tensor]) -> Tensor:
+        """Critic-only forward (bootstrap / terminal V) — skips actor trunk."""
+        self.critic.eval()
+        model_obs = {k: v for k, v in obs.items() if not k.startswith("_")}
+        with self._autocast():
+            v = self.critic_c(model_obs)
+        return v.float()
+
+    def _expand_obs_to_b(self, obs: dict[str, Tensor], B: int) -> dict[str, Tensor]:
+        """Tile env-batch obs to fixed B for compile capture (update path)."""
+        n0 = next(v.shape[0] for k, v in obs.items() if torch.is_tensor(v) and not k.startswith("_"))
+        if n0 == B:
+            return {k: v for k, v in obs.items() if not k.startswith("_")}
+        out: dict[str, Tensor] = {}
+        reps = (B + n0 - 1) // n0
+        for k, v in obs.items():
+            if k.startswith("_") or not torch.is_tensor(v):
+                continue
+            t = v.repeat((reps,) + (1,) * (v.dim() - 1))[:B]
+            out[k] = t.contiguous()
+        return out
+
     def warmup(self, obs: dict[str, Tensor], *, steps: int = 5) -> None:
-        """Freeze static shapes, then capture reduce-overhead CUDA graphs."""
+        """Freeze room pack; capture reduce-overhead graphs at *update* mb size."""
         if self.device.type != "cuda":
             return
         model_obs = {k: v for k, v in obs.items() if not k.startswith("_")}
-        # Freeze room pack on eager modules before any compiled call
         r = self.agent.freeze_room_pack(model_obs["room_mask"])
+        mb = max(1, int(self.minibatch))
+        n_env = int(model_obs["patches"].shape[0])
         print(
-            f"[ppo] monolithic compile warmup ×{steps} "
-            f"(B={model_obs['patches'].shape[0]} R_pack={r} compile={self.compile_model}) …",
+            f"[ppo] compile warmup ×{steps} "
+            f"(rollout B={n_env} update_mb={mb} R_pack={r} compile={self.compile_model}) …",
             flush=True,
         )
         t0 = time.perf_counter()
-        # Rollout graph (agent-monolith)
+
+        # Capture the ONLY shapes we allow at runtime (dynamic=False):
+        #   act / value_only: B = n_env  (never variable n_term)
+        #   update:           B = mb     (last mb padded to mb)
         for _ in range(steps):
             _ = self.act(model_obs)
-        # Update graphs (actor/critic monoliths) — fixed mb-sized dummy if needed later
+            _ = self.value_only(model_obs)  # same B=n_env as act critic path
+
         if self.compile_model:
+            # Update: train-mode + action=dict (different specialization than act sample).
             self.actor.train()
             self.critic.train()
-            B = model_obs["patches"].shape[0]
-            # Tiny train-mode trace so update path is compiled before first real update
-            n_act = int(model_obs["actors"].shape[1]) if model_obs["actors"].dim() > 1 else MAX_ACTORS
+            mb_obs = self._expand_obs_to_b(model_obs, mb)
+            n_act = int(mb_obs["actors"].shape[1]) if mb_obs["actors"].dim() > 1 else MAX_ACTORS
             dummy_act = {
-                "types": torch.zeros(B, n_act, INTENT_SLOTS, dtype=torch.long, device=self.device),
-                "dirs": torch.zeros(B, n_act, INTENT_SLOTS, dtype=torch.long, device=self.device),
-                "targets": torch.zeros(B, n_act, INTENT_SLOTS, dtype=torch.long, device=self.device),
-                "amounts": torch.zeros(B, n_act, INTENT_SLOTS, dtype=torch.long, device=self.device),
+                "types": torch.zeros(mb, n_act, INTENT_SLOTS, dtype=torch.long, device=self.device),
+                "dirs": torch.zeros(mb, n_act, INTENT_SLOTS, dtype=torch.long, device=self.device),
+                "targets": torch.zeros(mb, n_act, INTENT_SLOTS, dtype=torch.long, device=self.device),
+                "amounts": torch.zeros(mb, n_act, INTENT_SLOTS, dtype=torch.long, device=self.device),
             }
-            ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if self.use_bf16 else nullcontext()
-            with ctx:
-                out = self.actor_c(model_obs, action=dummy_act)
-                v = self.critic_c(model_obs)
+            with self._autocast():
+                out = self.actor_c(mb_obs, action=dummy_act)
+                v = self.critic_c(mb_obs)
             (out.logprob.float().mean() + v.float().mean()).backward()
             self.actor_opt.zero_grad(set_to_none=True)
             self.critic_opt.zero_grad(set_to_none=True)
+            del out, v, dummy_act, mb_obs
             self.actor.eval()
             self.critic.eval()
+            # Re-hit eval act after train capture so both mode specializations exist.
+            for _ in range(2):
+                _ = self.act(model_obs)
+                _ = self.value_only(model_obs)
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
         self._warmed = True
-        print(f"[ppo] warmup done in {time.perf_counter() - t0:.2f}s", flush=True)
+        print(
+            f"[ppo] warmup done in {time.perf_counter() - t0:.2f}s "
+            f"(graphs: act@B={n_env}, value_only@B={n_env}, update@B={mb})",
+            flush=True,
+        )
 
-    def update(self, rollout: RolloutBatch) -> dict[str, float]:
+    def update(self, rollout: RolloutBatch, *, critic_only: bool = False) -> dict[str, float]:
         self.actor.train()
         self.critic.train()
         B = rollout.reward.reshape(-1).shape[0]
-        # Index on CPU so full-rollout tensors can stay host-side (stream mb → GPU).
         idx = torch.arange(B)
         stats = {
             "policy_loss": 0.0,
@@ -179,6 +246,20 @@ class PPOTrainer:
         n_updates = 0
 
         obs_flat = {k: v for k, v in rollout.obs.items() if not k.startswith("_")}
+        action_bounds = {
+            "types": N_INTENT,
+            "dirs": N_DIR,
+            "targets": MAX_TARGETS,
+            "amounts": N_AMOUNT,
+        }
+        for name, upper in action_bounds.items():
+            values = rollout.actions[name]
+            lo = int(values.min().item())
+            hi = int(values.max().item())
+            if lo < 0 or hi >= upper:
+                raise RuntimeError(
+                    f"rollout action {name} outside [0,{upper}): min={lo} max={hi}"
+                )
         for k, v in list(obs_flat.items()):
             if v.shape[0] != B:
                 obs_flat[k] = v.reshape(B, *v.shape[1:])
@@ -192,11 +273,19 @@ class PPOTrainer:
             else:
                 act_flat[k] = v
 
-        old_lp = rollout.logprob.reshape(B)
+        old_lp = rollout.logprob.reshape(B, MAX_ACTORS)
         old_v = rollout.value.reshape(B)
         adv_all = rollout.advantage.reshape(B)
         ret_all = rollout.ret.reshape(B)
 
+        # One stable normalization contract for the rollout. Re-normalizing each
+        # shuffled minibatch changes rare economy advantages by batch composition.
+        if adv_all.numel() >= 2:
+            adv_all = (adv_all - adv_all.mean()) / (adv_all.std(unbiased=False) + 1e-8)
+        else:
+            adv_all = adv_all * 0
+
+        # Host-side EV (no GPU sync on full batch)
         y_pred = old_v.detach().cpu().numpy()
         y_true = ret_all.detach().cpu().numpy()
         var_y = np.var(y_true)
@@ -204,105 +293,177 @@ class PPOTrainer:
             np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
         )
 
-        # Minibatch size = #transitions per step; never larger than full batch B.
-        # No gradient accumulation: each mb does zero_grad → backward → step once.
         mb = max(1, min(int(self.minibatch), B))
         if self.minibatch > B:
-            # e.g. want 2048 but rollout only collected 1024
             print(
                 f"[ppo] minibatch clamped {self.minibatch} → {mb} (full batch B={B})",
                 flush=True,
             )
 
-        for _ in range(self.epochs):
+        early_stop = False
+        stopped_epoch = -1
+        pad_last_mb = self.device.type == "cuda" and self.compile_model and mb > 1
+        pin = self.device.type == "cuda"
+        acc: dict[str, Tensor] | None = None
+
+        for epoch in range(self.epochs):
+            if early_stop:
+                break
             perm = idx[torch.randperm(B)]
             for start in range(0, B, mb):
                 inds = perm[start : start + mb]
                 if inds.numel() == 0:
                     continue
-                # Move only this mb to GPU (full rollout may live on CPU).
-                obs_mb = {
-                    k: v[inds].to(self.device, non_blocking=True)
-                    for k, v in obs_flat.items()
-                    if not k.startswith("_")
+                n_real = int(inds.numel())
+                if pad_last_mb and n_real < mb:
+                    pad = inds[-1:].repeat(mb - n_real)
+                    inds = torch.cat([inds, pad], dim=0)
+
+                # Stream only this mb to GPU; promote uint8→float32 here.
+                self._pin_hold.clear()
+                from .vec_env import promote_obs_device
+
+                obs_mb = promote_obs_device(
+                    {k: v[inds] for k, v in obs_flat.items() if not k.startswith("_")},
+                    self.device,
+                    pin_hold=self._pin_hold,
+                    non_blocking=pin,
+                )
+
+                act_mb = {
+                    k: v[inds].to(self.device, non_blocking=pin)
+                    for k, v in act_flat.items()
                 }
-                act_mb = {k: v[inds].to(self.device, non_blocking=True) for k, v in act_flat.items()}
-                old_lp_mb = old_lp[inds].to(self.device, non_blocking=True)
-                old_v_mb = old_v[inds].to(self.device, non_blocking=True)
-                # CleanRL: norm_adv=True — per-minibatch advantage normalize
-                # Reward norm (discounted-return RMS) is applied in train.collect_rollout
-                # before GAE so `ret` / values share that scale; critic trains on those.
-                adv = adv_all[inds].to(self.device, non_blocking=True)
-                ret = ret_all[inds].to(self.device, non_blocking=True)
-                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                old_lp_mb = old_lp[inds].to(self.device, non_blocking=pin)
+                old_v_mb = old_v[inds].to(self.device, non_blocking=pin)
+                adv = adv_all[inds].to(self.device, non_blocking=pin)
+                ret = ret_all[inds].to(self.device, non_blocking=pin)
 
-                ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if self.use_bf16 else nullcontext()
+                if n_real < inds.numel():
+                    adv[n_real:] = 0
 
-                # Sequential actor → critic so only one network's activations are live.
-                # Dual trunks + B·R patch attention dominates VRAM; concurrent graphs OOM'd at mb=2048.
-                with ctx:
-                    out = self.actor_c(obs_mb, action=act_mb)
-                new_lp = out.logprob.float()
-                entropy = out.entropy.float().mean()
+                def _real(t: Tensor) -> Tensor:
+                    return t[:n_real] if n_real < t.shape[0] else t
 
-                logratio = new_lp - old_lp_mb
-                ratio = logratio.exp()
-                ratio_lo = 1.0 - self.clip
-                ratio_hi = 1.0 + self.clip_high
-                with torch.no_grad():
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    # Fraction of samples outside the asymmetric clip band
-                    clipfrac = ((ratio < ratio_lo) | (ratio > ratio_hi)).float().mean()
+                policy_loss = torch.zeros((), device=self.device)
+                entropy = torch.zeros((), device=self.device)
+                approx_kl = torch.zeros((), device=self.device)
+                old_approx_kl = torch.zeros((), device=self.device)
+                clipfrac = torch.zeros((), device=self.device)
+                gn_a = 0.0
 
-                # Asymmetric policy clip (ε_low=clip, ε_high=clipHigh):
-                #   ratio clamped to [1−ε_low, 1+ε_high]
-                #   pg_loss = −min(A·r, A·clip(r)).mean()
-                surr1 = ratio * adv
-                surr2 = torch.clamp(ratio, ratio_lo, ratio_hi) * adv
-                policy_loss = -torch.min(surr1, surr2).mean()
+                # --- Actor update (activations freed before critic) ---
+                if not critic_only:
+                    with self._autocast():
+                        out = self.actor_c(obs_mb, action=act_mb)
+                    new_lp = _real(out.actor_logprob.float())
+                    actor_ent = _real(out.actor_entropy.float())
+                    old_lp_r = _real(old_lp_mb)
+                    adv_r = _real(adv)
+                    live = (_real(obs_mb["actor_mask"]) > 0).float()
 
-                # No grad accumulation: zero → backward → clip → step, once per minibatch
-                self.actor_opt.zero_grad(set_to_none=True)
-                (policy_loss - self.entropy_coef * entropy).backward()
-                gn_a = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                self.actor_opt.step()
+                    logratio = new_lp - old_lp_r
+                    ratio = logratio.exp()
+                    ratio_lo = 1.0 - self.clip
+                    ratio_hi = 1.0 + self.clip_high
+                    with torch.no_grad():
+                        old_approx_kl = _mean_actor_then_transition(-logratio, live)
+                        approx_kl = _mean_actor_then_transition((ratio - 1) - logratio, live)
+                        clipped = ((ratio < ratio_lo) | (ratio > ratio_hi)).float()
+                        clipfrac = _mean_actor_then_transition(clipped, live)
 
-                with ctx:
-                    new_v = self.critic_c(obs_mb)
-                new_v = new_v.float()
+                    actor_adv = adv_r.unsqueeze(-1).expand_as(ratio)
+                    surr1 = ratio * actor_adv
+                    surr2 = torch.clamp(ratio, ratio_lo, ratio_hi) * actor_adv
+                    policy_loss = -_mean_actor_then_transition(torch.min(surr1, surr2), live)
+                    entropy = _mean_actor_then_transition(actor_ent, live)
 
-                # CleanRL clip_vloss=True
-                v_loss_unclipped = (new_v - ret) ** 2
-                v_clipped = old_v_mb + torch.clamp(new_v - old_v_mb, -self.clip, self.clip)
-                v_loss_clipped = (v_clipped - ret) ** 2
-                value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    self.actor_opt.zero_grad(set_to_none=True)
+                    (policy_loss - self.entropy_coef * entropy).backward()
+                    gn_a = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                    self.actor_opt.step()
+                    # Drop actor activations before critic forward (VRAM peak).
+                    del out, new_lp, logratio, ratio, surr1, surr2, adv_r, old_lp_r, actor_adv, actor_ent, live
+
+                # --- Critic update ---
+                critic_mod = self.critic
+                use_hl = bool(getattr(critic_mod, "use_hl_gauss", False))
+                ret_r = _real(ret)
+                old_v_r = _real(old_v_mb)
+                if use_hl:
+                    with self._autocast():
+                        logits = critic_mod.value_logits(obs_mb)
+                    logits_r = _real(logits.float())
+                    value_loss = critic_mod.support.cross_entropy(logits_r, ret_r).mean()
+                    del logits, logits_r
+                else:
+                    with self._autocast():
+                        new_v = self.critic_c(obs_mb)
+                    new_v = _real(new_v.float())
+                    use_vclip = bool(self.cfg.get("clipValueLoss", False))
+                    v_loss_unclipped = (new_v - ret_r) ** 2
+                    if use_vclip:
+                        v_clipped = old_v_r + torch.clamp(new_v - old_v_r, -self.clip, self.clip)
+                        v_loss_clipped = (v_clipped - ret_r) ** 2
+                        value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                        del v_clipped, v_loss_clipped
+                    else:
+                        value_loss = 0.5 * v_loss_unclipped.mean()
+                    del new_v, v_loss_unclipped
 
                 self.critic_opt.zero_grad(set_to_none=True)
                 (self.value_coef * value_loss).backward()
                 gn_c = nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.critic_opt.step()
 
-                gn_a_f = float(gn_a if not torch.is_tensor(gn_a) else gn_a.item())
-                gn_c_f = float(gn_c if not torch.is_tensor(gn_c) else gn_c.item())
+                # Free mb device tensors before next slice
+                del obs_mb, act_mb, old_lp_mb, old_v_mb, adv, ret, ret_r, old_v_r
 
-                stats["policy_loss"] += policy_loss.item()
-                stats["value_loss"] += value_loss.item()
-                stats["entropy"] += entropy.item()
-                stats["approx_kl"] += float(approx_kl.item())
-                stats["old_approx_kl"] += float(old_approx_kl.item())
-                stats["clipfrac"] += float(clipfrac.item())
-                stats["grad_norm_actor"] += gn_a_f
-                stats["grad_norm_critic"] += gn_c_f
-                stats["grad_norm"] += max(gn_a_f, gn_c_f)
+                gna_t = gn_a if torch.is_tensor(gn_a) else torch.as_tensor(float(gn_a), device=self.device)
+                gnc_t = gn_c if torch.is_tensor(gn_c) else torch.as_tensor(float(gn_c), device=self.device)
+                # Accumulate on device; flush to host once per update.
+                if acc is None:
+                    acc = {
+                        "policy_loss": policy_loss.detach(),
+                        "value_loss": value_loss.detach(),
+                        "entropy": entropy.detach(),
+                        "approx_kl": approx_kl.detach(),
+                        "old_approx_kl": old_approx_kl.detach(),
+                        "clipfrac": clipfrac.detach(),
+                        "grad_norm_actor": gna_t.detach().float(),
+                        "grad_norm_critic": gnc_t.detach().float(),
+                    }
+                else:
+                    acc["policy_loss"] = acc["policy_loss"] + policy_loss.detach()
+                    acc["value_loss"] = acc["value_loss"] + value_loss.detach()
+                    acc["entropy"] = acc["entropy"] + entropy.detach()
+                    acc["approx_kl"] = acc["approx_kl"] + approx_kl.detach()
+                    acc["old_approx_kl"] = acc["old_approx_kl"] + old_approx_kl.detach()
+                    acc["clipfrac"] = acc["clipfrac"] + clipfrac.detach()
+                    acc["grad_norm_actor"] = acc["grad_norm_actor"] + gna_t.detach().float()
+                    acc["grad_norm_critic"] = acc["grad_norm_critic"] + gnc_t.detach().float()
                 n_updates += 1
 
-        if n_updates:
-            for k in list(stats.keys()):
-                if k != "explained_variance":
-                    stats[k] /= n_updates
+                # KL early-stop still needs a sync for control flow when enabled.
+                stop_now = False
+                if (not critic_only) and self.target_kl > 0:
+                    stop_now = bool((approx_kl.detach() > self.target_kl).item())
+                del policy_loss, value_loss, entropy, approx_kl, old_approx_kl, clipfrac
+
+                if stop_now:
+                    early_stop = True
+                    stopped_epoch = epoch
+                    break
+
+        if n_updates and acc is not None:
+            for k, v in acc.items():
+                stats[k] = float(v.detach().float().mean().cpu() if v.dim() else v.detach().float().cpu()) / n_updates
+            stats["grad_norm"] = max(stats["grad_norm_actor"], stats["grad_norm_critic"])
         stats["minibatch"] = float(mb)
         stats["batch_size"] = float(B)
         stats["clip"] = float(self.clip)
         stats["clip_high"] = float(self.clip_high)
+        stats["early_stop"] = float(early_stop)
+        stats["stopped_epoch"] = float(stopped_epoch)
+        stats["target_kl"] = float(self.target_kl)
         return stats

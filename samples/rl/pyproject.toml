@@ -9,12 +9,22 @@ dependencies = [
   "tensorboard>=2.14",
 ]
 
+[project.optional-dependencies]
+metrics = ["polars>=0.20", "pyarrow>=14"]
+
+# Repository commands use `python3 -m samples.rl.agent...`; the installed wheel
+# exposes the discovered top-level `agent` package through these console scripts.
+
 [project.scripts]
 xxscreeps-rl-train = "agent.train:main"
+xxscreeps-rl-joint-pretrain = "agent.pretrain_joint:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = []
 
 [tool.setuptools.packages.find]
 include = ["agent*"]

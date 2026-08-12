@@ -1,246 +1,192 @@
-# Screeps RL (ViT + 2D-RoPE + PPO)
+# Screeps RL
 
-PyTorch agent for **[xxscreeps](https://github.com/laverdet/xxscreeps)**: dual actor/critic, masked multi-intent actions, **PPO** + **VAPO**-style decoupled **GAE** (critic λ = 1 Monte Carlo; policy length-adaptive λ).
+Entity-centric control for `xxscreeps`: a coordinated actor, centralized
+entity-aware critic, masked macro actions, joint behavior-cloning/value
+pretraining, and per-actor PPO.
 
-- **Env**: Node JSONL server over xxscreeps `simulate`
-- **Train / watch**: Python 3.10+
+This is an experimental research stack, not a production Screeps bot. The
+current learned policy controls a small economy and materially benefits from
+PPO; see the architecture document for readiness limits and planned work.
 
----
+## Current evidence
 
-## Parameter count
+Results below use the fixed `W7N3` empty-room scenario, seed 0, 6,000 ticks, and
+the shaped training return printed by `watch`. They are not multi-seed results
+or the raw harvest-plus-control score.
+
+| Policy | Decoding | Shaped return | Outcome |
+|---|---:|---:|---|
+| Joint BC checkpoint | sampled | 6,372.3 | RCL2, controller 187 |
+| Joint BC checkpoint | deterministic | 5,224.4 | RCL1, controller 0 |
+| PPO checkpoint | sampled | **8,315.0** | RCL2, controller 4,010 |
+| PPO checkpoint | deterministic | 5,187.2 | RCL1, controller 0 |
+
+PPO improved the matched sampled evaluation by **30.5%**. Deterministic
+behavior did not improve, so useful upgrading behavior still lives in sampled
+policy mass rather than the modal action.
+
+Current workspace artifacts:
+
+- `runs/joint_pretrain_highreward10m.pt`: joint BC/value pretraining; complete
+  artifact, but promoted with intentionally relaxed experimental thresholds.
+- `runs/policy_highreward_ppo10m.pt`: 55 PPO updates, 112,640 environment
+  steps, complete optimizers/reward statistics/RNG state, schema-compatible.
+
+Neither is release-qualified. Current evaluation covers one map and one action
+seed; detailed limitations and next gates live in
+[`docs/17-SCALABLE-ENTITY-MAPPO.md`](./docs/17-SCALABLE-ENTITY-MAPPO.md).
+
+## Model
 
 | Network | Parameters | Role |
-|---------|------------|------|
-| **Actor** | **~798,695** | Autoregressive multi-intent policy |
-| **Critic** | **~724,418** | Independent value net (no shared trunk) |
-| **Total** | **~1.52M** | VAPO-style dual models |
+|---|---:|---|
+| Actor | **1,205,478** | Coordinated entity policy |
+| Critic | **1,164,737** | Centralized value model |
+| Total | **2,370,215** | Separate, unshared networks |
 
-Default config in [`schema.json`](./schema.json): `dModel=128`, `nLayers=3`, `nHeads=4`.
+```mermaid
+flowchart TB
+    O["Current observation<br/>4 rooms · 100 actors · 128 targets"]
 
----
+    subgraph A["Actor — 1.205M parameters"]
+        A1["Room patches<br/>100 × 700 per room"]
+        A2["Spatial transformer<br/>128d · 4 heads · 2 layers"]
+        A3["Global + room + actor + target tokens<br/>up to 233 tokens"]
+        A4["Entity transformer<br/>128d · 4 heads · 3 layers"]
+        A5["Per-actor heads<br/>20 intents · 8 dirs · 128 targets · 10 amounts"]
+        A1 --> A2 --> A3 --> A4 --> A5
+    end
 
-## Model architecture
+    subgraph C["Critic — 1.165M parameters"]
+        C1["Independent spatial encoder"]
+        C2["Independent entity transformer"]
+        C3["Global token → MLP → V(s)"]
+        C1 --> C2 --> C3
+    end
 
-### Observation
+    E["Executor<br/>pathfinding · traffic · Screeps intents"]
+    O --> A1
+    O --> C1
+    A5 --> E
+```
 
-| Field | Shape (per env) | Notes |
-|-------|-----------------|-------|
-| `patches` | `[R, 100, 700]` | `R≤4` rooms; **10×10** patches of **5×5** tiles; 28 tile feats → `700` |
-| `room_mask` | `[R]` | Active rooms (packed from the front) |
-| `actors` | `[24, 24]` | My creeps + spawns/towers |
-| `actor_mask` | `[24]` | Live actor slots |
-| `targets` | `[48, 16]` | Sources, structures, creeps, resources, sites, … |
-| `target_mask` | `[48]` | Live target slots |
-| Masks | intent / dir / target-select / amount | Legal actions per actor × slot |
-| `globals` | `[6]` | RCL, stored energy, control progress, creeps, GCL, bucket |
+Each trunk has 1,131,584 parameters. The actor adds 73,894 action-head
+parameters; the critic adds a 33,153-parameter value head. Deployment only
+needs the actor unless value estimates are required.
 
-Encoding: [`env/encode.mjs`](./env/encode.mjs).
+The transformer coordinates entities within the current tick; it has no
+temporal attention or learned recurrent state. Temporal-memory design belongs
+to the [architecture roadmap](./docs/17-SCALABLE-ENTITY-MAPPO.md).
 
-### Encoder (per network, separate weights)
+## Observation and action contracts
 
-1. **Patch ViT** — project patches → **CLS** → **3× Pre-LN** blocks (QK **RMSNorm**, **2D RoPE**, **SDPA**)  
-2. Keep **per-room CLS** (no mean/max over patches after the transformer)  
-3. **Room packing** — only active rooms (usually 1 on the single-room test map)  
-4. Actors/targets add **their room’s CLS** (+ globals) via room index in features  
-5. Critic backbone: **attention pool** over room CLSes (not mean/max/min)
+Per environment:
 
-Code: [`agent/model.py`](./agent/model.py), [`agent/rope2d.py`](./agent/rope2d.py).
+| Field | Shape | Meaning |
+|---|---:|---|
+| `patches` | `[4,100,700]` uint8 | Four room slots; 5×5 spatial patches |
+| `room_coords` | `[4,2]` | Stable room-world offsets |
+| `actors` | `[100,28]` | Up to 64 creeps plus 36 spawn/tower actors |
+| `targets` | `[128,24]` | Typed sources, structures, creeps, resources, sites, and positions |
+| `globals` | `[12]` | Economy, counts, and overflow signals |
 
-### Policy (actor)
+The default transport is framed binary IPC; base64-packed and JSON modes exist
+for debugging. Encoding lives in [`env/encode.mjs`](./env/encode.mjs).
 
-- **2 intent slots** per actor (e.g. `move` + `transfer`)  
-- **AR** over slots: type → embed → dir / target / amount  
-- Categorical heads + **masks**  
-- **Init prior**: strong bias to **`harvest`** / **`move`**; strong negative on combat / claim / spawn spam (spawns still work when only `spawnCreep` is legal after masking)
+Every live actor chooses one goal-conditioned intent per tick:
 
-### Critic
+- intent: 20 classes;
+- direction: 8 classes when used;
+- target: contextual pointer over 128 candidates when used;
+- amount/body/site type: 10 classes when used.
 
-- Separate trunk + MLP value head  
-- λ = 1 MC targets (VAPO)  
-- Optional pretrain vs **[The International](https://github.com/The-International-Screeps-Bot/The-International-Open-Source)** open-source Screeps bot (`pretrain_critic.py`)
+Masks close inactive factors and illegal candidates. Targeted intents execute a
+single navigation or work step through [`env/actions.mjs`](./env/actions.mjs),
+which provides traffic-aware movement and cached paths. The policy must still
+reselect its goal every tick.
 
----
+## Learning contract
 
-## Action space
-
-Per **actor** (≤24), per **slot** (2):
-
-| Head | Size | Meaning |
-|------|------|---------|
-| **type** | 20 | Intent enum |
-| **dir** | 8 | N … NW |
-| **target** | 48 | Index into this tick’s target table |
-| **amount** | 10 | Bins `[0, 1, 5, 10, 25, 50, 100, 200, 500, 1000]` — **0 = all / default** |
-
-### Intent types
-
-`none`, `move`, `harvest`, `transfer`, `withdraw`, `pickup`, `drop`, `upgradeController`, `build`, `repair`, `attack`, `rangedAttack`, `heal`, `rangedHeal`, `claimController`, `reserveController`, `attackController`, `dismantle`, `generateSafeMode`, `spawnCreep`
-
-### Masking (high level)
-
-| Actor | When allowed |
-|-------|----------------|
-| Creep + MOVE, fatigue 0 | `move` + 8 dirs |
-| Creep + WORK | `harvest`, `build`, `repair`, `upgradeController`, `dismantle` |
-| Creep + CARRY, energy &gt; 0 | `transfer`, `drop` + amount bins |
-| Creep + CARRY, free capacity | `withdraw`, `pickup` + amount bins |
-| Creep + combat parts | attack / heal / … |
-| Spawn | `spawnCreep` |
-| Tower | `attack`, `repair`, `heal` on room targets |
-
-Targets are **not** raw (x, y): discrete table of ≤48 nearby objects (sources typically range ≤1).  
-Apply: [`env/actions.mjs`](./env/actions.mjs).
-
-### Examples
-
-| Goal | Slot |
-|------|------|
-| Harvest source | `type=harvest`, `target=i` |
-| Walk | `type=move`, `dir=k` |
-| Empty energy to spawn | `type=transfer`, `target=spawn_j`, `amount=0` |
-| Withdraw from container | `type=withdraw`, `target=container_j`, amount bin |
-| Pickup dropped energy | `type=pickup`, `target=resource_j` |
-| Upgrade controller | `type=upgradeController`, `target=controller_j` |
-| Spawn creep (spawn actor) | `type=spawnCreep` |
-
-Two slots can stack in one tick if both are valid.
-
----
-
-## Training features
-
-| Feature | Detail |
-|---------|--------|
-| **PPO** | Separate AdamW; critic LR = 2× actor |
-| **VAPO GAE** | Critic λ=1 (MC); policy λ = `1 − 1/(α L)`, α=0.05 |
-| **Asymmetric clip** | Policy ratio ∈ [0.80, 1.28] (ε_low=0.2, ε_high=0.28) |
-| **Value clip** | CleanRL `clip_vloss`, ε=0.2 |
-| **Adv norm** | Per-minibatch (`norm_adv`) |
-| **Reward norm** | Running RMS of discounted returns; logs keep **raw** reward |
-| **Rollouts** | 8 envs × 512 steps; extend +500 if skill &gt; 5 e/t (cap 20k) |
-| **skill_rate_et** | `(Σ harvestΔ + controlΔ) / T` — game metric, not reward |
-| **Compile** | Optional `torch.compile(mode="reduce-overhead")` |
-| **Parallel envs** | ThreadPool over Node processes |
-| **Headful** | `--headful`: Screeps client on env 0 (`:21025`) |
-| **TensorBoard** | Timestamped dirs under `runs/tb-ppo/` and `runs/tb-critic-pretrain/` |
+- Joint pretraining uses the same scripted `(state, action, reward)` stream for
+  actor BC and critic return regression.
+- PPO clips likelihood ratios per live actor, averages actors within a team
+  state, then averages transitions. Larger colonies do not receive extra sample
+  weight merely for having more creeps.
+- Actor arguments are type-gated; unused direction/target/amount factors do not
+  enter BC, entropy, or PPO likelihoods.
+- `gamma=0.999`; policy GAE `lambda=0.97`; critic targets use `lambda=1`.
+- Advantages are normalized once over the rollout.
+- Time-limit terminals bootstrap value and cut trajectory chains.
+- Training uses a productive-economy shaped reward:
 
 ```text
-r = 1.0 * Δcontrol_points + 0.05 * energy_harvested
+r_train = 0.1·harvest + 0.25·productive_delivery + 0.5·build_progress
+          + 1.0·control + 500·newly_claimed_room
 ```
 
----
+`watch` reports this shaped return. Raw evaluation score is
+`harvest + control`; the current watcher does not yet aggregate it separately.
+Delivery reward only counts energy entering spawn, extensions, or towers;
+withdrawal is limited to storage/container/link so transfer-withdraw cycling
+cannot mint reward.
 
-## Layout
+## Run it
 
-```
-samples/rl/
-  schema.json
-  README.md
-  env/          # server.mjs, encode.mjs, actions.mjs
-  agent/        # model, ppo, gae, train, pretrain_critic, watch, …
-```
-
----
-
-## Requirements
-
-- Node ≥ 22 (e.g. mise `node@24`)  
-- Python ≥ 3.10: `torch`, `numpy`, `tensorboard`  
-- Optional expert pretrain: build **[The International](https://github.com/The-International-Screeps-Bot/The-International-Open-Source)** → `../The-International-Open-Source/dist`
+Requirements: Python 3.10+, Node 22+, PyTorch, NumPy, and TensorBoard.
 
 ```bash
 export RL_NODE="$(mise exec node@24 -- which node)"
-```
 
----
+# Contracts
+python3 -m samples.rl.agent.test_latent_unit
+python3 -m samples.rl.agent.eval_scripted --ticks 6000 --max-episode 6000
+python3 -m samples.rl.agent.eval_expansion --ticks 500
+python3 -m samples.rl.agent.eval_reward_contract
 
-## Critic pretrain (The International expert)
-
-```bash
-RL_NODE="$(mise exec node@24 -- which node)" \
-python3 -m samples.rl.agent.pretrain_critic \
-  --num-envs 8 --steps 2000 --chunk 512 --epochs-per-chunk 4 --device cuda \
-  --save samples/rl/runs/critic_pretrained.pt
-# TensorBoard: samples/rl/runs/tb-critic-pretrain/<timestamp>/
-```
-
----
-
-## PPO train
-
-```bash
-RL_NODE="$(mise exec node@24 -- which node)" \
-python3 -m samples.rl.agent.train \
-  --steps 512 --num-envs 8 --minibatch 2048 --updates 1000000000 \
-  --device cuda \
-  --critic-pretrain samples/rl/runs/critic_pretrained.pt \
-  --save samples/rl/runs/policy.pt
-
-# Resume + live client on env 0 (slows training)
-python3 -m samples.rl.agent.train \
-  --resume samples/rl/runs/policy.pt --headful --tick-ms 100 \
-  ...
-```
-
-```bash
-tensorboard --logdir samples/rl/runs --port 6008
-```
-
-Key series: `charts/episodic_return`, `charts/mean_step_reward`, `charts/mean_step_reward_norm`, `charts/skill_rate_et`, `losses/value_loss`, `losses/approx_kl`, `gae/*`.
-
----
-
-## Watch a checkpoint
-
-```bash
-RL_NODE="$(mise exec node@24 -- which node)" \
+# Workspace-local checkpoint example; runs/ is gitignored.
+# CPU inference does not reserve the shared GPU.
 python3 -m samples.rl.agent.watch \
-  --checkpoint samples/rl/runs/policy.pt \
-  --headful --ticks 2000 --tick-ms 150 --deterministic
+  --checkpoint samples/rl/runs/policy_highreward_ppo10m.pt \
+  --device cpu --sample --headful --tick-ms 30 --ticks 6000 --no-compile
 ```
 
-Client: **http://127.0.0.1:21025/** — **Player 1** / **rlwatch** → room **W7N3**.
+The checkpoint examples above and below refer to artifacts in this working
+copy; a clean clone must generate or supply compatible artifacts first. Queue
+all local training and GPU evaluation through `mlq`. Use eager PPO for now: the
+compiled update graph hit a demonstrated TorchInductor target-index assertion,
+while the equivalent eager run completed successfully.
 
----
-
-## Env protocol (JSONL)
-
-```json
-{"cmd":"reset"}
-{"cmd":"step","actions":{"types":[[...]],"dirs":[[...]],"targets":[[...]],"amounts":[[...]]}}
-{"cmd":"reset_expert","botDir":"/path/to/The-International-Open-Source/dist"}
-{"cmd":"step_expert"}
-{"cmd":"close"}
+```bash
+mlq submit --name screeps-ppo --max-parallel-runs 1 --cwd "$PWD" -- \
+  python3 -m samples.rl.agent.train \
+    --resume samples/rl/runs/policy_highreward_ppo10m.pt \
+    --save samples/rl/runs/policy_next.pt \
+    --device cuda --no-compile \
+    --steps 512 --max-rollout-steps 512 --max-episode 6000 \
+    --num-envs 8 --curriculum empty,seed_creep,seed_full,seed_claimer
 ```
 
----
+A PPO resume restores actor, critic, both optimizers, aggregate reward
+normalization, counters, and CPU/CUDA/NumPy RNG state. Environments restart, so
+it is an optimizer/weights continuation rather than a continuation of live
+trajectories.
 
-## Defaults ([`schema.json`](./schema.json))
+## Layout and documentation
 
-| Key | Default |
-|-----|---------|
-| `model.dModel` | 128 |
-| `model.nLayers` | 3 |
-| `model.nHeads` | 4 |
-| `ppo.gamma` | 0.99 |
-| `ppo.clip` / `clipHigh` | 0.2 / 0.28 |
-| `ppo.minibatch` | 2048 |
-| `ppo.rolloutSteps` | 512 |
-| `ppo.numEnvs` | 8 |
-| `ppo.normalizeReward` | true |
-| `ppo.extendRateThreshold` | 5.0 (skill e/t) |
+```text
+samples/rl/
+  schema.json   # capacities, action ABI, model and PPO configuration
+  env/          # simulator server, encoder, executor, scripted teacher
+  agent/        # model, PPO, GAE, buffers, training, evaluation, watcher
+  docs/         # architecture, training gates, reward and performance contracts
+  runs/         # local checkpoints and metrics
+```
 
----
+Further documentation:
 
-## Notes
+- [`docs/17-SCALABLE-ENTITY-MAPPO.md`](./docs/17-SCALABLE-ENTITY-MAPPO.md)
+- [`docs/11-REWARD-AND-PRETRAIN.md`](./docs/11-REWARD-AND-PRETRAIN.md)
+- [`docs/13-PERFORMANCE.md`](./docs/13-PERFORMANCE.md)
 
-- No creeps until `spawnCreep` succeeds.  
-- Value loss can be large if a critic pretrained on **The International** (raw expert returns) is off-scale vs the policy; reward norm is on the **PPO** path only.  
-- Headful tick delay slows all parallel envs.  
-- Research harness — not a CPU-safe live MMO bot.
-
----
-
-## License / upstream
-
-Under `samples/rl/` in [xxscreeps](https://github.com/laverdet/xxscreeps). Follow the root repo license.
+Other numbered wave/session documents are historical and must not be used to
+launch current schema-v2 training.

@@ -92,15 +92,18 @@ class RewardNormalizer:
         if self._returns is None or len(self._returns) != N:
             self._returns = np.zeros(N, dtype=np.float64)
 
+        # Vectorized discounted return stream (still sequential in time, but
+        # no Python per-env loops). RMS updated once per timestep batch.
         out = np.empty_like(r, dtype=np.float64)
+        ret = self._returns  # (N,)
+        g = self.gamma
         for t in range(T):
-            # R_t = γ R_{t-1} (1 − done_{t-1 handled via post-step clear}) + r_t
-            self._returns = self._returns * self.gamma + r[t]
-            self.return_rms.update(self._returns)
+            ret = ret * g + r[t]
+            self.return_rms.update(ret)
             scale = float(np.sqrt(self.return_rms.var + self.epsilon))
             out[t] = r[t] / scale
-            # Terminal: zero return filter for next step (episode boundary)
-            self._returns = self._returns * (1.0 - d[t])
+            ret = ret * (1.0 - d[t])
+        self._returns = ret
 
         if self.clip is not None:
             out = np.clip(out, -self.clip, self.clip)
@@ -115,3 +118,25 @@ class RewardNormalizer:
             "reward_rms_var": float(self.return_rms.var),
             "reward_rms_count": float(self.return_rms.count),
         }
+
+    def state_dict(self) -> dict:
+        return {
+            "mean": float(self.return_rms.mean),
+            "var": float(self.return_rms.var),
+            "count": float(self.return_rms.count),
+            "returns": None if self._returns is None else self._returns.tolist(),
+            "gamma": self.gamma,
+            "clip": self.clip,
+            "epsilon": self.epsilon,
+        }
+
+    def load_state_dict(self, state: dict, *, restore_returns: bool = False) -> None:
+        """Restore aggregate moments; live traces require matching simulator state."""
+        self.gamma = float(state.get("gamma", self.gamma))
+        self.clip = state.get("clip", self.clip)
+        self.epsilon = float(state.get("epsilon", self.epsilon))
+        self.return_rms.mean = np.array(state["mean"], dtype=np.float64)
+        self.return_rms.var = np.array(state["var"], dtype=np.float64)
+        self.return_rms.count = float(state["count"])
+        rets = state.get("returns") if restore_returns else None
+        self._returns = None if rets is None else np.asarray(rets, dtype=np.float64)

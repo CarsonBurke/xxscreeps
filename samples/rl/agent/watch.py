@@ -9,6 +9,11 @@ Examples (repo root):
   python3 -m samples.rl.agent.watch \\
     --checkpoint samples/rl/runs/policy.pt --headful --ticks 2000
 
+  # Qualified joint-pretrain artifact (complete actor + critic contract)
+  RL_NODE="$(mise exec node@24 -- which node)" \\
+  python3 -m samples.rl.agent.watch \\
+    --checkpoint samples/rl/runs/joint_pretrain_v2.pt --deterministic --ticks 500
+
   # Terminal-only (fast)
   RL_NODE="$(mise exec node@24 -- which node)" \\
   python3 -m samples.rl.agent.watch --checkpoint samples/rl/runs/policy.pt --ticks 500
@@ -31,10 +36,12 @@ for p in (_REPO, _RL_ROOT):
         sys.path.insert(0, sp)
 
 try:
+    from samples.rl.agent.artifacts import load_full_state, validate_artifact
     from samples.rl.agent.constants import AMOUNT_BINS, INTENT_TYPES, MAX_ACTORS
     from samples.rl.agent.env_client import ScreepsEnv
     from samples.rl.agent.model import Agent, count_params
 except ImportError:
+    from agent.artifacts import load_full_state, validate_artifact
     from agent.constants import AMOUNT_BINS, INTENT_TYPES, MAX_ACTORS
     from agent.env_client import ScreepsEnv
     from agent.model import Agent, count_params
@@ -65,35 +72,39 @@ def parse_args() -> argparse.Namespace:
 def load_agent(path: Path, device: torch.device) -> Agent:
     agent = Agent().to(device)
     if not path.is_file():
-        print(f"[watch] no checkpoint at {path}; random init weights", flush=True)
-        return agent
+        raise SystemExit(f"[watch] checkpoint does not exist: {path}")
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    if isinstance(ckpt, dict) and "actor" in ckpt:
-        missing_a, unexp_a = agent.actor.load_state_dict(ckpt["actor"], strict=False)
-        missing_c, unexp_c = agent.critic.load_state_dict(ckpt["critic"], strict=False)
-        print(
-            f"[watch] loaded {path} update={ckpt.get('update')} "
-            f"global_step={ckpt.get('global_step')} "
-            f"actor_missing={len(missing_a)} critic_missing={len(missing_c)}",
-            flush=True,
+    if not isinstance(ckpt, dict) or "actor" not in ckpt or "critic" not in ckpt:
+        raise SystemExit(
+            f"[watch] checkpoint {path} is not a complete schema-v2 artifact"
         )
-    else:
-        agent.load_state_dict(ckpt, strict=False)
-        print(f"[watch] loaded raw state_dict from {path}", flush=True)
+    try:
+        meta = validate_artifact(
+            ckpt, agent.actor, agent.critic, kinds=("joint_pretrain", "ppo"),
+        )
+        if meta["kind"] == "joint_pretrain" and (
+            bool(meta.get("partial")) or not bool(meta.get("qualified"))
+        ):
+            raise ValueError("joint-pretrain artifact is partial or unqualified")
+        load_full_state(agent.actor, ckpt["actor"], name="actor")
+        load_full_state(agent.critic, ckpt["critic"], name="critic")
+    except ValueError as error:
+        raise SystemExit(f"[watch] incompatible checkpoint: {error}") from error
+    print(
+        f"[watch] loaded {path} update={ckpt.get('update')} "
+        f"global_step={ckpt.get('global_step')} kind={meta['kind']}",
+        flush=True,
+    )
     agent.eval()
     return agent
 
 
 def _to_device(obs: dict, device: torch.device) -> dict:
-    out = {}
-    for k, v in obs.items():
-        if k.startswith("_"):
-            out[k] = v
-        elif torch.is_tensor(v):
-            out[k] = v.to(device)
-        else:
-            out[k] = v
-    return out
+    try:
+        from samples.rl.agent.vec_env import promote_obs_device
+    except ImportError:
+        from agent.vec_env import promote_obs_device
+    return promote_obs_device(obs, device, non_blocking=False)
 
 
 def describe_actions(out, actor_meta: list, target_meta: list) -> list[str]:
@@ -133,7 +144,10 @@ def main() -> int:
     device = torch.device(args.device)
     deterministic = bool(args.deterministic) and not args.sample
 
-    # Propagate headful settings into the Node env server
+    # Optional env inheritance; ScreepsEnv constructor args are authoritative.
+    # Watch needs full meta for HUD + pathfinder nav quality (train uses lean/cheap).
+    os.environ["RL_LEAN_META"] = "0"
+    os.environ.setdefault("RL_NAV", "pathfinder")
     if args.headful:
         os.environ["RL_HEADFUL"] = "1"
         os.environ["RL_HEADFUL_PASSWORD"] = args.password
@@ -154,11 +168,19 @@ def main() -> int:
         flush=True,
     )
 
+    tick_ms = args.tick_ms
+    if tick_ms is None and args.headful:
+        tick_ms = 150
+
     env = ScreepsEnv(
         node=args.node,
         room=args.room,
         max_episode=args.ticks,
         device="cpu",
+        headful=args.headful,
+        headful_password=args.password,
+        tick_ms=tick_ms,
+        no_open=args.no_open,
     )
     try:
         obs = env.reset()
@@ -171,6 +193,7 @@ def main() -> int:
 
         ep_ret = 0.0
         t0 = time.time()
+        step = -1
         for step in range(args.ticks):
             batch = _to_device(obs, device)
             with torch.inference_mode():
