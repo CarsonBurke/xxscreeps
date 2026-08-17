@@ -176,6 +176,32 @@ PPO's Muon rate is RMS-matched to the AdamW step it replaced rather than
 inherited from pretraining, so switching optimizers is a geometry change that
 can be attributed, not a step-size change wearing a new name.
 
+### Deterministic evaluation understates the policy it scores
+
+`eval_closed_loop` and the showcase recorder both decode argmax, while training
+rollouts sample. Any behaviour that survives PPO only as a low-probability
+action is therefore invisible to them, and reporting it as absent is a
+measurement error, not a finding.
+
+Measured on the joint-pretrain artifact over 600 ticks of `empty`, same seed:
+
+| decode | build energy | createConstructionSite | build intents | harvest | delivery |
+|---|---:|---:|---:|---:|---:|
+| deterministic | 0 | 0 | 0 | 2,712 | 1,443 |
+| sampled | 320 | 2 | 16 | 1,172 | 394 |
+
+Construction sits below the argmax threshold even before PPO. The training
+tensorboard shows what actually happens to it: `actions/intent_build_issued`
+starts near one intent per environment tick (6,220 per update averaged over the
+first ten updates of the reservoir run) and decays to 182 by update 205, a 34x
+suppression, with the fresh-start control decaying 80x. So PPO suppresses
+construction rather than erasing it, and a deterministic score cannot see the
+difference.
+
+Two consequences. Reported behaviour counts must name their decode. And the
+sampled column is not free: sampled play built, but harvested 2.3x less over the
+same window, so decode choice trades economy against behavioural coverage.
+
 ### Strict artifacts are part of correctness
 
 Checkpoints carry semantic schema, ABI identifiers, complete model state,
