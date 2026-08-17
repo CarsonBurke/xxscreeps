@@ -1,267 +1,329 @@
 # Screeps RL
 
-Entity-centric control for `xxscreeps`: a coordinated actor, centralized
-entity-aware critic, masked macro actions, joint behavior-cloning/value
-pretraining, and per-actor PPO.
+Reinforcement learning for [`xxscreeps`](../../README.md): one neural policy runs
+an entire Screeps colony — every creep, spawn and tower — choosing one masked
+macro action per entity, every tick.
 
-This is an experimental research stack, not a production Screeps bot. The
-historical policy controlled a small economy and materially benefited from PPO.
-The current ABI requires fresh pretraining before another PPO run.
+It learns in two stages. First it clones two teachers: a scripted planner, and
+[The International](https://github.com/The-International-Screeps-Bot/The-International-Open-Source),
+one of the strongest open-source Screeps bots. Then PPO takes over against the
+live simulator.
 
-The International is the strongest expert trajectory source: on the fixed
-1,000-tick contract it reaches roughly 9–20 raw harvest+control per tick across
-tested seeds, with much higher post-warmup throughput. Raw engine intents supply
-exact conservative target, construction, and spawn-composition labels. Spawn
-ordering is supervised only when the raw body is representable as contiguous
-part-type blocks; immediate moves and other commands that do not fit the
-one-slot macro ABI are rejected. A scripted planner remains
-the complete-label and empty-to-expansion qualification teacher.
+This is a research stack, not a competitive bot. What it does and does not do is
+measured below.
 
-## Current evidence
+## Cloning, then reinforcement
 
-Results below use the fixed `W7N3` empty-room scenario, seed 0, 6,000 ticks, and
-the old reward ABI used by those historical checkpoints. They are not
-multi-seed results or comparable to new H+C-only checkpoints.
+| After behaviour cloning | After PPO |
+|---|---|
+| ![cloned policy placing construction sites](docs/media/bc_building.webp) | ![reinforced policy running its economy](docs/media/ppo_economy.webp) |
+| Imitates the teachers' whole repertoire — it lays construction sites, builds, hauls, upgrades — but thinly. Sites are scattered over the room instead of clustered into a base, most are never finished, and the economy stays at RCL2 after 40,000 ticks. | Two sources saturated by ~30 creeps, energy recovered from the ground, a hauling lane to the controller, RCL3 in 7,600 ticks — and **no construction at all**. PPO kept everything that pays this tick and dropped everything that pays later. |
 
-| Policy | Decoding | Historical return | Outcome |
-|---|---:|---:|---|
-| Joint BC checkpoint | sampled | 6,372.3 | RCL2, controller 187 |
-| Joint BC checkpoint | deterministic | 5,224.4 | RCL1, controller 0 |
-| PPO checkpoint | sampled | **8,315.0** | RCL2, controller 4,010 |
-| PPO checkpoint | deterministic | 5,187.2 | RCL1, controller 0 |
+Both clips are 10 s of a full run recorded with
+[`tools/record_showcase.py`](./tools/record_showcase.py).
 
-PPO improved the matched sampled evaluation by **30.5%**. Deterministic
-behavior did not improve, so useful upgrading behavior still lives in sampled
-policy mass rather than the modal action.
+## What it does
 
-Historical workspace artifacts:
+Best current policy, scored on ten **fresh, untouched** 20,000-tick worlds at a
+seed used by neither training nor teacher collection. The score is
+`harvested_energy + controller_progress` per tick, greedy decoding:
 
-- `runs/joint_pretrain_highreward10m.pt`: joint BC/value pretraining promoted
-  with intentionally relaxed experimental thresholds.
-- `runs/policy_highreward_ppo10m.pt`: 55 PPO updates and 112,640 environment
-  steps.
+| Scenario | Score/tick | Behaviour |
+|---|---:|---|
+| `empty` — bare room, one spawn | **17.1** | Grows to ~30 creeps, saturates both sources, reaches RCL3 |
+| `seed_creep` | **18.5** | Same, from a seeded worker |
+| `seed_claimer` | **17.4** | Same, plus 2 room claims |
+| `seed_full` | **13.1** | Operates an inherited mature colony |
+| `seed_outpost` | **16.6** | Works a neutral outpost |
 
-Both predate the free-form body, entity-outcome, H+C reward, and HL-Gauss ABIs and
-are intentionally rejected by the current loader. Neither is release-qualified.
-Current evaluation covers one map and one action seed; detailed limitations live in
+An otherwise identical PPO run that differed **only in which states it trained
+from** scores 4.0. Closing that gap was a data-distribution change, not a bigger
+network — see [start states](#start-states).
+
+### What reinforcement gains, and what it loses
+
+Intents issued per update, first ten updates (still near the cloned policy)
+against the last forty:
+
+| Behaviour | Early | Late | Change |
+|---|---:|---:|---:|
+| `upgradeController` | 16,090 | 42,134 | **2.6×** |
+| `pickup` — recovering dropped energy | 5,245 | 12,600 | **2.4×** |
+| `move` — deliberate repositioning | 107 | 5,118 | **48×** |
+| `harvest` | 43,806 | 27,309 | 0.6× |
+| `build` | 6,220 | 135 | **0.02×** |
+| `createConstructionSite` | 47 | 12 | 0.3× |
+
+And on the held-out evaluation, against the control run that saw only
+tick-zero starts:
+
+| | Reinforced | Control |
+|---|---:|---:|
+| Score per tick (sum over five scenarios) | **82.7** | 20.0 |
+| Controller progress rate | **27.2** | 0.1 |
+| Remote-room harvesting | **32,228** | 0 |
+| Remote energy delivered home | **311** | 0 |
+| Room claims | 2 | 0 |
+
+So harvesting throughput, upgrading, energy recovery and remote work all improve
+substantially, while construction is suppressed roughly 46× and claiming stays
+rare. Fewer `harvest` intents with far more delivered energy is the same story
+from the other side: less time re-deciding, more time working.
+
+### Why building disappears
+
+Nothing is broken — the objective says so. PPO optimizes
+`0.1 × harvested + 1.0 × controller_progress` with `gamma = 0.995`, an effective
+horizon of `1/(1-gamma) = 200` ticks. An extension costs thousands of energy now
+and repays through cheaper bodies over thousands of ticks; a claim repays even
+later. Discounted at 200 ticks, those are worth approximately nothing, while the
+same energy spent on `upgradeController` scores immediately. Construction
+survives only as low-probability policy mass — enough to appear under sampled
+decoding, never enough to be the greedy action.
+
+That horizon, and the 512-tick rollout it sits inside, were chosen so the whole
+loop trains on **one GPU**: 512 ticks × 12 environments is 6,144 transitions per
+update, about 16 s wall. Both are the most likely ceiling on further progress,
+and neither is cheap to lift — longer rollouts cost collection time linearly, and
+a longer horizon costs advantage variance. Candidate approaches are in
 [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
-## Model
+**Also not yet demonstrated:** economy-funded expansion, sustained remote
+logistics late in a lifecycle, and structure placement worth building. Greedy
+evaluation hides behaviours that live in sampled mass, so every reported count
+names its decode; see [`docs/DECISIONS.md`](./docs/DECISIONS.md).
 
-| Network | Parameters | Role |
-|---|---:|---|
-| Actor | **1,400,998** | Coordinated entity and room-strategy policy |
-| Critic | **1,324,889** | Centralized HL-Gauss value model |
-| Total | **2,725,887** | Separate, unshared networks |
+## How it works
 
 ```mermaid
-flowchart TB
-    O["Current observation<br/>4 rooms · 100 actors · 128 targets"]
+flowchart LR
+    W["xxscreeps world<br/>real engine · 50×50 rooms"]
+    O["Observation · 201 KB/tick<br/>4 room patch planes<br/>100 actors · 128 targets · masks"]
+    AC["Actor · 1.57M<br/>spatial → entity transformer<br/>→ per-actor heads"]
+    CR["Critic · 1.49M<br/>independent trunks<br/>→ 409-bin HL-Gauss value"]
+    A["One macro action per entity<br/>intent · direction · target · amount<br/>construction · spawn body"]
+    X["Executor<br/>pathfinding · traffic · engine intents"]
 
-    subgraph A["Actor — 1.401M parameters"]
-        A1["Room patches<br/>100 × 700 per room"]
-        A2["Spatial transformer<br/>128d · 4 heads · 2 layers"]
-        A3["Global + room + actor + target tokens<br/>up to 233 tokens"]
-        A4["Entity transformer<br/>128d · 4 heads · 3 layers"]
-        A5["Per-actor heads<br/>intent/target/amount<br/>construction type + 2,500-way tile<br/>8 part counts + learned type order"]
-        A1 --> A2 --> A3 --> A4 --> A5
-    end
-
-    subgraph C["Critic — 1.325M parameters"]
-        C1["Independent spatial encoder"]
-        C2["Independent entity transformer"]
-        C3["Global token → MLP → 409-bin HL-Gauss value"]
-        C1 --> C2 --> C3
-    end
-
-    E["Executor<br/>pathfinding · traffic · Screeps intents"]
-    O --> A1
-    O --> C1
-    A5 --> E
+    W -->|encode after the tick| O
+    O --> AC
+    O --> CR
+    AC --> A
+    A --> X
+    X -->|advance one tick| W
+    CR -.->|advantages, during PPO| AC
 ```
 
-Each trunk has 1,239,104 parameters. The actor adds 161,894 action-head
-parameters; the critic adds an 85,785-parameter value head. Deployment only
-needs the actor unless value estimates are required.
+Every live creep, spawn and tower picks one goal-conditioned action per tick. The
+executor turns it into engine intents and owns pathfinding and traffic, so the
+network spends its capacity on decisions rather than on walking.
 
-The transformer coordinates entities within the current tick; it has no
-temporal attention or learned recurrent state. Temporal-memory design belongs
-to the [roadmap](./docs/ROADMAP.md).
-
-## Observation and action contracts
-
-Per environment:
-
-| Field | Shape | Meaning |
+| Factor | Choices | Active when |
 |---|---:|---|
-| `patches` | `[4,100,700]` uint8 | Four room slots; 5×5 spatial patches |
-| `room_coords` | `[4,2]` | Stable room-world offsets |
-| `actors` | `[100,36]` | Exact total/active body counts plus store, health, fatigue, TTL, spawning, position, and room-energy state |
-| `actor_outcome` | `[100]` uint8 | Previous tick's categorical result for this stable entity |
-| `targets` | `[128,24]` | Typed sources, structures, creeps, resources, and sites |
-| `construction_mask` | `[4,7,313]` uint8 | Bit-packed authoritative legality for every room/type/tile |
-| `globals` | `[12]` | Economy, counts, and overflow signals |
+| Intent | 20 | always |
+| Direction | 8 | the intent is directional |
+| Target | 128 candidates | the intent needs an object |
+| Amount | 10 bins | the intent moves resources |
+| Construction | 7 types × 2,500 tiles | room actors only |
+| Spawn body | 8 part counts + learned part order | spawns only |
 
-The default transport is framed binary IPC; base64-packed and JSON modes exist
-for debugging. Encoding lives in [`env/encode.mjs`](./env/encode.mjs).
+Inactive factors are masked out of the likelihood entirely, so they never enter
+cloning, entropy or the PPO ratio. Coordination happens **within a tick**: there
+is no temporal attention and no recurrent state, which is why long-lived tasks
+are [roadmap](./docs/ROADMAP.md#temporal-memory-and-options) work.
 
-Every live actor chooses one goal-conditioned intent per tick:
+## Training
 
-- intent: 20 classes;
-- direction: 8 classes when used;
-- target: contextual pointer over 128 candidates when used;
-- amount: 10 classes when used;
-- construction: 7 structure types followed by one 2,500-tile categorical, only on room actors;
-- spawn body: eight part counts (0–50) plus a learned order over the nonzero part types.
-
-Body logits are produced in one neural pass. A fixed eight-type conditional scan
-masks counts so the sampled composition is nonempty, has at most 50 parts, and
-fits current room energy. A Plackett–Luce head orders only the part types whose
-counts are nonzero; zero-count types use a canonical suffix, avoiding duplicate
-encodings of the same executed body. There is no separate length choice, no
-50-token decoder, and no energy reservation across ticks.
-Masks close inactive factors and illegal candidates. Targeted intents execute a
-single navigation or work step through [`env/actions.mjs`](./env/actions.mjs),
-which provides traffic-aware movement and cached paths. The policy must still
-reselect its goal every tick.
-
-## Learning contract
-
-- The standalone corpus collector records full scripted and TI lifecycles,
-  computes exact finite-horizon returns once, and writes an immutable,
-  content-addressed artifact. Joint pretraining only loads that artifact and
-  globally shuffles its stage-balanced reservoirs. Scripted rows provide
-  complete actor BC and critic targets; TI contributes exact, macro-compatible
-  actor factors plus a one-time critic initialization set. Raw movement and
-  unsupported or concurrent TI commands are never guessed as actor labels.
-  Because value is behavior-policy dependent, repeated TI value fitting never
-  competes with the final scripted-policy critic: promotion uses the independent
-  scripted holdout, while post-adaptation TI EV is diagnostic. A trainer-side
-  actor-only auxiliary lane reindexes rare `createConstructionSite` and
-  `claimController` actors. It scores intent+structure type for construction
-  (not the teacher's arbitrary legal tile) and intent+target for claims.
-- PPO clips likelihood ratios per live actor, averages actors within a team
-  state, then averages transitions. Larger colonies do not receive extra sample
-  weight merely for having more creeps.
-- Actor arguments are type-gated; unused direction/target/amount factors do not
-  enter BC, entropy, or PPO likelihoods.
-- PPO uses `gamma=0.995` and one CleanRL-style GAE recurrence with
-  `lambda=0.95`: actor advantages come from GAE and critic targets are exactly
-  `advantage + behavior_value`. The geometric decay is `0.94525`, an effective
-  horizon of about 18 steps. Critic pretraining uses finite-horizon discounted
-  reward-to-go at the same gamma; actor pretraining is supervised BC and has no GAE.
-- Advantages are normalized once over the rollout.
-- Time-limit terminals bootstrap value and cut trajectory chains.
-- Supervised pretraining runs on CUDA with Muon (`lr=0.01`) on hidden
-  transformer matrices and AdamW on embeddings/heads. Muon alone uses `0.025`
-  cautious update-agreement decay; PPO remains fused AdamW with zero decay.
-- Training optimizes harvest and controller progress only:
-
-```text
-r_train = 0.1·harvest + 1.0·control
+```mermaid
+flowchart LR
+    S["Scripted planner<br/>complete labels"] --> C
+    I["The International<br/>expert intents"] --> C
+    C["Immutable corpus<br/>content-addressed"] --> BC
+    BC["Joint pretraining<br/>behaviour cloning + value"] --> PPO
+    R["Start-state reservoir<br/>fresh · policy · teacher"] --> PPO
+    PPO["PPO<br/>per-actor clipped ratio"] --> E["Evaluation<br/>fresh 20k worlds only"]
 ```
 
-Delivery, construction, claims, spawning, and storage flows remain diagnostics
-and qualification gates because their gross deltas are proxy-gameable. The raw
-comparison score is `harvest + control`; the current watcher does not yet
-aggregate it separately.
+- **Two teachers, different jobs.** The scripted planner supplies complete labels
+  and the empty-room-to-expansion qualification target. The International plays
+  far better, and its raw engine intents give exact conservative labels for
+  targets, construction and spawn composition — but only where they map onto the
+  macro ABI. Immediate moves and multi-command ticks are dropped rather than
+  guessed.
+- **Corpus first, training second.** Lifecycles are collected once into an
+  immutable, content-addressed artifact with finite-horizon value targets
+  computed up front. Training loads only that artifact and refuses a different
+  one on resume, so a cloning result can always be traced to exact data.
+- **PPO.** Likelihood ratios are clipped per live actor, averaged within a team
+  state, then across transitions, so a 40-creep colony gets no more weight than a
+  4-creep one. `lambda = 0.95`, advantages normalized once per rollout,
+  time-limit terminals bootstrap value instead of silently truncating credit.
+- **One optimizer for both stages.** Muon — Polar Express orthogonalization with
+  NorMuon second-moment reweighting — on hidden transformer matrices, fused AdamW
+  on embeddings and heads, no learning-rate schedule anywhere.
+- **Objective.** `0.1 × harvest + 1.0 × controller_progress`, and nothing else.
+  Delivery, construction, claims and spawning stay diagnostics and qualification
+  gates: gross deltas are gameable, and a fixed claim bonus would swamp economic
+  quality.
+
+### Start states
+
+Twelve environments all starting at tick zero advance in lockstep, so every
+update draws from one narrow band of a 20,000-tick timeline. Behaviours that only
+matter later — remote hauling, replacement, recovery — stop appearing in the
+batch and get unlearned. The control run demonstrates it: its training reward
+halved while entropy, gradient norm and KL all collapsed toward zero.
+
+So PPO draws start states from an **event-stratified reservoir**:
+
+- half the fleet stays on untouched full lifecycles, which are the only worlds
+  whose late states follow from the policy's own earlier decisions;
+- the rest resume from snapshots of recent policy runs, successful and failed;
+- a temporary teacher lane bridges phases the policy cannot reach yet, and
+  retires per phase once the policy supplies its own examples.
+
+Snapshots are stratified by event, not sampled periodically — periodic sampling
+overrepresents long boring plateaus. Captured events include pre-spawn and
+pre-claim, outbound to a remote source, loaded and returning, replacement due,
+and RCL transitions. **Pre-decision** capture is the point: resuming after the
+teacher chose a body and placed a structure would train execution of a decision
+the policy never made, so the snapshot leaves the decision open and the policy
+picks its own body and placement.
+
+![matched PPO runs differing only in start states](docs/media/training_curves.png)
+
+*Two PPO runs from the same cloned checkpoint, seed, optimizer and update count,
+differing only in start states. Both inherit a working ~50-creep colony from
+cloning; the tick-zero run loses it by update 60 and never recovers, and its
+score settles at 4 while the reservoir run climbs past 15. Evaluation on fresh
+worlds confirms it: **17.1 against 4.0**.*
+
+Evaluation never uses snapshots — a policy scored from restored states is never
+required to reach them. Contract:
+[`docs/TRAINING.md`](./docs/TRAINING.md#start-states).
+
+## Under the hood
+
+The parts that were least obvious to get right.
+
+**Spawn bodies in one pass.** A body is up to 50 parts drawn from 8 types, which
+is far too large to enumerate and awkward to decode sequentially. Instead one
+neural pass emits count logits for all eight types, then a fixed conditional scan
+masks them so every sampled composition is non-empty, at most 50 parts, and
+affordable at the room's current energy. A Plackett–Luce head then orders only
+the part types with non-zero counts; zero-count types take a canonical suffix, so
+one executed body has exactly one encoding. No length choice, no 50-step
+decoder, no energy reservation across ticks.
+
+**Macro actions, not keystrokes.** A learned action is a goal — harvest that
+source, transfer to that structure, claim that controller — and the executor
+performs one navigation or work step toward it, with traffic-aware movement and
+cached routes. Routes are cached across ticks and reused for ten ticks, and
+searches are bounded. The policy still reselects its goal every tick, so it can
+abandon a plan, but it never spends learned capacity on eight direction classes
+per step.
+
+**Legality is part of the action.** Candidate masks, model compatibility,
+executor validation and engine behaviour all describe the same executable
+action. A legal intent with no executable argument is not offered at all, which
+is why invalid actions are rare enough to report as a defect rather than a rate
+(2 in 344,078 in the recorded run).
+
+**Distributional value.** The critic predicts a 409-bin HL-Gauss distribution
+over a signed-log return support rather than regressing a scalar, because
+returns here span several orders of magnitude between an empty room and a mature
+colony. Targets outside the support fail loudly instead of being clipped.
+
+**Post-tick observations.** The server applies actions, advances the simulator,
+then encodes — so the next decision sees the consequences of the last one.
+Terminal observations are preserved for value bootstrap and trajectory chains are
+cut at truncation.
+
+Throughput, for context: an update is 512 ticks × 12 environments stepped in
+parallel, then 12 optimizer steps, about 16 s on one RTX 5090 with collection at
+7.7 s of it. `--compile` CUDA-graphs the per-tick forward and makes collection
+1.7× faster; two other compile configurations were measured and rejected on
+memory. See [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 ## Run it
 
-Requirements: Python 3.10+, Node 22+, PyTorch, NumPy, and TensorBoard.
+Requires Python 3.10+, Node 22+, PyTorch, NumPy, TensorBoard. Local training and
+GPU evaluation go through `mlq`; `runs/` is gitignored, so a clean clone must
+produce its own artifacts.
 
 ```bash
 export RL_NODE="$(mise exec node@24 -- which node)"
 
-# Contracts
+# Contracts: model, action ABI, reward, teacher, environment
 python3 -m samples.rl.agent.test_latent_unit
 python3 -m samples.rl.agent.eval_scripted --ticks 20000 --max-episode 20000 --seed 3
-python3 -m samples.rl.agent.eval_expansion --ticks 500
 python3 -m samples.rl.agent.eval_reward_contract
-
-# Workspace-local checkpoint example; runs/ is gitignored.
-# CPU inference does not reserve the shared GPU.
-python3 -m samples.rl.agent.watch \
-  --checkpoint samples/rl/runs/policy_v2.pt \
-  --device cpu --sample --headful --tick-ms 30 --ticks 6000 --no-compile
 ```
 
-The checkpoint examples above and below refer to artifacts in this working
-copy; a clean clone must generate or supply compatible artifacts first. Queue
-all local training and GPU evaluation through `mlq`. Use eager PPO for now: the
-compiled update graph hit a demonstrated TorchInductor target-index assertion,
-while the equivalent eager run completed successfully.
+Watch a policy play, live in the Screeps client or as a 2K recording:
 
 ```bash
-mlq submit --name screeps-pretrain-corpus --priority 10 \
-  --max-parallel-runs 1 --cwd "$PWD" -- \
+python3 -m samples.rl.agent.watch \
+  --checkpoint samples/rl/runs/policy.pt --headful --deterministic --ticks 20000
+# then open http://127.0.0.1:21025
+
+python3 samples/rl/tools/record_showcase.py \
+  --checkpoint samples/rl/runs/policy.pt \
+  --out samples/rl/runs/showcase/run --ticks 40000
+```
+
+Train in three queued stages:
+
+```bash
+# 1. Collect the corpus once; it prints a content-addressed path
+mlq submit --name screeps-corpus --priority 10 --max-parallel-runs 1 --cwd "$PWD" -- \
   python3 -m samples.rl.agent.pretrain_corpus \
     --num-envs 32 --steps 20000 --max-episode 20000 \
     --curriculum empty,seed_creep,seed_full,seed_claimer,seed_outpost \
-    --ti-actor-steps 20000 --ti-replay-capacity 8192 \
-    --output samples/rl/runs/pretrain-corpora
-```
+    --ti-actor-steps 20000 --output samples/rl/runs/pretrain-corpora
 
-After that job succeeds, inspect its printed content-addressed path and submit
-training explicitly:
-
-```bash
-CORPUS=samples/rl/runs/pretrain-corpora/<corpus-sha256>
-
-mlq submit --name screeps-joint-pretrain --max-parallel-runs 1 --cwd "$PWD" -- \
+# 2. Clone behaviour and value from it
+mlq submit --name screeps-pretrain --max-parallel-runs 1 --cwd "$PWD" -- \
   python3 -m samples.rl.agent.pretrain_joint \
-    --corpus "$CORPUS" \
+    --corpus samples/rl/runs/pretrain-corpora/<sha256> \
     --global-epochs 16 --seed 3 --device cuda \
-    --save samples/rl/runs/joint_pretrain_v4.pt
+    --save samples/rl/runs/joint_pretrain.pt
 
-mlq submit --name screeps-teacher-start-states --priority 10 \
-  --max-parallel-runs 1 --cwd "$PWD" -- \
-  python3 -m samples.rl.agent.teacher_snapshots \
-    --teacher ti --num-envs 4 --steps 20000 \
-    --curriculum empty,seed_outpost \
-    --output samples/rl/runs/teacher-start-states
-
+# 3. PPO from the reservoir, then score on fresh worlds
 mlq submit --name screeps-ppo --max-parallel-runs 1 --cwd "$PWD" -- \
   python3 -m samples.rl.agent.train \
-    --resume samples/rl/runs/joint_pretrain_v4.pt \
-    --save samples/rl/runs/policy_next.pt \
-    --device cuda --no-compile \
-    --steps 512 --max-rollout-steps 512 --max-episode 20000 --seed 3 \
-    --num-envs 24 --minibatch 1536 \
+    --resume samples/rl/runs/joint_pretrain.pt --save samples/rl/runs/policy.pt \
+    --device cuda --compile --seed 3 \
+    --num-envs 12 --steps 512 --minibatch 1536 --max-episode 20000 \
     --curriculum empty,seed_creep,seed_full,seed_claimer,seed_outpost \
-    --start-mix fresh=12,policy=8,teacher=4 \
-    --reservoir samples/rl/runs/reservoirs/next \
-    --teacher-start-states samples/rl/runs/teacher-start-states/<sha256> \
-    --segment-ticks 2048
+    --reservoir samples/rl/runs/reservoirs/run \
+    --start-mix fresh=6,policy=4,teacher=2 --segment-ticks 2048
+
+mlq submit --name screeps-eval --max-parallel-runs 1 --cwd "$PWD" -- \
+  python3 -m samples.rl.agent.eval_closed_loop \
+    --checkpoint samples/rl/runs/policy.pt --ticks 20000 --num-envs 10 --seed 900
 ```
 
-A PPO resume restores actor, critic, both optimizers, aggregate reward
-normalization, counters, and CPU/CUDA/NumPy RNG state. Environments restart, so
-it is an optimizer/weights continuation rather than a continuation of live
-trajectories.
+Teacher snapshots for the reservoir's bridge lane are collected once with
+`samples.rl.agent.teacher_snapshots`. A PPO resume restores weights, both
+optimizers, reward normalization, counters and RNG state; environments restart,
+so it continues the optimization rather than the trajectories.
 
-PPO draws its start states from an event-stratified reservoir instead of always
-beginning at tick zero. Twelve of the 24 environments stay untouched
-full-lifecycle worlds, the rest resume from policy and teacher snapshots, and
-evaluation remains on fresh 20,000-tick worlds. The contract, including the
-one-off teacher collection above, is in
-[`docs/TRAINING.md`](./docs/TRAINING.md#start-states).
-
-## Layout and documentation
+## Layout
 
 ```text
 samples/rl/
   schema.json   # capacities, action ABI, model and PPO configuration
   env/          # simulator server, encoder, executor, scripted teacher
-  agent/        # model, PPO, GAE, buffers, training, evaluation, watcher
-  docs/         # architecture, training gates, reward and performance contracts
-  runs/         # local checkpoints and metrics
+  agent/        # model, PPO, optimizer, reservoir, training, evaluation
+  tools/        # showcase recorder
+  docs/         # architecture, training gates, performance, decisions, roadmap
+  runs/         # local checkpoints, metrics, videos (gitignored)
 ```
 
-Further documentation:
-
-- [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — implemented model and environment contract
-- [`docs/TRAINING.md`](./docs/TRAINING.md) — executable training, qualification, evaluation, and stop gates
-- [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) — transport, storage, compilation, and profiling contracts
-- [`docs/ROADMAP.md`](./docs/ROADMAP.md) — unresolved blockers and measured architectural experiments
-- [`docs/DECISIONS.md`](./docs/DECISIONS.md) — durable conclusions and evidence distilled from expert reviews
+| Document | Contents |
+|---|---|
+| [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | Implemented model and environment contract |
+| [`docs/TRAINING.md`](./docs/TRAINING.md) | Executable training, qualification and evaluation gates |
+| [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) | Measured bottlenecks, transport, compilation |
+| [`docs/DECISIONS.md`](./docs/DECISIONS.md) | Conclusions that should outlive individual experiments |
+| [`docs/ROADMAP.md`](./docs/ROADMAP.md) | Open blockers and unresolved experiments |
