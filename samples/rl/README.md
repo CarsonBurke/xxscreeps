@@ -17,7 +17,7 @@ what it does, what it fails at, and the measurements behind both.
 | After behaviour cloning | After PPO |
 |---|---|
 | ![cloned policy placing construction sites](docs/media/bc_building.webp) | ![reinforced policy running its economy](docs/media/ppo_economy.webp) |
-| The cloned policy reproduces the teachers' full repertoire. It lays construction sites, builds, hauls and upgrades, but thinly. Sites end up scattered across the room instead of clustered into a base, most are never finished, and the economy is still at RCL2 after 40,000 ticks. | PPO saturates both energy sources with about 30 creeps, recovers dropped energy, runs a hauling lane to the controller and reaches RCL3 in 7,600 ticks. It also builds nothing. Behaviour that pays this tick survived; behaviour that pays later did not. |
+| The cloned policy reproduces the teachers' full repertoire. It lays construction sites, builds, hauls and upgrades, but thinly. Sites end up scattered across the room instead of clustered into a base, most are never finished, and the economy is still at RCL2 after 40,000 ticks. | PPO saturates both energy sources with about 30 creeps, recovers dropped energy, runs a hauling lane to the controller and reaches RCL3 in 7,600 ticks. It places no construction sites and builds nothing. |
 
 Both clips are 12 seconds from full runs recorded with
 [`tools/record_showcase.py`](./tools/record_showcase.py).
@@ -70,28 +70,46 @@ substantially. Construction is suppressed by a factor of 46 and claiming stays
 rare. Fewer `harvest` intents alongside much more delivered energy is the same
 result from another angle: less time spent re-deciding, more time working.
 
-### Why building disappears
+### Construction, and what is not yet known about it
 
-The objective explains it. PPO maximizes
-`0.1 x harvested + 1.0 x controller_progress` with `gamma = 0.995`, an effective
-horizon of `1/(1-gamma) = 200` ticks. An extension costs thousands of energy now
-and repays through cheaper bodies over thousands of ticks, and a claim repays
-later still. Discounted over 200 ticks both are worth almost nothing, while the
-same energy spent on `upgradeController` scores immediately. Construction
-survives as low-probability policy mass, which is enough to appear under sampled
-decoding and never enough to be the greedy action.
+Construction survives PPO only as low-probability policy mass: enough to appear
+under sampled decoding, never enough to be the greedy action. Two explanations
+are plausible and the evidence here does not separate them.
 
-That horizon and the 512-tick rollout around it were chosen to fit the whole loop
-on one GPU: 512 ticks across 12 environments gives 6,144 transitions per update,
-about 16 seconds of wall time. They are also the most likely ceiling on further
-progress, and neither is cheap to lift. Longer rollouts cost collection time
-linearly, and a longer horizon costs advantage variance. Candidate approaches are
-in [`docs/ROADMAP.md`](./docs/ROADMAP.md).
+The first is discounting. `gamma = 0.995` gives an effective horizon of
+`1/(1-gamma) = 200` ticks, and an extension costs thousands of energy now while
+repaying through cheaper bodies over thousands of ticks.
 
-Three other things remain undemonstrated: economy-funded expansion, sustained
-remote logistics late in a lifecycle, and structure placement good enough to be
-worth building. Greedy evaluation also hides behaviour that only exists in
-sampled policy mass, so every count above names its decode. See
+The second is that placement is never supervised. The teacher's construction
+labels carry an arbitrary legal tile, so cloning teaches which structure type to
+build but not where, and the cloned policy scatters sites across the room rather
+than clustering them near the spawn and the sources. Structures in arbitrary
+positions repay little at any horizon, so dropping them can be correct rather
+than short-sighted.
+
+Two observations argue against discounting as the whole story. Spawning is also
+delayed payoff, since a body costs energy now and repays over a life of roughly
+1,500 ticks, and it was retained: `spawnCreep` intents held at 0.85x and the
+policy sustains 27 to 35 creeps. Remote harvesting has a round trip of hundreds
+of ticks before energy arrives home, and it grew rather than shrank. Whatever
+suppressed construction did not suppress delayed payoff in general.
+
+The experiment that would separate the two is cheap: give the policy a
+well-placed base and measure whether its throughput improves within a few
+hundred ticks. If good placement pays back inside the current horizon, the
+blocker is placement learning rather than the discount.
+
+The 512-tick rollout and the 200-tick horizon were both chosen to fit the loop on
+one GPU: 512 ticks across 12 environments gives 6,144 transitions per update, at
+about 16 seconds of wall time. They are the most likely ceiling on further
+progress and neither is cheap to lift, since longer rollouts cost collection time
+linearly and a longer horizon costs advantage variance.
+[`docs/ROADMAP.md`](./docs/ROADMAP.md) tracks both.
+
+Also undemonstrated: economy-funded expansion, sustained remote logistics late in
+a lifecycle, and structure placement good enough to be worth building. Greedy
+evaluation hides behaviour that only exists in sampled policy mass, so every
+count above names its decode. See
 [`docs/DECISIONS.md`](./docs/DECISIONS.md).
 
 ## How it works

@@ -9,12 +9,19 @@ This file contains unresolved work. Implemented behavior belongs in
 
 Before another substantial PPO continuation:
 
-0. **A 200-tick horizon cannot fund investment.** `gamma=0.995` gives an
-   effective horizon of 200 ticks on a 20,000-tick problem, and every
-   investment action pays back well beyond it: a replacement creep costs about
-   300 energy now and repays over a ~1,500-tick life, and a claim repays over
-   thousands. Under `0.10 x harvest + 1.00 x control` per tick, spawning is
-   locally negative - that energy could be controller progress this tick.
+0. **Investment behaviour is unfunded, and the cause is not established.**
+   `gamma=0.995` gives an effective horizon of 200 ticks on a 20,000-tick
+   problem, and construction and claiming both repay well beyond it. That makes
+   discounting a candidate explanation for their suppression, not a finding.
+
+   The obvious counterexample has to be accounted for by any explanation:
+   spawning is delayed payoff too, since a body costs about 300 energy and
+   repays over a ~1,500-tick life, and it was retained under the same discount
+   (`spawnCreep` intents at 0.85x of their early rate, 27-35 creeps sustained).
+   Remote harvesting has a round trip of hundreds of ticks and grew. A second
+   candidate is specific to construction: placement is never supervised, since
+   teacher labels carry an arbitrary legal tile, so a built structure's expected
+   payoff may be near zero at any horizon.
 
    The matched pair measured the consequence. Both runs inherited a working
    ~51-creep colony from behavior cloning; the fresh-start control decayed to
@@ -24,17 +31,23 @@ Before another substantial PPO continuation:
    actor gradient norm to 0.048, entropy to 0.22. Raw mean reward halved while
    *normalized* mean reward stayed flat at 0.004, because the reward
    normalizer's running RMS shrank with the economy: the loss never reported the
-   collapse. Claims went to zero in **both** runs, which is the same myopia seen
-   directly - a claim is pure investment.
+   collapse. Claims went to zero in **both** runs under greedy decoding, which
+   is consistent with either candidate and distinguishes neither.
 
    Three co-moving series diagnose this in any run and are already logged:
    `max_creeps`, `overflow_step_fraction` (0.000 means nothing in the batch is
    large enough to overflow the observation), and the `value_target_min/max`
-   spread. The reservoir neutralizes the consequence by re-seeding mature
-   states; it does not fix the horizon. Candidate fixes to measure on the same
-   matched protocol, one at a time: a longer discount with the existing
-   finite-horizon critic target, an investment-aware auxiliary value head, or
-   the temporal abstraction in [`DECISIONS.md`](./DECISIONS.md).
+   spread. The reservoir prevents the population collapse by re-seeding mature
+   states; it changes neither the discount nor placement supervision.
+
+   Separate the two candidates before changing the objective. Placing a
+   teacher-quality base and measuring whether throughput improves within a few
+   hundred ticks answers whether good placement pays back inside the current
+   horizon. Only if it does not is a discount change the indicated fix, and then
+   on the same matched protocol, one change at a time: a longer discount with
+   the existing finite-horizon critic target, an investment-aware auxiliary
+   value head, or the temporal abstraction in
+   [`DECISIONS.md`](./DECISIONS.md).
 1. **Observation overflow.** Overflow averaged 28.3% over the final ten
    rollouts and reached 75% in one rollout. Diagnose which actor, room, and
    candidate categories overflow at each economy stage before changing caps.
