@@ -32,17 +32,25 @@ class IsolatedCPU implements CPU {
 	limit;
 	tickLimit;
 	readonly #startTime;
+	readonly #deterministic;
+	// A virtual clock advances a fixed step per call, so code that measures its
+	// own cost sees the same sequence on every replay. Monotonic by construction,
+	// so a loop waiting for the budget to be consumed still terminates.
+	#virtual = 0;
 
 	constructor(data: TickPayload) {
 		this.bucket = data.cpu.bucket;
 		this.limit = data.cpu.limit;
 		this.tickLimit = data.cpu.tickLimit;
 		this.#startTime = isolate.wallTime;
+		this.#deterministic = data.cpu.deterministic ?? false;
 	}
 
 	getHeapStatistics = () => isolate.getHeapStatisticsSync();
 
-	getUsed = () => Number(isolate.wallTime - this.#startTime) / 1e6;
+	getUsed = () => this.#deterministic
+		? (this.#virtual += 0.05)
+		: Number(isolate.wallTime - this.#startTime) / 1e6;
 
 	halt = () => {
 		isolate.dispose();

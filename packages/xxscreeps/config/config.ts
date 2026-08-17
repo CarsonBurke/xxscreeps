@@ -153,6 +153,21 @@ export interface RunnerConfig {
 	concurrency?: number;
 
 	/**
+	 * Seed a deterministic `Math.random` inside each player sandbox. Required to
+	 * replay a fixed bot against a fixed world: the sandbox is its own realm, so
+	 * it does not inherit a host-side generator.
+	 */
+	randomSeed?: number;
+
+	/**
+	 * Charge a fixed synthetic cost per tick and report a virtual `getUsed`
+	 * instead of wall-clock time. Player code branches on the CPU bucket and on
+	 * elapsed CPU, so wall-clock accounting makes a fixed bot's decisions a
+	 * function of host load. Off by default: a real server must bill real CPU.
+	 */
+	deterministicCpu?: boolean;
+
+	/**
 	 * Show runner log messages when running from main thread.
 	 * @default false
 	 */

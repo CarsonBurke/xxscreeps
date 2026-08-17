@@ -75,10 +75,36 @@ let me: string;
 let world: World;
 let requireMain: () => any;
 
+/**
+ * Deterministic `Math.random` for the player realm.
+ *
+ * A sandbox is its own realm, so overriding `Math.random` on the host leaves
+ * player code with the platform generator and a fixed bot replays a different
+ * game every run. Bots branch on randomness for scouting cadence, task
+ * tie-breaks and body naming, so reproducing a recorded run requires seeding
+ * the generator the bot actually calls. xorshift32 is used because zero is its
+ * only fixed point and it needs no state beyond one word.
+ */
+function installDeterministicRandom(seed: number) {
+	let state = (seed >>> 0) ^ 0x9e3779b9;
+	if (state === 0) {
+		state = 0x6d2b79f5;
+	}
+	Math.random = () => {
+		state ^= state << 13;
+		state ^= state >>> 17;
+		state ^= state << 5;
+		return (state >>> 0) / 0x100000000;
+	};
+}
+
 export function initialize(compiler: Compiler, evaluate: Evaluate, data: InitializationPayload) {
 	// Set up environment
 	flushGlobals();
 	setupConsole(print);
+	if (data.randomSeed !== undefined) {
+		installDeterministicRandom(data.randomSeed);
+	}
 
 	// Load terrain
 	world = new World(data.shardName, data.terrainBlob);

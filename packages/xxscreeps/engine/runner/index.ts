@@ -10,6 +10,13 @@ export interface InitializationPayload {
 	codeBlob: CodeBlobs | undefined;
 	shardName: string;
 	terrainBlob: Readonly<Uint8Array>;
+	/**
+	 * Seed for a deterministic `Math.random` inside the player sandbox. A sandbox
+	 * is a separate realm, so a host-side override of `Math.random` never reaches
+	 * player code and an unseeded sandbox replays a different game from the same
+	 * world. Left undefined the sandbox keeps the platform generator.
+	 */
+	randomSeed?: number;
 }
 
 export interface TickPayload {
@@ -17,6 +24,8 @@ export interface TickPayload {
 		bucket: number;
 		limit: number;
 		tickLimit: number;
+		/** Report a virtual `getUsed` instead of wall-clock elapsed time. */
+		deterministic?: boolean;
 	};
 	roomBlobs: Readonly<Uint8Array>[];
 	time: number;

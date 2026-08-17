@@ -149,6 +149,7 @@ export class PlayerInstance {
 					userId: this.userId,
 					shardName: this.shard.name,
 					terrainBlob: this.world.terrainBlob,
+					randomSeed: config.runner.randomSeed,
 				} as never;
 				const [ codeBlob ] = await Promise.all([
 					this.branchName == null ? undefined : Code.loadBlobs(this.shard.db, this.userId, this.branchName),
@@ -173,6 +174,7 @@ export class PlayerInstance {
 						bucket,
 						limit: kCPU,
 						tickLimit: Math.min(config.runner.cpu.tickLimit, bucket),
+						deterministic: config.runner.deterministicCpu === true,
 					},
 					time,
 				};
@@ -221,7 +223,10 @@ export class PlayerInstance {
 		// Save runtime results
 		if (result?.result === 'success') {
 			const { payload } = result;
-			const tickCpu = payload.usage.cpu ?? NaN;
+			// Billing measured wall time makes the bucket, and therefore every
+			// player decision gated on it, a function of host load. Reproducible
+			// mode charges exactly the refill so the bucket holds still.
+			const tickCpu = config.runner.deterministicCpu ? kCPU : payload.usage.cpu ?? NaN;
 			this.bucket = clamp(0, config.runner.cpu.bucket, this.bucket - tickCpu + kCPU);
 			await Promise.all([
 				// Publish intent blobs
