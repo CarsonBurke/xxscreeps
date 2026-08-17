@@ -71,6 +71,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tick-ms", type=int, default=None, help="delay between ticks (default 150 if headful)")
     p.add_argument("--no-open", action="store_true", help="do not auto-open browser")
     p.add_argument("--password", type=str, default="rlwatch")
+    p.add_argument(
+        "--allow-unqualified-joint", action="store_true",
+        help="watch a complete but unqualified joint-pretrain artifact",
+    )
     p.add_argument("--print-every", type=int, default=1, help="HUD print interval (ticks)")
     p.add_argument("--no-compile", action="store_true")
     p.add_argument(
@@ -84,7 +88,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_agent(
-    path: Path, device: torch.device, *, allow_source_mismatch: bool = False,
+    path: Path, device: torch.device, *,
+    allow_source_mismatch: bool = False,
+    allow_unqualified_joint: bool = False,
 ) -> Agent:
     agent = Agent().to(device)
     if not path.is_file():
@@ -99,10 +105,19 @@ def load_agent(
             ckpt, agent.actor, agent.critic, kinds=("joint_pretrain", "ppo"),
             evaluation_only_source_mismatch=allow_source_mismatch,
         )
-        if meta["kind"] == "joint_pretrain" and (
-            bool(meta.get("partial")) or not bool(meta.get("qualified"))
-        ):
-            raise ValueError("joint-pretrain artifact is partial or unqualified")
+        if meta["kind"] == "joint_pretrain" and bool(meta.get("partial")):
+            raise ValueError("joint-pretrain artifact is partial")
+        if meta["kind"] == "joint_pretrain" and not bool(meta.get("qualified")):
+            if not allow_unqualified_joint:
+                raise ValueError(
+                    "joint-pretrain artifact is unqualified; pass "
+                    "--allow-unqualified-joint to watch it anyway"
+                )
+            print(
+                "[watch] viewing an unqualified joint-pretrain artifact; this is a "
+                "viewing override, not a promotion",
+                flush=True,
+            )
         load_full_state(agent.actor, ckpt["actor"], name="actor")
         load_full_state(agent.critic, ckpt["critic"], name="critic")
     except ValueError as error:
@@ -135,7 +150,13 @@ def describe_actions(out, actor_meta: list, target_meta: list) -> list[str]:
     body_order = out.body_order[0].cpu()
     construction_types = out.construction_types[0].cpu()
     construction_tiles = out.construction_tiles[0].cpu()
-    n = min(MAX_ACTORS, len(actor_meta) if actor_meta else types.shape[0])
+    # `_actor_meta` lists every encoded actor while the action tensors carry the
+    # compacted actor bucket, which counts only maskable actors - a creep that is
+    # still spawning appears in the meta and not in the bucket. Bound by the
+    # tensor, or a colony crossing a bucket boundary indexes past the end and
+    # kills the run.
+    meta_rows = len(actor_meta) if actor_meta else types.shape[0]
+    n = min(MAX_ACTORS, types.shape[0], meta_rows)
     for ai in range(n):
         meta = actor_meta[ai] if ai < len(actor_meta) else {"id": f"a{ai}", "kind": "?"}
         slots = []
@@ -211,6 +232,7 @@ def main() -> int:
     agent = load_agent(
         args.checkpoint, device,
         allow_source_mismatch=args.allow_source_mismatch,
+        allow_unqualified_joint=args.allow_unqualified_joint,
     )
     print(
         f"[watch] device={device} actor_params={count_params(agent.actor):,} "
