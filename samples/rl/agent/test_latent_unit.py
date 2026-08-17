@@ -20,13 +20,20 @@ for p in (_REPO, _RL):
 
 from samples.rl.agent.constants import (
     ACTOR_FEAT,
+    ACTOR_FEATURE_INDEX,
+    BODY_PART_COSTS,
+    CONSTRUCTION_MASK_BYTES,
     GLOBAL_FEAT,
     INTENT_SLOTS,
     INTENT_TYPES,
     MAX_ACTORS,
+    MAX_BODY_PARTS,
+    MAX_ROOM_ENERGY,
     MAX_ROOMS,
     MAX_TARGETS,
     N_AMOUNT,
+    N_BODY_PART,
+    N_CONSTRUCTION_TYPE,
     N_DIR,
     N_INTENT,
     PATCH_FLAT,
@@ -37,10 +44,305 @@ from samples.rl.agent.constants import (
     SCHEMA_PATH,
     TARGET_FEAT,
 )
-from samples.rl.agent.gae import compute_gae_tn
+from samples.rl.agent.gae import cleanrl_gae, compute_gae_tn
 from samples.rl.agent.hl_gauss import HLGaussSupport
-from samples.rl.agent.model import Actor, Agent, Critic
+from samples.rl.agent.model import ActionConditionedDynamics, Actor, Agent, Critic
+from samples.rl.agent.muon import (
+    MUON_BETA2,
+    HybridMuonAdamW,
+    normuon_group_step,
+    optimizer_parameter_counts,
+    polar_express,
+    split_hidden_matrices,
+)
 from samples.rl.agent.running_stats import RewardNormalizer
+
+_AF = ACTOR_FEATURE_INDEX
+
+
+def test_muon_partition_covers_hidden_matrices_only():
+    actor = Actor()
+    critic = Critic()
+    actor_muon, actor_adam, actor_muon_names, actor_adam_names = (
+        split_hidden_matrices(actor)
+    )
+    critic_muon, critic_adam, critic_muon_names, critic_adam_names = (
+        split_hidden_matrices(critic)
+    )
+    assert sum(parameter.numel() for parameter in actor_muon) == 983_040
+    assert sum(parameter.numel() for parameter in critic_muon) == 983_040
+    assert sum(parameter.numel() for parameter in (*actor_muon, *actor_adam)) == sum(
+        parameter.numel() for parameter in actor.parameters()
+    )
+    assert sum(parameter.numel() for parameter in (*critic_muon, *critic_adam)) == sum(
+        parameter.numel() for parameter in critic.parameters()
+    )
+    assert all(
+        (".blocks." in name or ".entity_blocks." in name)
+        and name.endswith(".weight")
+        for name in actor_muon_names
+    )
+    assert all(
+        (".blocks." in name or ".entity_blocks." in name)
+        and name.endswith(".weight")
+        for name in critic_muon_names
+    )
+    assert "body_count_head.weight" in actor_adam_names
+    assert "value_head.4.weight" in critic_adam_names
+    assert "trunk.body_count_embed.weight" in actor_adam_names
+
+
+def test_polar_express_beats_newton_schulz_on_small_singular_values():
+    """Why Polar Express replaced Newton-Schulz: the same five rounds, closer to
+    the polar factor. Mean singular value must reach ~1 instead of ~0.87, and
+    the smallest direction of an ill-conditioned matrix must be lifted further.
+    """
+    from torch.optim._muon import _zeropower_via_newtonschulz as newton_schulz
+
+    generator = torch.Generator().manual_seed(0)
+    for rows, cols in ((64, 64), (48, 12), (12, 48)):
+        rank = min(rows, cols)
+        base = torch.randn(3, rows, cols, generator=generator)
+        left, _, right = torch.linalg.svd(base, full_matrices=False)
+        # Condition number 1e3: the hard case for a fixed-coefficient iteration.
+        spectrum = torch.linspace(1e-3, 1.0, rank).flip(0).expand(3, -1)
+        matrices = left @ torch.diag_embed(spectrum) @ right
+
+        singular = torch.linalg.svdvals(polar_express(matrices).float())
+        assert singular.shape == (3, rank)
+        assert abs(float(singular.mean()) - 1.0) < 0.05, singular
+        assert float(singular.max()) < 1.2, singular
+
+        reference = torch.stack([
+            newton_schulz(matrices[i], (3.4445, -4.7750, 2.0315), 5, 1e-7).float()
+            for i in range(matrices.shape[0])
+        ])
+        reference_singular = torch.linalg.svdvals(reference)
+        assert float(singular.min()) > float(reference_singular.min())
+        assert float(singular.mean()) > float(reference_singular.mean())
+
+        # The polar factor keeps the original singular vectors, so the update
+        # still points along the gradient it came from.
+        assert bool(((polar_express(matrices) * matrices).sum(dim=(-2, -1)) > 0).all())
+
+
+def test_normuon_step_preserves_update_norm():
+    """NorMuon reweights rows but renormalizes, so `muon_lr` keeps its meaning."""
+    generator = torch.Generator().manual_seed(1)
+    grads = torch.randn(2, 8, 8, generator=generator)
+    params = torch.randn(2, 8, 8, generator=generator)
+    before = params.clone()
+    momentum_buffer = torch.zeros_like(params)
+    second_moment = torch.zeros(2, 8, 1)
+    momentum, lr = 0.85, 0.01
+    normuon_group_step(
+        params, grads.clone(), momentum_buffer, second_moment,
+        torch.tensor(momentum), torch.tensor(lr), torch.tensor(0.0),
+        MUON_BETA2, torch.float32,
+    )
+    assert torch.isfinite(params).all()
+    # Reconstruct the orthogonalized direction the step must have taken.
+    buffer = torch.zeros_like(before)
+    buffer.lerp_(grads, 1.0 - momentum)
+    direction = polar_express(grads.clone().lerp_(buffer, momentum))
+    step = before - params
+    assert abs(float(step.norm()) / float(direction.norm() * lr) - 1.0) < 1e-4
+    # The reweighting is real: individual rows move by different multiples of
+    # the orthogonalized direction even though the total norm is unchanged.
+    row_ratio = (step / (direction * lr)).mean(dim=-1)
+    assert float(row_ratio.max() - row_ratio.min()) > 1e-3
+    assert float(second_moment.max()) > 0.0
+    assert torch.allclose(momentum_buffer, buffer, atol=1e-7)
+
+
+def test_normuon_decay_is_cautious():
+    """Weight decay applies only where the learned step already shrinks the weight."""
+    generator = torch.Generator().manual_seed(2)
+    grads = torch.randn(1, 8, 8, generator=generator)
+    params = torch.randn(1, 8, 8, generator=generator)
+    lr, weight_decay = 0.01, 0.5
+    plain = params.clone()
+    decayed = params.clone()
+    normuon_group_step(
+        plain, grads.clone(), torch.zeros_like(params), torch.zeros(1, 8, 1),
+        torch.tensor(0.85), torch.tensor(lr), torch.tensor(0.0),
+        MUON_BETA2, torch.float32,
+    )
+    normuon_group_step(
+        decayed, grads.clone(), torch.zeros_like(params), torch.zeros(1, 8, 1),
+        torch.tensor(0.85), torch.tensor(lr), torch.tensor(lr * weight_decay),
+        MUON_BETA2, torch.float32,
+    )
+    learned_step = params - plain
+    shrinking = (learned_step * params) > 0
+    assert bool(shrinking.any()) and bool((~shrinking).any())
+    # Untouched where the step grows the weight; pulled toward zero elsewhere.
+    assert torch.allclose(decayed[~shrinking], plain[~shrinking], atol=1e-7)
+    extra = plain[shrinking] - decayed[shrinking]
+    # Decay is one power of the learning rate, matching the rate this stack
+    # tuned `muon_weight_decay` against.
+    expected = params[shrinking] * (lr * weight_decay)
+    assert torch.allclose(extra, expected, atol=1e-7)
+
+
+def test_muon_second_moment_reweights_anisotropic_rows():
+    """Rows with persistently large updates must be damped relative to quiet rows."""
+    params = torch.zeros(1, 4, 4)
+    grads = torch.zeros(1, 4, 4)
+    grads[0, 0] = 4.0
+    grads[0, 1] = 0.05
+    momentum_buffer = torch.zeros_like(params)
+    second_moment = torch.zeros(1, 4, 1)
+    for _ in range(6):
+        normuon_group_step(
+            params, grads.clone(), momentum_buffer, second_moment,
+            torch.tensor(0.95), torch.tensor(0.01), torch.tensor(0.0),
+            MUON_BETA2, torch.float32,
+        )
+    assert float(second_moment[0, 0]) > float(second_moment[0, 1])
+
+
+def test_muon_batched_group_matches_one_matrix_at_a_time():
+    """Stacking matrices must not couple them: no statistic may span the group."""
+    generator = torch.Generator().manual_seed(3)
+    params = torch.randn(3, 12, 8, generator=generator)
+    grads = torch.randn(3, 12, 8, generator=generator)
+    momentum, lr, decay = 0.9, 0.02, 0.01
+
+    batched = params.clone()
+    batched_momentum = torch.randn(3, 12, 8, generator=generator)
+    batched_second = torch.rand(3, 12, 1, generator=generator)
+    single_momentum = batched_momentum.clone()
+    single_second = batched_second.clone()
+    normuon_group_step(
+        batched, grads.clone(), batched_momentum, batched_second,
+        torch.tensor(momentum), torch.tensor(lr), torch.tensor(decay),
+        MUON_BETA2, torch.float32,
+    )
+
+    for index in range(params.shape[0]):
+        single = params[index : index + 1].clone()
+        normuon_group_step(
+            single, grads[index : index + 1].clone(),
+            single_momentum[index : index + 1],
+            single_second[index : index + 1],
+            torch.tensor(momentum), torch.tensor(lr), torch.tensor(decay),
+            MUON_BETA2, torch.float32,
+        )
+        assert torch.allclose(batched[index], single[0], atol=1e-6), index
+    assert torch.allclose(batched_momentum, single_momentum, atol=1e-6)
+    assert torch.allclose(batched_second, single_second, atol=1e-6)
+
+
+def test_ppo_trainer_uses_hybrid_muon_with_rms_matched_rate():
+    """PPO's trunk rate is derived from the AdamW step it replaced, not inherited."""
+    from samples.rl.agent.muon import PPO_MUON_LR
+    from samples.rl.agent.ppo import PPOTrainer
+
+    trainer = PPOTrainer(actor=Actor(), critic=Critic(), device="cpu")
+    assert isinstance(trainer.actor_opt, HybridMuonAdamW)
+    assert isinstance(trainer.critic_opt, HybridMuonAdamW)
+    assert trainer.actor_opt.muon_lr == PPO_MUON_LR
+    assert trainer.critic_opt.muon_lr == PPO_MUON_LR * 2.0
+    assert trainer.critic_opt.adam_lr == trainer.actor_opt.adam_lr * 2.0
+    # An orthogonalized step moves each coordinate of these matrices by roughly
+    # muon_lr * sqrt(min(R, C)) * sqrt(max(1, R/C)) / sqrt(R*C); that must land
+    # within a factor of two of the AdamW rate it replaced.
+    for group in trainer.actor_opt.groups:
+        rows, cols = group.shape
+        rms = (
+            trainer.actor_opt.muon_lr * group.lr_scale
+            * (min(rows, cols) ** 0.5) / ((rows * cols) ** 0.5)
+        )
+        assert 0.5 <= rms / trainer.actor_opt.adam_lr <= 2.0, (group.shape, rms)
+
+    trainer.actor_opt.set_learning_rates(adam_lr=5e-5, muon_lr=6e-4)
+    assert trainer.actor_opt.adam_lr == 5e-5
+    assert trainer.actor_opt.muon_lr == 6e-4
+
+
+def test_hybrid_muon_optimizer_state_roundtrip():
+    class TinyTransformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.trunk = torch.nn.Module()
+            self.trunk.room_enc = torch.nn.Module()
+            self.trunk.room_enc.blocks = torch.nn.ModuleList([
+                torch.nn.ModuleDict({"wq": torch.nn.Linear(4, 4)})
+            ])
+            self.head = torch.nn.Linear(4, 2)
+
+        def forward(self, value):
+            value = self.trunk.room_enc.blocks[0]["wq"](value)
+            return self.head(value)
+
+    model = TinyTransformer()
+    optimizer = HybridMuonAdamW(
+        model, adam_lr=3e-4, muon_lr=1e-2, muon_weight_decay=2.5e-2,
+    )
+    assert optimizer_parameter_counts(optimizer) == {"muon": 16, "adamw": 14}
+    loss = model(torch.randn(8, 4)).square().mean()
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    assert optimizer.step_count == 1
+    assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
+    # One step into a 300-step ramp from 0.85 to 0.95.
+    assert abs(optimizer.momentum - (0.85 + (0.95 - 0.85) / 300)) < 1e-9
+
+    restored_model = TinyTransformer()
+    restored = HybridMuonAdamW(
+        restored_model, adam_lr=3e-4, muon_lr=1e-2, muon_weight_decay=2.5e-2,
+    )
+    restored.load_state_dict(optimizer.state_dict())
+    assert restored.step_count == 1
+    assert torch.equal(
+        restored.groups[0].momentum_buffer, optimizer.groups[0].momentum_buffer,
+    )
+    assert torch.equal(
+        restored.groups[0].second_moment, optimizer.groups[0].second_moment,
+    )
+
+    # A stale format or a different hidden-matrix layout must fail loudly, not
+    # silently restore a mismatched population.
+    stale = optimizer.state_dict()
+    stale["format"] = 1
+    try:
+        restored.load_state_dict(stale)
+    except ValueError as error:
+        assert "incompatible" in str(error)
+    else:
+        raise AssertionError("stale optimizer format must be rejected")
+
+
+def test_muon_group_batches_same_shape_matrices():
+    """Equal-shape matrices share one stacked update; distinct shapes do not."""
+    actor = Actor()
+    optimizer = HybridMuonAdamW(actor, adam_lr=3e-4)
+    assert [group.shape for group in optimizer.groups] == [
+        (128, 128), (128, 512), (512, 128),
+    ]
+    assert [len(group.params) for group in optimizer.groups] == [20, 5, 5]
+    assert optimizer.groups[0].lr_scale == 1.0
+    # Muon's original aspect-ratio adjustment: sqrt(max(1, rows/cols)).
+    assert optimizer.groups[1].lr_scale == 1.0
+    assert optimizer.groups[2].lr_scale == 2.0
+
+
+def test_muon_rejects_partial_gradients():
+    """A half-populated group is a bug in the loss, not something to average over."""
+    actor = Actor()
+    optimizer = HybridMuonAdamW(actor, adam_lr=3e-4)
+    group = optimizer.groups[0]
+    for parameter in group.params:
+        parameter.grad = torch.zeros_like(parameter)
+    group.params[3].grad = None
+    try:
+        optimizer.step()
+    except RuntimeError as error:
+        assert "partial gradients" in str(error)
+    else:
+        raise AssertionError("a partially populated Muon group must be rejected")
 
 
 def test_gae_truncation_bootstraps():
@@ -79,6 +381,67 @@ def test_gae_cuts_chain_on_done():
     assert float(ret[1, 0]) < 5.0, ret
 
 
+def test_gae_cuts_chain_on_truncation_without_done():
+    """A start-state segment boundary truncates without ending the episode."""
+    T, N = 4, 1
+    rewards = torch.tensor([[1.0], [1.0], [0.0], [100.0]])
+    values = torch.zeros(T, N)
+    # Segment boundary at t=1: the environment episode continues in a different
+    # world, so `done` stays 0 while the trajectory is cut and bootstrapped.
+    dones = torch.zeros(T, N)
+    trunc = torch.tensor([[0.0], [1.0], [0.0], [0.0]])
+    next_values = torch.zeros(T, N)
+    adv, ret = compute_gae_tn(
+        rewards, values, dones, gamma=0.99, lam=1.0,
+        next_value=torch.zeros(N), truncations=trunc, next_values_tn=next_values,
+    )
+    # t=1 sees only its own reward plus the spliced terminal value.
+    assert abs(float(adv[1, 0]) - 1.0) < 1e-6, adv
+    # t=0 sees t=1 but nothing from the restored world at t>=2.
+    assert abs(float(adv[0, 0]) - (1.0 + 0.99)) < 1e-6, adv
+    assert float(adv[2, 0]) > 90.0, adv
+
+
+def test_cleanrl_gae_shares_actor_advantage_and_critic_return():
+    """Match an independent CleanRL recurrence, including episode boundaries."""
+    generator = torch.Generator().manual_seed(17)
+    T, N = 37, 5
+    rewards = torch.randn(T, N, generator=generator)
+    values = torch.randn(T, N, generator=generator)
+    dones = torch.zeros(T, N)
+    dones[8, 0] = dones[13, 2] = dones[31, 4] = 1
+    trunc = torch.zeros_like(dones)
+    trunc[8, 0] = trunc[31, 4] = 1
+    # Segment boundaries truncate without ending the episode.
+    trunc[20, 1] = trunc[5, 3] = 1
+    next_values = torch.randn(T, N, generator=generator)
+    gae_lambda = 0.95
+    gamma = 0.995
+
+    expected_adv = torch.zeros_like(rewards)
+    last_gae = torch.zeros(N)
+    for t in reversed(range(T)):
+        terminated = dones[t] * (1.0 - trunc[t])
+        delta = rewards[t] + gamma * next_values[t] * (1.0 - terminated) - values[t]
+        cut = torch.clamp(dones[t] + trunc[t], max=1.0)
+        last_gae = delta + gamma * gae_lambda * (1.0 - cut) * last_gae
+        expected_adv[t] = last_gae
+    actual_adv, actual_ret, info = cleanrl_gae(
+        rewards, values, dones, gamma=gamma, gae_lambda=gae_lambda,
+        truncations=trunc, next_values_tn=next_values,
+    )
+    assert torch.equal(actual_adv, expected_adv)
+    assert torch.equal(actual_ret, actual_adv + values)
+    _, lambda_one_return = compute_gae_tn(
+        rewards, values, dones, gamma, 1.0,
+        truncations=trunc, next_values_tn=next_values,
+    )
+    assert not torch.equal(actual_ret, lambda_one_return)
+    assert info["gamma"] == gamma
+    assert info["gae_lambda"] == gae_lambda
+    assert abs(info["effective_horizon"] - 1 / (1 - gamma * gae_lambda)) < 1e-9
+
+
 def test_type_gated_logprob_none_low_entropy():
     B = 2
     actor = Actor()
@@ -94,6 +457,10 @@ def test_type_gated_logprob_none_low_entropy():
         "dir_mask": torch.zeros(B, MAX_ACTORS, INTENT_SLOTS, N_DIR),
         "target_select_mask": torch.zeros(B, N_INTENT, MAX_TARGETS),
         "amount_mask": torch.zeros(B, MAX_ACTORS, INTENT_SLOTS, N_INTENT, N_AMOUNT),
+        "construction_mask": torch.zeros(
+            B, MAX_ROOMS, N_CONSTRUCTION_TYPE, CONSTRUCTION_MASK_BYTES,
+            dtype=torch.uint8,
+        ),
         "globals": torch.zeros(B, GLOBAL_FEAT),
     }
     # Only none legal
@@ -113,6 +480,44 @@ def test_hl_gauss_support():
     assert ce.shape == (3,)
 
 
+def test_hl_gauss_symlog_high_return_geometry_and_decode():
+    critic = Critic()
+    support = critic.support
+    assert support.num_bins == 409
+    assert support.centers[support.num_bins // 2] == 0
+    targets = torch.tensor([
+        -1_000_000_000.0,
+        -1_000_000.0,
+        -8_648.0,  # representative large shaped return within the support
+        0.0,
+        8_648.0,
+        1_000_000.0,
+        1_000_000_000.0,
+    ])
+    labels = support.project(targets)
+    assert torch.allclose(labels.sum(-1), torch.ones_like(targets), atol=1e-6)
+    decoded = support.to_expected_scalar(labels.clamp_min(1e-30).log())
+    # HL-Gauss is Gaussian in symlog coordinates, where these anchored targets
+    # decode exactly up to float32 precision.
+    assert torch.allclose(
+        torch.log1p(decoded.abs()), torch.log1p(targets.abs()), atol=2e-5,
+    )
+    diagnostics = support.target_diagnostics(targets)
+    assert diagnostics["overflow_count"].item() == 0
+    assert diagnostics["saturation_fraction"].item() == 0
+
+
+def test_hl_gauss_rejects_instead_of_clamping_overflow():
+    support = Critic().support
+    try:
+        support.project(torch.tensor([2_000_000_000.0]))
+    except ValueError as error:
+        assert "outside declared raw-return support" in str(error)
+        assert "overflow_count=1" in str(error)
+    else:
+        raise AssertionError("out-of-support return was silently projected")
+
+
 def test_reward_normalizer_roundtrip():
     rn = RewardNormalizer(gamma=0.99, clip=10.0)
     r = torch.randn(8, 2)
@@ -128,7 +533,7 @@ def test_reward_normalizer_roundtrip():
 
 def test_critic_scalar_default():
     c = Critic()
-    assert c.use_hl_gauss is False
+    assert c.use_hl_gauss is True
     B = 1
     batch = {
         "patches": torch.zeros(B, MAX_ROOMS, PATCHES_PER_ROOM, PATCH_FLAT),
@@ -136,21 +541,50 @@ def test_critic_scalar_default():
         "room_coords": torch.zeros(B, MAX_ROOMS, 2),
         "actors": torch.zeros(B, MAX_ACTORS, ACTOR_FEAT),
         "actor_mask": torch.zeros(B, MAX_ACTORS),
+        "actor_outcome": torch.zeros(B, MAX_ACTORS),
         "targets": torch.zeros(B, MAX_TARGETS, TARGET_FEAT),
         "target_mask": torch.zeros(B, MAX_TARGETS),
         "globals": torch.zeros(B, GLOBAL_FEAT),
     }
     v = c(batch)
     assert v.shape == (1,)
+    assert torch.allclose(v, torch.zeros_like(v), atol=1e-5)
+
+
+def test_critic_value_head_stays_fp32_under_autocast():
+    critic = Critic()
+    obs = _dummy_obs_batch(1)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        logits = critic(obs, return_logits=True)
+    assert logits.dtype == torch.float32
+
+
+def test_value_contract_has_no_clipping_and_fixed_critic_grad_clip():
+    source = (_RL / "agent" / "ppo.py").read_text(encoding="utf-8")
+    assert "clipValueLoss" not in source
+    assert "v_clipped" not in source
+    assert float(SCHEMA["value"]["criticMaxGradNorm"]) == 0.5
+    assert SCHEMA["value"]["loss"] == "hlGauss"
+    assert SCHEMA["value"]["transform"] == "symlog"
+    assert int(SCHEMA["artifact"]["learningAbi"]) >= 12
+    assert float(SCHEMA["ppo"]["gamma"]) == 0.995
+    assert float(SCHEMA["ppo"]["gaeLambda"]) == 0.95
+    assert int(SCHEMA["ppo"]["numEnvs"]) == 24
+    assert int(SCHEMA["ppo"]["rolloutSteps"]) == 512
+    assert int(SCHEMA["ppo"]["maxRolloutSteps"]) == 512
+    assert int(SCHEMA["ppo"]["minibatch"]) == 1536
+    assert int(SCHEMA["ppo"]["epochs"]) == 3
+    assert 512 * 24 // 1536 == 8
+    assert int(SCHEMA["nextLat"]["horizon"]) == 1
 
 
 def test_schema_reward_values_productive_economy():
     r = SCHEMA["reward"]
+    assert set(key for key in r if not key.startswith("_")) == {
+        "energyHarvested", "controlPoints",
+    }
     assert 0 < float(r["energyHarvested"]) < float(r["controlPoints"])
     assert float(r["controlPoints"]) == 1.0
-    assert float(r["energyDelivered"]) > 0
-    assert float(r["buildProgress"]) > 0
-    assert float(r["roomClaim"]) > 0
     assert "spawn" not in r  # avoid rewarding body churn directly
 
 
@@ -179,6 +613,10 @@ def test_logprob_sample_matches_evaluate():
         "dir_mask": torch.ones(B, MAX_ACTORS, INTENT_SLOTS, N_DIR),
         "target_select_mask": torch.zeros(B, N_INTENT, MAX_TARGETS),
         "amount_mask": torch.zeros(B, MAX_ACTORS, INTENT_SLOTS, N_INTENT, N_AMOUNT),
+        "construction_mask": torch.zeros(
+            B, MAX_ROOMS, N_CONSTRUCTION_TYPE, CONSTRUCTION_MASK_BYTES,
+            dtype=torch.uint8,
+        ),
         "globals": torch.zeros(B, GLOBAL_FEAT),
     }
     # One live actor; only none + move legal
@@ -206,6 +644,11 @@ def test_entity_context_changes_peer_policy_and_critic():
     torch.manual_seed(7)
     actor = Actor().eval()
     critic = Critic().eval()
+    # The production prior intentionally initializes the intent projection at a
+    # tiny gain; use an ordinary trained-head scale so this test probes whether
+    # peer context can affect policy rather than initialization magnitude.
+    with torch.no_grad():
+        actor.type_head.weight.normal_(std=0.2)
     obs = _dummy_obs_batch(1)
     obs["actor_mask"][0, :2] = 1
     none = INTENT_TYPES.index("none")
@@ -227,6 +670,31 @@ def test_entity_context_changes_peer_policy_and_critic():
         after_value_state = critic._backbone(changed)[0]
     assert not torch.allclose(before_actor, after_actor, atol=1e-7, rtol=1e-7)
     assert not torch.allclose(before_value_state, after_value_state, atol=1e-7, rtol=1e-7)
+
+
+def test_creep_token_contains_exact_body_and_storage_state():
+    actor = Actor().eval()
+    obs = _dummy_obs_batch(1)
+    obs["actor_mask"][0, 0] = 1
+    obs["actors"][0, 0, _AF["totalWork"]] = 1.0 / MAX_BODY_PARTS
+    obs["actors"][0, 0, _AF["activeWork"]] = 1.0 / MAX_BODY_PARTS
+    with torch.no_grad():
+        before = actor.trunk(
+            obs["patches"], obs["room_mask"], obs["room_coords"],
+            obs["actors"], obs["actor_mask"], obs["actor_outcome"],
+            obs["targets"], obs["target_mask"], obs["globals"],
+        )[0]
+        changed = {key: value.clone() for key, value in obs.items()}
+        changed["actors"][0, 0, _AF["totalWork"]] = 2.0 / MAX_BODY_PARTS
+        changed["actors"][0, 0, _AF["activeWork"]] = 2.0 / MAX_BODY_PARTS
+        changed["actors"][0, 0, _AF["storedEnergy"]] = 50.0 / MAX_ROOM_ENERGY
+        changed["actors"][0, 0, _AF["storeCapacity"]] = 100.0 / MAX_ROOM_ENERGY
+        after = actor.trunk(
+            changed["patches"], changed["room_mask"], changed["room_coords"],
+            changed["actors"], changed["actor_mask"], changed["actor_outcome"],
+            changed["targets"], changed["target_mask"], changed["globals"],
+        )[0]
+    assert not torch.allclose(before[0, 0], after[0, 0])
 
 
 def test_per_actor_logprob_factorization():
@@ -266,19 +734,39 @@ def test_structure_cannot_select_remote_target_intent():
     assert int(out.types[0, 0, 0]) == none
 
 
-def test_creep_construction_target_is_same_room_only():
+def test_immobile_creep_can_only_select_targets_already_in_primitive_range():
     obs = _dummy_obs_batch(1)
-    obs["room_mask"][0, 1] = 1
-    obs["actor_mask"][0, 0] = 1  # mobile creep in room 0
+    obs["actor_mask"][0, 0] = 1
+    obs["actors"][0, 0, 1:3] = torch.tensor([0.2, 0.3])
     obs["target_mask"][0, 0] = 1
-    obs["targets"][0, 0, 0] = 1.0  # explicit build position
-    obs["targets"][0, 0, 3] = 1.0 / (MAX_ROOMS - 1)  # remote room 1
+    obs["targets"][0, 0, 0] = 0.0  # source
+    obs["targets"][0, 0, 1:3] = torch.tensor([0.5, 0.3])
+    none = INTENT_TYPES.index("none")
+    harvest = INTENT_TYPES.index("harvest")
+    obs["intent_mask"][0, 0].zero_()
+    obs["intent_mask"][0, 0, :, none] = 1
+    obs["intent_mask"][0, 0, :, harvest] = 1
+    obs["target_select_mask"][0, harvest, 0] = 1
+
+    actor = Actor().eval()
+    with torch.no_grad():
+        actor.type_head.bias.fill_(-50)
+        actor.type_head.bias[harvest] = 50
+        distant = actor(obs, deterministic=True)
+    assert int(distant.types[0, 0, 0]) == none
+
+    obs["targets"][0, 0, 1] = obs["actors"][0, 0, 1] + 1.0 / 49.0
+    with torch.no_grad():
+        adjacent = actor(obs, deterministic=True)
+    assert int(adjacent.types[0, 0, 0]) == harvest
+
+
+def test_creep_cannot_issue_room_construction():
+    obs = _dummy_obs_batch(1)
+    obs["actor_mask"][0, 0] = 1
     none = INTENT_TYPES.index("none")
     construct = INTENT_TYPES.index("createConstructionSite")
     obs["intent_mask"][0, 0, :, none] = 1
-    obs["intent_mask"][0, 0, :, construct] = 1
-    obs["target_select_mask"][0, construct, 0] = 1
-    obs["amount_mask"][0, 0, :, construct, 0] = 1
 
     actor = Actor().eval()
     with torch.no_grad():
@@ -288,26 +776,211 @@ def test_creep_construction_target_is_same_room_only():
     assert int(out.types[0, 0, 0]) == none
 
 
-def test_construction_has_no_direction_factor():
+def test_construction_uses_exact_type_and_tile_factors():
     obs = _dummy_obs_batch(1)
     obs["actor_mask"][0, 0] = 1
-    obs["target_mask"][0, 0] = 1
-    obs["targets"][0, 0, 0] = 1.0  # position target
+    obs["actors"][0, 0, 0] = 1
+    obs["actors"][0, 0, _AF["isRoom"]] = 1
     construct = INTENT_TYPES.index("createConstructionSite")
     obs["intent_mask"][0, 0, 0, construct] = 1
-    obs["target_select_mask"][0, construct, 0] = 1
-    obs["amount_mask"][0, 0, 0, construct, 0] = 1
+    type_index = 2
+    tile = 17 * 50 + 23
+    obs["construction_mask"][0, 0, type_index, tile // 8] |= 1 << (tile % 8)
     with torch.no_grad():
         out = Actor()(obs, deterministic=True)
     assert int(out.types[0, 0, 0]) == construct
-    assert out.factor_active[0, 0].tolist() == [True, False, True, True]
+    assert int(out.construction_types[0, 0, 0]) == type_index
+    assert int(out.construction_tiles[0, 0, 0]) == tile
+    assert out.factor_active[0, 0, :7].tolist() == [
+        True, False, False, False, True, True, False,
+    ]
+    assert not bool(out.factor_active[0, 0, 7:].any())
+
+
+def test_construction_sample_and_reevaluate_logprob_match():
+    from unittest import mock
+
+    torch.manual_seed(19)
+    obs = _dummy_obs_batch(1)
+    obs["actor_mask"][0, 0] = 1
+    obs["actors"][0, 0, 0] = 1
+    obs["actors"][0, 0, _AF["isRoom"]] = 1
+    construct = INTENT_TYPES.index("createConstructionSite")
+    obs["intent_mask"][0, 0, 0, construct] = 1
+    for type_index, tiles in ((0, (101, 777)), (3, (456, 2048))):
+        for tile in tiles:
+            obs["construction_mask"][0, 0, type_index, tile // 8] |= 1 << (tile % 8)
+    actor = Actor().eval()
+    original_einsum = torch.einsum
+
+    def reject_integer_einsum(equation, *operands):
+        assert all(operand.dtype != torch.long for operand in operands), (
+            f"categorical indices reached einsum {equation}"
+        )
+        return original_einsum(equation, *operands)
+
+    with torch.no_grad():
+        with mock.patch.object(torch, "einsum", side_effect=reject_integer_einsum):
+            sampled = actor(obs)
+            action = {
+                key: getattr(sampled, key)
+                for key in (
+                    "types", "dirs", "targets", "amounts", "construction_types",
+                    "construction_tiles", "body_counts", "body_order",
+                )
+            }
+            evaluated = actor(obs, action=action)
+    assert torch.allclose(
+        sampled.actor_logprob, evaluated.actor_logprob, atol=1e-5, rtol=1e-5,
+    )
+
+
+def test_spawn_count_chain_is_exactly_affordable_and_reevaluable():
+    obs = _dummy_obs_batch(1)
+    spawn = INTENT_TYPES.index("spawnCreep")
+    none = INTENT_TYPES.index("none")
+    obs["actor_mask"][0, 0] = 1
+    obs["actors"][0, 0, _AF["isNonCreep"]] = 1
+    obs["actors"][0, 0, _AF["isSpawn"]] = 1
+    obs["actors"][0, 0, _AF["roomEnergyAvailable"]] = 300.0 / MAX_ROOM_ENERGY
+    obs["intent_mask"][0, 0, 0, none] = 1
+    obs["intent_mask"][0, 0, 0, spawn] = 1
+    actor = Actor().eval()
+    with torch.no_grad():
+        actor.type_head.bias.fill_(-50)
+        actor.type_head.bias[spawn] = 50
+        for _ in range(4):
+            out = actor(obs)
+            assert int(out.types[0, 0, 0]) == spawn
+            counts = out.body_counts[0, 0, 0]
+            order = out.body_order[0, 0, 0]
+            length = int(counts.sum())
+            assert 1 <= length <= MAX_BODY_PARTS
+            assert sorted(order.tolist()) == list(range(N_BODY_PART))
+            positive_count = int((counts > 0).sum())
+            assert bool((counts[order[:positive_count]] > 0).all())
+            assert order[positive_count:].tolist() == sorted(order[positive_count:].tolist())
+            cost = sum(
+                BODY_PART_COSTS[part] * int(counts[part]) for part in range(N_BODY_PART)
+            )
+            assert cost <= 300
+            action = {
+                key: getattr(out, key)
+                for key in (
+                    "types", "dirs", "targets", "amounts",
+                    "body_counts", "body_order",
+                )
+            }
+            evaluated = actor(obs, action=action)
+            assert torch.allclose(
+                out.actor_logprob[0, 0], evaluated.actor_logprob[0, 0], atol=2e-5,
+            )
+
+        # Below the cheapest body cost, spawn itself closes and none remains.
+        obs["actors"][0, 0, _AF["roomEnergyAvailable"]] = 0
+        masked = actor(obs, deterministic=True)
+        assert int(masked.types[0, 0, 0]) == none
+        assert masked.body_counts[0, 0, 0].tolist() == [0] * N_BODY_PART
+        assert masked.body_order[0, 0, 0].tolist() == list(range(N_BODY_PART))
+
+    actor.zero_grad(set_to_none=True)
+    affordable_obs = {key: value.clone() for key, value in obs.items()}
+    affordable_obs["actors"][0, 0, _AF["roomEnergyAvailable"]] = 300.0 / MAX_ROOM_ENERGY
+    differentiable = actor(affordable_obs)
+    spawn_loss = -differentiable.actor_logprob[0, 0]
+    assert torch.isfinite(spawn_loss)
+    spawn_loss.backward()
+    actor_grads = [parameter.grad for parameter in actor.parameters() if parameter.grad is not None]
+    assert actor_grads
+    assert all(torch.isfinite(gradient).all() for gradient in actor_grads)
+
+
+def test_spawn_count_chain_has_full_support_without_forced_cheap_suffix():
+    actor = Actor().eval()
+    logits = torch.zeros(2, N_BODY_PART, MAX_BODY_PARTS + 1, requires_grad=True)
+    counts = torch.zeros(2, N_BODY_PART, dtype=torch.long)
+    counts[0, 0] = 6  # six MOVE, exactly 300 energy
+    counts[1, -1] = 30  # thirty TOUGH, also exactly 300 energy
+    sampled, logprob, entropy = actor._budget_conditioned_counts(
+        logits, torch.tensor([300, 300]), False, counts,
+    )
+    assert torch.equal(sampled, counts)
+    assert torch.isfinite(logprob).all()
+    assert torch.isfinite(entropy).all()
+    (-logprob.mean()).backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
+def test_spawn_order_canonicalizes_zero_aliases_and_rejects_bad_wire_order():
+    from samples.rl.agent.actions_util import safe_bc_nll
+
+    actor = Actor().eval()
+    logits = torch.randn(1, N_BODY_PART, requires_grad=True)
+    counts = torch.tensor([[2, 0, 0, 0, 0, 0, 0, 0]])
+    canonical = torch.arange(N_BODY_PART).view(1, -1)
+    order, lp, entropy, active = actor._positive_type_order(
+        logits, counts, False, canonical,
+    )
+    assert torch.equal(order, canonical)
+    assert int(active.sum()) == 1  # contract sentinel; no stochastic order choice
+    assert float(lp.detach().sum()) == 0.0
+    assert float(entropy.detach().sum()) == 0.0
+
+    aliased = canonical.clone()
+    aliased[0, 1], aliased[0, 2] = aliased[0, 2].clone(), aliased[0, 1].clone()
+    _, bad_lp, _, bad_active = actor._positive_type_order(
+        logits, counts, False, aliased,
+    )
+    try:
+        safe_bc_nll(bad_lp, bad_active, strict=True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("noncanonical zero-count order alias was accepted")
+
+
+def test_spawn_factor_budget_is_eight_counts_plus_at_most_seven_order_choices():
+    actor = Actor().eval()
+    logits = torch.zeros(1, N_BODY_PART)
+    counts = torch.ones(1, N_BODY_PART, dtype=torch.long)
+    order = torch.arange(N_BODY_PART).view(1, -1)
+    _, _, _, active = actor._positive_type_order(logits, counts, True, order)
+    assert int(active.sum()) == N_BODY_PART - 1
+    assert 2 * N_BODY_PART == 16
+    assert 2 * N_BODY_PART < 1 + MAX_BODY_PARTS  # replaces old length + 50-slot scan
+
+
+def test_ti_interleaved_spawn_supervises_counts_but_not_grouped_order():
+    from samples.rl.agent.pretrain_joint import (
+        _body_label_factor_mask,
+        _parts_to_count_order,
+    )
+
+    carry, move = 2, 0
+    interleaved = [carry, move] * 4
+    counts, order, order_exact = _parts_to_count_order(interleaved)
+    assert counts.tolist() == [4, 0, 4, 0, 0, 0, 0, 0]
+    assert order[:2].tolist() == [carry, move]
+    assert not order_exact
+    eligible = _body_label_factor_mask(counts, order_exact)
+    assert bool(eligible[6 : 6 + N_BODY_PART].all())
+    assert not bool(eligible[6 + N_BODY_PART :].any())
+
+    grouped = [carry] * 4 + [move] * 4
+    grouped_counts, grouped_order, grouped_exact = _parts_to_count_order(grouped)
+    assert torch.equal(grouped_counts, counts)
+    assert torch.equal(grouped_order, order)
+    assert grouped_exact
+    grouped_eligible = _body_label_factor_mask(grouped_counts, grouped_exact)
+    # Two positive types have exactly one stochastic relative-order choice.
+    assert int(grouped_eligible[6 + N_BODY_PART :].sum()) == 1
 
 
 def test_resource_amount_bins_are_unique_for_selected_target():
     obs = _dummy_obs_batch(1)
     obs["actor_mask"][0, 0] = 1
-    obs["actors"][0, 0, 20] = 50.0 / 2000.0
-    obs["actors"][0, 0, 21] = 50.0 / 2000.0
+    obs["actors"][0, 0, _AF["storedEnergy"]] = 50.0 / MAX_ROOM_ENERGY
+    obs["actors"][0, 0, _AF["storeCapacity"]] = 50.0 / MAX_ROOM_ENERGY
     obs["target_mask"][0, 0] = 1
     obs["targets"][0, 0, 0] = 2.0 / 6.0
     obs["targets"][0, 0, 13] = 49.0 / 1_000_000.0
@@ -332,6 +1005,7 @@ def test_creep_cannot_transfer_to_itself():
     obs = _dummy_obs_batch(1)
     obs["actor_mask"][0, 0] = 1
     obs["actors"][0, 0, 1:3] = torch.tensor([0.2, 0.3])
+    obs["actors"][0, 0, _AF["activeMove"]] = 1.0 / MAX_BODY_PARTS
     obs["actors"][0, 0, 20:22] = torch.tensor([25.0 / 2000.0, 50.0 / 2000.0])
     obs["target_mask"][0, :2] = 1
     obs["targets"][0, :, 0] = 4.0 / 6.0  # creep targets
@@ -367,7 +1041,7 @@ def test_tower_attack_requires_creep_target():
     obs = _dummy_obs_batch(1)
     obs["actor_mask"][0, 0] = 1
     obs["actors"][0, 0, 0] = 1  # structure actor
-    obs["actors"][0, 0, 5] = 1  # tower
+    obs["actors"][0, 0, _AF["isTower"]] = 1
     obs["target_mask"][0, 0] = 1
     obs["targets"][0, 0, 0] = 2.0 / 6.0  # hostile structure, not creep
     none = INTENT_TYPES.index("none")
@@ -399,9 +1073,100 @@ def test_factorized_ppo_update_finite():
     agent = Agent()
     with torch.no_grad():
         out = agent.actor(obs)
-        values = agent.critic(obs)
+        critic_logits, critic_latent = agent.critic.value_logits_and_latent(obs)
+        values = agent.critic.support.to_expected_scalar(critic_logits)
     rollout = RolloutBatch(
         obs=obs,
+        actions={
+            "types": out.types,
+            "dirs": out.dirs,
+            "targets": out.targets,
+            "amounts": out.amounts,
+        },
+        logprob=out.actor_logprob,
+        value=values,
+        reward=torch.ones(batch_size),
+        done=torch.zeros(batch_size),
+        advantage=torch.tensor([1.0, -0.5, 0.25, 2.0]),
+        ret=torch.tensor([1.0, 0.5, 1.5, 2.0]),
+        actor_latent=out.state_latent,
+        critic_latent=critic_latent,
+        critic_logits=critic_logits,
+        batch_size=batch_size,
+    )
+    trainer = PPOTrainer(
+        agent,
+        device="cpu",
+        compile_model=False,
+        max_grad_norm=0.125,
+        epochs=1,
+        minibatch=2,
+    )
+    clip_calls: list[float] = []
+    original_clip = torch.nn.utils.clip_grad_norm_
+    def recording_clip(parameters, max_norm, *args, **kwargs):
+        clip_calls.append(float(max_norm))
+        return original_clip(parameters, max_norm, *args, **kwargs)
+    torch.nn.utils.clip_grad_norm_ = recording_clip
+    try:
+        stats = trainer.update(rollout)
+    finally:
+        torch.nn.utils.clip_grad_norm_ = original_clip
+    for key in ("policy_loss", "value_loss", "entropy", "approx_kl"):
+        assert torch.isfinite(torch.tensor(stats[key])), (key, stats[key])
+    assert stats["critic_max_grad_norm"] == 0.5
+    assert stats["value_target_overflow_fraction"] == 0.0
+    assert clip_calls.count(0.125) == 2  # actor: two minibatches
+    assert clip_calls.count(0.5) == 2  # critic: independently fixed at 0.5
+
+
+def test_factorized_ppo_update_accepts_sparse_rollout_observations():
+    """Exercise page reconstruction through PPO's actual minibatch staging."""
+    from samples.rl.agent.ppo import PPOTrainer, RolloutBatch
+    from samples.rl.agent.rollout_buffer import HostRolloutBuffer
+
+    torch.manual_seed(12)
+    batch_size = 4
+    obs = _dummy_obs_batch(batch_size)
+    obs["actor_mask"][:, :2] = 1
+    obs["intent_mask"][:, :2, :, INTENT_TYPES.index("none")] = 1
+    obs["intent_mask"][:, :2, :, INTENT_TYPES.index("move")] = 1
+    obs["amount_mask"][..., 0] = 1
+    agent = Agent()
+    with torch.no_grad():
+        out = agent.actor(obs)
+        critic_logits, critic_latent = agent.critic.value_logits_and_latent(obs)
+        values = agent.critic.support.to_expected_scalar(critic_logits)
+
+    buf = HostRolloutBuffer(batch_size, 1)
+    byte_keys = {
+        "room_mask", "actor_mask", "target_mask", "intent_mask",
+        "dir_mask", "target_select_mask", "amount_mask",
+        "construction_mask",
+    }
+    for index in range(batch_size):
+        host = {
+            key: (
+                value[index : index + 1].to(torch.uint8)
+                if key == "patches" or key in byte_keys
+                else value[index : index + 1]
+            )
+            for key, value in obs.items()
+        }
+        buf.write_step(
+            host_obs=host,
+            types=out.types[index : index + 1],
+            dirs=out.dirs[index : index + 1],
+            targets=out.targets[index : index + 1],
+            amounts=out.amounts[index : index + 1],
+            logprob=out.actor_logprob[index : index + 1],
+            value=values[index : index + 1],
+            reward=torch.ones(1),
+            done=torch.zeros(1),
+            trunc=torch.zeros(1),
+        )
+    rollout = RolloutBatch(
+        obs=buf.as_flat_obs(),
         actions={
             "types": out.types,
             "dirs": out.dirs,
@@ -417,15 +1182,281 @@ def test_factorized_ppo_update_finite():
         batch_size=batch_size,
     )
     trainer = PPOTrainer(
-        agent,
-        device="cpu",
-        compile_model=False,
-        epochs=1,
-        minibatch=2,
+        agent, device="cpu", compile_model=False, epochs=1, minibatch=2,
     )
     stats = trainer.update(rollout)
+    assert buf.patch_pages.count == batch_size
     for key in ("policy_loss", "value_loss", "entropy", "approx_kl"):
         assert torch.isfinite(torch.tensor(stats[key])), (key, stats[key])
+
+
+def test_nextlat_ppo_pairs_are_causal_masked_and_train_both_trunks():
+    """Future rows are detached targets; terminals and rollout tails contribute zero."""
+    from samples.rl.agent.ppo import PPOTrainer, RolloutBatch, _masked_latent_loss
+
+    prediction = torch.tensor([[0.0, 0.0], [0.0, 0.0]], requires_grad=True)
+    target = torch.tensor([[2.0, 2.0], [100.0, 100.0]], requires_grad=True)
+    loss = _masked_latent_loss(prediction, target, torch.tensor([True, False]))
+    assert torch.allclose(loss, torch.tensor(1.5)), loss
+    loss.backward()
+    assert prediction.grad is not None and torch.isfinite(prediction.grad).all()
+    assert target.grad is None
+
+    torch.manual_seed(31)
+    batch_size = 4
+    obs = _dummy_obs_batch(batch_size)
+    obs["actor_mask"][:, :2] = 1
+    obs["intent_mask"][:, :2, :, INTENT_TYPES.index("none")] = 1
+    obs["intent_mask"][:, :2, :, INTENT_TYPES.index("move")] = 1
+    obs["dir_mask"][:, :2] = 1
+    obs["amount_mask"][..., 0] = 1
+    # Make each actual next state observably different while keeping table shape fixed.
+    obs["globals"][:, 0] = torch.arange(batch_size, dtype=torch.float32) / batch_size
+    agent = Agent()
+    with torch.no_grad():
+        out = agent.actor(obs)
+        critic_logits, critic_latent = agent.critic.value_logits_and_latent(obs)
+        values = agent.critic.support.to_expected_scalar(critic_logits)
+    actions = {
+        "types": out.types,
+        "dirs": out.dirs,
+        "targets": out.targets,
+        "amounts": out.amounts,
+        "body_counts": out.body_counts,
+        "body_order": out.body_order,
+        "construction_types": out.construction_types,
+        "construction_tiles": out.construction_tiles,
+    }
+    actor_before = agent.actor.latent_dynamics.dynamics_mlp[-1].weight.detach().clone()
+    critic_before = agent.critic.latent_dynamics.dynamics_mlp[-1].weight.detach().clone()
+    rollout = RolloutBatch(
+        obs=obs,
+        actions=actions,
+        logprob=out.actor_logprob,
+        value=values,
+        reward=torch.ones(batch_size),
+        done=torch.tensor([0.0, 1.0, 0.0, 0.0]),
+        advantage=torch.tensor([1.0, -0.5, 0.25, 2.0]),
+        ret=torch.tensor([1.0, 0.5, 1.5, 2.0]),
+        actor_latent=out.state_latent,
+        critic_latent=critic_latent,
+        critic_logits=critic_logits,
+        next_indices=torch.tensor([1, 2, 3, 3]),
+        nextlat_valid=torch.tensor([True, False, True, False]),
+        batch_size=batch_size,
+    )
+    trainer = PPOTrainer(
+        agent, device="cpu", compile_model=False, epochs=1, minibatch=4,
+    )
+    stats = trainer.update(rollout)
+    assert stats["nextlat_valid_fraction"] == 0.5
+    for key in ("nextlat_actor_mse", "nextlat_critic_mse", "nextlat_critic_kl"):
+        assert torch.isfinite(torch.tensor(stats[key])), (key, stats[key])
+        assert stats[key] >= 0
+    assert not torch.equal(
+        actor_before, agent.actor.latent_dynamics.dynamics_mlp[-1].weight,
+    )
+    assert not torch.equal(
+        critic_before, agent.critic.latent_dynamics.dynamics_mlp[-1].weight,
+    )
+
+
+def test_nextlat_time_major_pairing_cuts_done_truncation_and_tail():
+    from samples.rl.agent.train import _nextlat_pair_indices
+
+    done = torch.zeros(4, 3)
+    trunc = torch.zeros_like(done)
+    done[1, 0] = 1
+    trunc[2, 2] = 1
+    next_indices, valid = _nextlat_pair_indices(done, trunc)
+    expected = torch.tensor([
+        [3, 4, 5],
+        [6, 7, 8],
+        [9, 10, 11],
+        [9, 10, 11],
+    ])
+    assert torch.equal(next_indices, expected)
+    assert torch.equal(
+        valid,
+        torch.tensor([
+            [True, True, True],
+            [False, True, True],
+            [True, True, False],
+            [False, False, False],
+        ]),
+    )
+
+
+def test_nextlat_action_encoding_uses_target_features_not_table_identity():
+    torch.manual_seed(37)
+    actor = Actor().eval()
+    obs = _dummy_obs_batch(1)
+    obs["actor_mask"][0, 0] = 1
+    obs["target_mask"][0, :2] = 1
+    obs["targets"][0, 0, 0:4] = torch.tensor([3 / 6, 0.1, 0.2, 0.0])
+    obs["targets"][0, 1, 0:4] = torch.tensor([3 / 6, 0.8, 0.7, 0.0])
+    pickup = INTENT_TYPES.index("pickup")
+    actions = {
+        "types": torch.full((1, MAX_ACTORS, 1), pickup),
+        "dirs": torch.zeros(1, MAX_ACTORS, 1, dtype=torch.long),
+        "targets": torch.zeros(1, MAX_ACTORS, 1, dtype=torch.long),
+        "amounts": torch.zeros(1, MAX_ACTORS, 1, dtype=torch.long),
+    }
+    state = torch.randn(1, actor.d_model)
+    with torch.no_grad():
+        baseline = actor.predict_next_latent(state, obs, actions)
+        permuted_obs = {key: value.clone() for key, value in obs.items()}
+        permuted_obs["targets"][:, [0, 1]] = permuted_obs["targets"][:, [1, 0]]
+        permuted_actions = {key: value.clone() for key, value in actions.items()}
+        permuted_actions["targets"][:, 0, 0] = 1
+        permuted = actor.predict_next_latent(state, permuted_obs, permuted_actions)
+    assert torch.allclose(baseline, permuted, atol=1e-6, rtol=1e-6)
+
+
+def _nextlat_actions(batch_size: int, actor_count: int) -> dict[str, torch.Tensor]:
+    shape = (batch_size, actor_count, INTENT_SLOTS)
+    return {
+        "types": torch.full(shape, INTENT_TYPES.index("none"), dtype=torch.long),
+        "dirs": torch.zeros(shape, dtype=torch.long),
+        "targets": torch.zeros(shape, dtype=torch.long),
+        "amounts": torch.zeros(shape, dtype=torch.long),
+    }
+
+
+def test_nextlat_none_actions_have_zero_context_and_ignore_idle_state():
+    torch.manual_seed(41)
+    dynamics = ActionConditionedDynamics(24).eval()
+    state = torch.randn(1, 24)
+    batch = {
+        "actors": torch.randn(1, 4, ACTOR_FEAT),
+        "actor_mask": torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+        "targets": torch.randn(1, 3, TARGET_FEAT),
+    }
+    actions = _nextlat_actions(1, 4)
+
+    with torch.no_grad():
+        context = dynamics.action_context(state, batch, actions)
+        prediction = dynamics(state, batch, actions)
+    assert torch.equal(context, torch.zeros_like(context))
+
+    changed_batch = {key: value.clone() for key, value in batch.items()}
+    changed_batch["actors"].normal_(mean=50.0, std=10.0)
+    changed_batch["targets"].normal_(mean=-50.0, std=10.0)
+    changed_actions = {key: value.clone() for key, value in actions.items()}
+    changed_actions["dirs"].fill_(N_DIR - 1)
+    changed_actions["targets"].fill_(batch["targets"].shape[1] - 1)
+    changed_actions["amounts"].fill_(N_AMOUNT - 1)
+    permutation = torch.tensor([2, 0, 3, 1])
+    changed_batch["actors"] = changed_batch["actors"][:, permutation]
+    changed_batch["actor_mask"] = changed_batch["actor_mask"][:, permutation]
+    changed_actions = {
+        key: value[:, permutation] for key, value in changed_actions.items()
+    }
+    with torch.no_grad():
+        changed_context = dynamics.action_context(state, changed_batch, changed_actions)
+        changed_prediction = dynamics(state, changed_batch, changed_actions)
+    assert torch.equal(changed_context, torch.zeros_like(changed_context))
+    assert torch.equal(prediction, changed_prediction)
+
+
+def test_nextlat_issued_actions_are_sensitive_and_permutation_invariant():
+    torch.manual_seed(43)
+    dynamics = ActionConditionedDynamics(24).eval()
+    state = torch.randn(1, 24)
+    batch = {
+        "actors": torch.randn(1, 4, ACTOR_FEAT),
+        "actor_mask": torch.ones(1, 4),
+        "targets": torch.randn(1, 3, TARGET_FEAT),
+    }
+    actions = _nextlat_actions(1, 4)
+    move = INTENT_TYPES.index("move")
+    pickup = INTENT_TYPES.index("pickup")
+    actions["types"][0, 0, 0] = move
+    actions["dirs"][0, 0, 0] = 1
+    actions["types"][0, 2, 0] = pickup
+    actions["targets"][0, 2, 0] = 1
+
+    with torch.no_grad():
+        none_actions = _nextlat_actions(1, 4)
+        none_context = dynamics.action_context(state, batch, none_actions)
+        none_prediction = dynamics(state, batch, none_actions)
+        context = dynamics.action_context(state, batch, actions)
+        prediction = dynamics(state, batch, actions)
+        changed_direction = {key: value.clone() for key, value in actions.items()}
+        changed_direction["dirs"][0, 0, 0] = 2
+        changed_context = dynamics.action_context(state, batch, changed_direction)
+        changed_prediction = dynamics(state, batch, changed_direction)
+    assert torch.equal(none_context, torch.zeros_like(none_context))
+    assert not torch.allclose(none_prediction, prediction)
+    assert not torch.allclose(context, changed_context)
+    assert not torch.allclose(prediction, changed_prediction)
+
+    idle_changed_batch = {key: value.clone() for key, value in batch.items()}
+    idle_changed_batch["actors"][0, [1, 3]].normal_(mean=100.0, std=20.0)
+    idle_changed_actions = {key: value.clone() for key, value in actions.items()}
+    idle_changed_actions["dirs"][0, [1, 3], 0] = N_DIR - 1
+    idle_changed_actions["targets"][0, [1, 3], 0] = 2
+    idle_changed_actions["amounts"][0, [1, 3], 0] = N_AMOUNT - 1
+    with torch.no_grad():
+        idle_changed_context = dynamics.action_context(
+            state, idle_changed_batch, idle_changed_actions,
+        )
+        idle_changed_prediction = dynamics(
+            state, idle_changed_batch, idle_changed_actions,
+        )
+    assert torch.equal(context, idle_changed_context)
+    assert torch.equal(prediction, idle_changed_prediction)
+
+    permutation = torch.tensor([2, 3, 0, 1])
+    permuted_batch = {
+        "actors": batch["actors"][:, permutation],
+        "actor_mask": batch["actor_mask"][:, permutation],
+        "targets": batch["targets"],
+    }
+    permuted_actions = {
+        key: value[:, permutation] for key, value in actions.items()
+    }
+    with torch.no_grad():
+        permuted_context = dynamics.action_context(
+            state, permuted_batch, permuted_actions,
+        )
+        permuted_prediction = dynamics(state, permuted_batch, permuted_actions)
+    assert torch.allclose(context, permuted_context, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(prediction, permuted_prediction, atol=1e-7, rtol=1e-6)
+
+
+def test_nextlat_action_context_gradients_are_finite_and_mask_none_exactly():
+    torch.manual_seed(47)
+    dynamics = ActionConditionedDynamics(24)
+    state = torch.randn(1, 24, requires_grad=True)
+    actors = torch.randn(1, 3, ACTOR_FEAT, requires_grad=True)
+    batch = {
+        "actors": actors,
+        "actor_mask": torch.tensor([[1.0, 1.0, 0.0]]),
+        "targets": torch.randn(1, 2, TARGET_FEAT, requires_grad=True),
+    }
+    actions = _nextlat_actions(1, 3)
+    move = INTENT_TYPES.index("move")
+    none = INTENT_TYPES.index("none")
+    actions["types"][0, 0, 0] = move
+    actions["dirs"][0, 0, 0] = 1
+
+    prediction = dynamics(state, batch, actions)
+    loss = prediction.square().mean()
+    loss.backward()
+
+    assert state.grad is not None and torch.isfinite(state.grad).all()
+    assert torch.count_nonzero(state.grad) > 0
+    assert actors.grad is not None and torch.isfinite(actors.grad).all()
+    assert torch.count_nonzero(actors.grad[0, 0]) > 0
+    assert torch.count_nonzero(actors.grad[0, 1:]) == 0
+    type_grad = dynamics.type_embed.weight.grad
+    assert type_grad is not None and torch.isfinite(type_grad).all()
+    assert torch.count_nonzero(type_grad[move]) > 0
+    assert torch.count_nonzero(type_grad[none]) == 0
+    for name, parameter in dynamics.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
 
 
 def test_ppo_population_does_not_reweight_transitions():
@@ -444,8 +1475,61 @@ def test_room_pack_keeps_expansion_capacity():
     agent = Agent()
     initial_mask = torch.tensor([[1.0] + [0.0] * (MAX_ROOMS - 1)])
     assert agent.freeze_room_pack(initial_mask) == MAX_ROOMS
-    assert agent.actor.trunk._static_r == MAX_ROOMS
-    assert agent.critic.trunk._static_r == MAX_ROOMS
+    # The compatibility hook must not freeze reset-time visibility; host-side
+    # 1/2/4 buckets grow with later expansion.
+    assert not hasattr(agent.actor.trunk, "_static_r")
+    assert not hasattr(agent.critic.trunk, "_static_r")
+
+
+def test_entity_capacity_buckets_preserve_live_policy_and_value():
+    from samples.rl.agent.vec_env import promote_obs_device
+
+    torch.manual_seed(23)
+    dense = _dummy_obs_batch(2)
+    dense["actor_mask"][:, :2] = 1
+    dense["target_mask"][:, :9] = 1
+    dense["intent_mask"][:, :2, :, INTENT_TYPES.index("none")] = 1
+    dense["amount_mask"][:, :2, :, :, 0] = 1
+    compact = promote_obs_device(dense, "cpu", non_blocking=False)
+    assert compact["actors"].shape[1] == 8
+    assert compact["targets"].shape[1] == 16
+
+    actor = Actor().eval()
+    critic = Critic().eval()
+    with torch.no_grad():
+        dense_out = actor(dense, deterministic=True)
+        compact_out = actor(compact, deterministic=True)
+        dense_value = critic(dense)
+        compact_value = critic(compact)
+    assert torch.equal(compact_out.types, dense_out.types[:, :8])
+    assert torch.allclose(
+        compact_out.actor_logprob, dense_out.actor_logprob[:, :8], atol=2e-5,
+    )
+    assert torch.allclose(compact_value, dense_value, atol=2e-5)
+
+
+def test_rollout_zero_pads_compact_action_prefix():
+    from samples.rl.agent.rollout_buffer import HostRolloutBuffer
+
+    buf = HostRolloutBuffer(1, 1)
+    host = _rollout_host_obs(1)
+    compact = torch.ones(1, 8, INTENT_SLOTS, dtype=torch.uint8)
+    buf.write_step(
+        host_obs=host,
+        types=compact,
+        dirs=compact,
+        targets=compact,
+        amounts=compact,
+        logprob=torch.ones(1, 8),
+        value=torch.zeros(1),
+        reward=torch.zeros(1),
+        done=torch.zeros(1),
+        trunc=torch.zeros(1),
+    )
+    assert torch.equal(buf.types[0, 0, :8], compact[0])
+    assert not bool(buf.types[0, 0, 8:].any())
+    assert torch.equal(buf.logprob[0, 0, :8], torch.ones(8))
+    assert not bool(buf.logprob[0, 0, 8:].any())
 
 
 def test_trunk_only_filter_for_reward_norm():
@@ -471,12 +1555,17 @@ def _dummy_obs_batch(B: int) -> dict[str, torch.Tensor]:
         "room_coords": torch.zeros(B, MAX_ROOMS, 2),
         "actors": torch.zeros(B, MAX_ACTORS, ACTOR_FEAT),
         "actor_mask": torch.zeros(B, MAX_ACTORS),
+        "actor_outcome": torch.zeros(B, MAX_ACTORS),
         "targets": torch.zeros(B, MAX_TARGETS, TARGET_FEAT),
         "target_mask": torch.zeros(B, MAX_TARGETS),
         "intent_mask": torch.zeros(B, MAX_ACTORS, INTENT_SLOTS, N_INTENT),
         "dir_mask": torch.ones(B, MAX_ACTORS, INTENT_SLOTS, N_DIR),
         "target_select_mask": torch.zeros(B, N_INTENT, MAX_TARGETS),
         "amount_mask": torch.zeros(B, MAX_ACTORS, INTENT_SLOTS, N_INTENT, N_AMOUNT),
+        "construction_mask": torch.zeros(
+            B, MAX_ROOMS, N_CONSTRUCTION_TYPE, CONSTRUCTION_MASK_BYTES,
+            dtype=torch.uint8,
+        ),
         "globals": torch.zeros(B, GLOBAL_FEAT),
     }
 
@@ -516,17 +1605,34 @@ def test_safe_bc_nll_strict_rejects_masked_teacher_factor():
         raise AssertionError("strict BC accepted a masked teacher factor")
 
 
-def test_mc_returns_tn_shapes():
-    from samples.rl.agent.gae import mc_returns_tn
+def test_discounted_returns_tn_exact_recurrence_and_boundaries():
+    from samples.rl.agent.gae import discounted_returns_tn
 
-    T, N = 3, 2
-    r = torch.ones(T, N)
-    d = torch.zeros(T, N)
-    d[-1] = 1
-    boot = torch.zeros(N)
-    ret = mc_returns_tn(r, d, gamma=0.99, next_value=boot, truncations=d)
-    assert ret.shape == (T, N)
-    assert float(ret[0, 0]) > 0
+    gamma = 0.995
+    rewards = torch.tensor([[1.0], [2.0], [3.0], [100.0], [200.0]])
+    dones = torch.tensor([[0.0], [0.0], [1.0], [0.0], [1.0]])
+    ret = discounted_returns_tn(
+        rewards, dones, gamma=gamma, next_value=torch.zeros(1),
+        truncations=torch.zeros_like(dones),
+    )
+    expected = torch.tensor([
+        1 + gamma * 2 + gamma**2 * 3,
+        2 + gamma * 3,
+        3,
+        100 + gamma * 200,
+        200,
+    ])
+    assert torch.allclose(ret[:, 0], expected)
+
+    # A nonterminal finite chunk uses its explicitly supplied endpoint value.
+    bootstrapped = discounted_returns_tn(
+        torch.tensor([[4.0], [5.0]]), torch.zeros(2, 1), gamma=gamma,
+        next_value=torch.tensor([7.0]), truncations=torch.zeros(2, 1),
+    )
+    assert torch.allclose(
+        bootstrapped[:, 0],
+        torch.tensor([4 + gamma * 5 + gamma**2 * 7, 5 + gamma * 7]),
+    )
 
 
 def test_host_rollout_buffer_write_and_flat():
@@ -547,6 +1653,7 @@ def test_host_rollout_buffer_write_and_flat():
             targets=types,
             amounts=types,
             logprob=torch.zeros(N, MAX_ACTORS),
+            actor_latent=torch.full((N, int(SCHEMA["model"]["dModel"])), 0.25),
             value=torch.ones(N),
             reward=torch.ones(N) * 0.5,
             done=torch.zeros(N),
@@ -554,21 +1661,142 @@ def test_host_rollout_buffer_write_and_flat():
         )
     assert len(buf) == 3
     flat = buf.as_flat_obs()
-    assert flat["patches"].shape[0] == 3 * N
+    gathered = flat.gather_minibatch(torch.arange(3 * N))
+    assert gathered["patches"].shape[:2] == (3 * N, 1)
     assert float(buf.tn("reward").sum()) == 3.0
+    assert torch.all(buf.tn("actor_latent") == 0.25)
     buf.set_term_values(0, torch.tensor([1.0, 2.0]), torch.tensor([True, False]))
     assert float(buf.term_value[0, 0]) == 1.0
     assert bool(buf.has_term[0, 0]) and not bool(buf.has_term[0, 1])
     old_capacity = buf.t_max
     buf.ensure_capacity(old_capacity + 3)
     assert buf.t_max >= old_capacity + 3
-    assert buf.obs["patches"].dtype == torch.uint8
+    assert buf.patch_pages.count == 3 * N
     assert buf.obs["target_select_mask"].shape[-2:] == (N_INTENT, MAX_TARGETS)
+
+
+def _rollout_host_obs(n: int) -> dict[str, torch.Tensor]:
+    module = __import__("samples.rl.agent.rollout_buffer", fromlist=["_OBS_SPEC"])
+    return {
+        key: torch.zeros((n, *shape), dtype=dtype)
+        for key, (shape, dtype) in module._OBS_SPEC.items()
+    }
+
+
+def _write_empty_rollout_step(buf, host) -> None:
+    action = torch.zeros(buf.n, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long)
+    buf.write_step(
+        host_obs=host,
+        types=action,
+        dirs=action,
+        targets=action,
+        amounts=action,
+        logprob=torch.zeros(buf.n, MAX_ACTORS),
+        value=torch.zeros(buf.n),
+        reward=torch.zeros(buf.n),
+        done=torch.zeros(buf.n),
+        trunc=torch.zeros(buf.n),
+    )
+
+
+def test_sparse_rollout_pages_preserve_expansion_reorder_and_gather():
+    """Each transition reconstructs its own live slots, including new rooms."""
+    from samples.rl.agent.rollout_buffer import HostRolloutBuffer
+
+    buf = HostRolloutBuffer(3, 2)
+    first = _rollout_host_obs(2)
+    first["room_mask"][0, 0] = 1
+    first["room_mask"][1, 2] = 1
+    first["patches"][0, 0].fill_(11)
+    first["patches"][1, 2].fill_(22)
+    _write_empty_rollout_step(buf, first)
+
+    expanded = _rollout_host_obs(2)
+    expanded["room_mask"][0, :2] = 1
+    expanded["patches"][0, 0].fill_(31)
+    expanded["patches"][0, 1].fill_(32)
+    # Env 1 changes which room slot is live. Old slot 2 must not leak through.
+    expanded["room_mask"][1, 0] = 1
+    expanded["patches"][1, 0].fill_(41)
+    expanded["patches"][1, 2].fill_(99)
+    _write_empty_rollout_step(buf, expanded)
+
+    flat = buf.as_flat_obs()
+    # Gather out of temporal order and repeat a transition (last-mb padding case).
+    batch = flat.gather_minibatch(torch.tensor([3, 0, 2, 1, 3]))
+    patches = batch["patches"]
+    assert tuple(patches.shape) == (5, MAX_ROOMS, PATCHES_PER_ROOM, PATCH_FLAT)
+    assert int(patches[0, 0, 0, 0]) == 41
+    assert torch.count_nonzero(patches[0, 1:]) == 0
+    assert int(patches[1, 0, 0, 0]) == 11
+    assert int(patches[2, 0, 0, 0]) == 31
+    assert int(patches[2, 1, 0, 0]) == 32
+    assert int(patches[3, 2, 0, 0]) == 22
+    assert torch.equal(patches[0], patches[4])
+    assert torch.equal(batch["room_mask"], torch.tensor([
+        [1, 0, 0, 0], [1, 0, 0, 0], [1, 1, 0, 0],
+        [0, 0, 1, 0], [1, 0, 0, 0],
+    ], dtype=torch.uint8))
+
+
+def test_sparse_rollout_gather_uses_room_capacity_buckets():
+    from samples.rl.agent.rollout_buffer import HostRolloutBuffer
+
+    buf = HostRolloutBuffer(2, 1)
+    one_room = _rollout_host_obs(1)
+    one_room["room_mask"][0, 0] = 1
+    _write_empty_rollout_step(buf, one_room)
+    two_rooms = _rollout_host_obs(1)
+    two_rooms["room_mask"][0, :2] = 1
+    _write_empty_rollout_step(buf, two_rooms)
+    flat = buf.as_flat_obs()
+
+    assert flat.gather_minibatch(torch.tensor([0]))["patches"].shape[1] == 1
+    assert flat.gather_minibatch(torch.tensor([1]))["patches"].shape[1] == 2
+    assert flat.gather_minibatch(torch.tensor([0, 1]))["patches"].shape[1] == 2
+
+
+def test_sparse_rollout_reset_reuses_pages_without_stale_rooms():
+    from samples.rl.agent.rollout_buffer import HostRolloutBuffer
+
+    buf = HostRolloutBuffer(1, 1)
+    old = _rollout_host_obs(1)
+    old["room_mask"][0, :2] = 1
+    old["patches"][0, 0].fill_(7)
+    old["patches"][0, 1].fill_(8)
+    _write_empty_rollout_step(buf, old)
+    allocated = buf.patch_pages.allocated_bytes
+
+    buf.reset()
+    assert len(buf) == 0 and buf.patch_pages.count == 0
+    new = _rollout_host_obs(1)
+    new["room_mask"][0, 3] = 1
+    new["patches"][0, 3].fill_(9)
+    _write_empty_rollout_step(buf, new)
+    gathered = buf.as_flat_obs().gather_minibatch(torch.tensor([0]))["patches"]
+    assert torch.count_nonzero(gathered[0, :3]) == 0
+    assert int(gathered[0, 3, 0, 0]) == 9
+    assert buf.patch_pages.allocated_bytes == allocated
+
+
+def test_sparse_rollout_memory_accounting_beats_dense_one_room_history():
+    from samples.rl.agent.rollout_buffer import HostRolloutBuffer
+
+    steps, envs = 64, 2
+    buf = HostRolloutBuffer(steps, envs)
+    host = _rollout_host_obs(envs)
+    host["room_mask"][:, 0] = 1
+    for _ in range(steps):
+        _write_empty_rollout_step(buf, host)
+    dense = HostRolloutBuffer.dense_storage_bytes(steps, envs)
+    assert buf.storage_bytes(allocated=True) < dense * 0.65
+    assert buf.patch_pages.used_bytes == steps * envs * PATCHES_PER_ROOM * PATCH_FLAT
 
 
 def test_joint_train_chunk_shapes_and_finite():
     """_train_chunk on synthetic [T,N] data: finite NLL/vloss, no env."""
     from samples.rl.agent.pretrain_joint import _train_chunk
+    from samples.rl.agent.rollout_buffer import HostRolloutBuffer
 
     torch.manual_seed(1)
     T, N = 4, 2
@@ -581,6 +1809,7 @@ def test_joint_train_chunk_shapes_and_finite():
     # per-t stacked host obs [N,...]
     buf_obs = []
     buf_act = []
+    chunk_buffer = HostRolloutBuffer(T, N)
     for _ in range(T):
         o = _dummy_obs_batch(N)
         # Match the real host contract: quantized spatial data and byte masks.
@@ -600,9 +1829,28 @@ def test_joint_train_chunk_shapes_and_finite():
             "dirs": torch.zeros(N, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
             "targets": torch.zeros(N, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
             "amounts": torch.zeros(N, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
+            "body_counts": torch.zeros(
+                N, MAX_ACTORS, INTENT_SLOTS, N_BODY_PART, dtype=torch.long,
+            ),
+            "body_order": torch.arange(N_BODY_PART).view(
+                1, 1, 1, N_BODY_PART,
+            ).expand(N, MAX_ACTORS, INTENT_SLOTS, -1).clone(),
+            "construction_types": torch.zeros(
+                N, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long,
+            ),
+            "construction_tiles": torch.zeros(
+                N, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long,
+            ),
         })
         # legal move on live actor
         buf_act[-1]["types"][:, 0, 0] = INTENT_TYPES.index("move")
+        chunk_buffer.write_step(
+            host_obs=o,
+            **buf_act[-1],
+            logprob=torch.zeros(N, MAX_ACTORS),
+            value=torch.zeros(N), reward=torch.ones(N), done=torch.zeros(N),
+            trunc=torch.zeros(N),
+        )
 
     rewards = torch.ones(T, N)
     dones = torch.zeros(T, N)
@@ -615,7 +1863,7 @@ def test_joint_train_chunk_shapes_and_finite():
     next_obs = {k: v.clone() for k, v in buf_obs[-1].items()}
     nll, vloss, ev, gs, hist = _train_chunk(
         actor, critic, actor, critic, opt_a, opt_c,
-        buf_obs, buf_act, rewards, dones,
+        chunk_buffer, [], rewards, dones,
         next_obs=next_obs,
         term_obs_rows=term_rows,
         gamma=0.99,
@@ -630,6 +1878,485 @@ def test_joint_train_chunk_shapes_and_finite():
     assert nll == nll and vloss == vloss, "NaN losses"
     assert gs > 0
     assert isinstance(hist, dict)
+    assert hist["_critic_max_grad_norm"] == 0.5
+    assert hist["_value_target_overflow_fraction"] == 0.0
+
+    class NaNOnTrainCritic(torch.nn.Module):
+        def __init__(self, base):
+            super().__init__()
+            self.base = base
+            self.calls = 0
+
+        def forward(self, batch, *, return_logits=False):
+            self.calls += 1
+            value = self.base(batch, return_logits=return_logits)
+            # Bootstrap and terminal-value calls are valid; corrupt the first
+            # training forward to verify that no partial artifact can proceed.
+            return value if self.calls < 3 else value * float("nan")
+
+    failing_critic = NaNOnTrainCritic(critic)
+    try:
+        _train_chunk(
+            actor, critic, actor, failing_critic, opt_a, opt_c,
+            chunk_buffer, [], rewards, dones,
+            next_obs=next_obs,
+            term_obs_rows=term_rows,
+            gamma=0.99,
+            epochs=1,
+            mb=4,
+            value_coef=1.0,
+            device=device,
+            use_bf16=False,
+            writer=None,
+            global_step=gs,
+        )
+    except FloatingPointError as error:
+        assert "critic loss" in str(error)
+    else:
+        raise AssertionError("non-finite critic batch did not fail closed")
+
+
+def test_spawn_replay_update_is_finite_and_strict():
+    from samples.rl.agent.pretrain_joint import _train_spawn_replay
+
+    obs = _dummy_obs_batch(1)
+    spawn = INTENT_TYPES.index("spawnCreep")
+    none = INTENT_TYPES.index("none")
+    obs["actor_mask"][0, 0] = 1
+    obs["actors"][0, 0, 0] = 1
+    obs["actors"][0, 0, _AF["isSpawn"]] = 1
+    obs["actors"][0, 0, _AF["roomEnergyAvailable"]] = 650.0 / MAX_ROOM_ENERGY
+    obs["intent_mask"][0, 0, 0, none] = 1
+    obs["intent_mask"][0, 0, 0, spawn] = 1
+    actor = Actor()
+    with torch.no_grad():
+        actor.type_head.bias.fill_(-50)
+        actor.type_head.bias[spawn] = 50
+        out = actor(obs, deterministic=True)
+    action = {
+        key: getattr(out, key).detach().clone()
+        for key in (
+            "types", "dirs", "targets", "amounts",
+            "body_counts", "body_order",
+        )
+    }
+    replay = [("ge650:7_15:0_0_0_0_0_0_0_0", 0, obs, action)]
+    optimizer = torch.optim.Adam(actor.parameters(), lr=1e-4)
+    nll, legal, diagnostics = _train_spawn_replay(
+        actor, optimizer, replay,
+        device=torch.device("cpu"), use_bf16=False, minibatch=1,
+    )
+    assert nll >= 0 and torch.isfinite(torch.tensor(nll))
+    assert legal == 1.0
+    assert diagnostics["spawn_type_accuracy"] == 1.0
+    assert all(torch.isfinite(parameter).all() for parameter in actor.parameters())
+
+
+def test_spawn_replay_is_bounded_and_mixed_buckets_pad_locally():
+    from samples.rl.agent.pretrain_joint import (
+        SPAWN_REPLAY_PER_STRATUM, _append_spawn_replay, _pad_replay_tensors,
+    )
+
+    obs = _dummy_obs_batch(1)
+    obs["actor_mask"][0, :2] = 1
+    obs["actors"][0, 0, _AF["isNonCreep"]] = 1
+    obs["actors"][0, 0, _AF["isSpawn"]] = 1
+    obs["target_mask"][0, :3] = 1
+    spawn = INTENT_TYPES.index("spawnCreep")
+    obs["intent_mask"][0, 0, 0, spawn] = 1
+    obs["actors"][0, 0, _AF["roomEnergyAvailable"]] = 300.0 / MAX_ROOM_ENERGY
+    action = {
+        "types": torch.zeros(1, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
+        "dirs": torch.zeros(1, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
+        "targets": torch.zeros(1, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
+        "amounts": torch.zeros(1, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
+        "body_counts": torch.zeros(
+            1, MAX_ACTORS, INTENT_SLOTS, N_BODY_PART, dtype=torch.long,
+        ),
+        "body_order": torch.arange(N_BODY_PART).view(
+            1, 1, 1, N_BODY_PART,
+        ).expand(1, MAX_ACTORS, INTENT_SLOTS, -1).clone(),
+        "construction_types": torch.zeros(
+            1, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long,
+        ),
+        "construction_tiles": torch.zeros(
+            1, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long,
+        ),
+    }
+    action["types"][0, 0, 0] = spawn
+    action["body_counts"][0, 0, 0, 0] = 1
+    replay = []
+    for _ in range(SPAWN_REPLAY_PER_STRATUM + 9):
+        _append_spawn_replay(replay, obs, action)
+    assert len(replay) == SPAWN_REPLAY_PER_STRATUM
+    assert replay[0][2]["actors"].shape[1] == 8
+    assert replay[0][2]["targets"].shape[1] == 16
+    wait_action = {key: value.clone() for key, value in action.items()}
+    wait_action["types"][0, 0, 0] = INTENT_TYPES.index("none")
+    _append_spawn_replay(replay, obs, wait_action)
+    assert replay[-1][0].startswith("wait")
+
+    larger_obs = _dummy_obs_batch(1)
+    larger_obs["actor_mask"][0, :12] = 1
+    larger_obs["actors"][0, 0, _AF["isNonCreep"]] = 1
+    larger_obs["actors"][0, 0, _AF["isSpawn"]] = 1
+    larger_obs["target_mask"][0, :20] = 1
+    larger_obs["room_mask"][0, :2] = 1
+    larger_action = {key: value.clone() for key, value in action.items()}
+    larger_action["body_counts"][0, 0, 0, 0] = 1
+    _append_spawn_replay(replay, larger_obs, larger_action)
+    small_row, large_row = replay[0][2], replay[-1][2]
+    padded = _pad_replay_tensors(
+        [small_row, large_row], actor_cap=16, target_cap=32, room_cap=2,
+    )
+    assert padded["actors"].shape == (2, 16, ACTOR_FEAT)
+    assert padded["targets"].shape == (2, 32, TARGET_FEAT)
+    assert padded["patches"].shape[1] == 2
+    assert not bool(padded["actor_mask"][0, 8:].any())
+
+
+def test_global_lifecycle_reservoir_and_joint_epoch_are_finite():
+    from samples.rl.agent.pretrain_joint import (
+        LifecycleSample,
+        SCRIPTED_REPLAY_PER_STRATUM,
+        _append_scripted_lifecycle_replay,
+        _evaluate_global_lifecycle,
+        _train_global_lifecycle_epoch,
+    )
+
+    obs = _dummy_obs_batch(1)
+    obs["actor_mask"][0, 0] = 1
+    obs["intent_mask"][0, 0, 0, INTENT_TYPES.index("none")] = 1
+    action = {
+        "types": torch.zeros(1, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
+        "dirs": torch.zeros(1, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
+        "targets": torch.zeros(1, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
+        "amounts": torch.zeros(1, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
+        "construction_types": torch.zeros(
+            1, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long,
+        ),
+        "construction_tiles": torch.zeros(
+            1, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long,
+        ),
+        "body_counts": torch.zeros(
+            1, MAX_ACTORS, INTENT_SLOTS, N_BODY_PART, dtype=torch.long,
+        ),
+        "body_order": torch.arange(N_BODY_PART).view(
+            1, 1, 1, N_BODY_PART,
+        ).expand(1, MAX_ACTORS, INTENT_SLOTS, -1).clone(),
+    }
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    reservoir: list[LifecycleSample] = []
+    seen: dict[str, int] = {}
+    retained: dict[str, list[int]] = {}
+    for timestep in range(100):
+        _append_scripted_lifecycle_replay(
+            reservoir, seen, retained, rng, obs, action,
+            [{"curriculum": "empty"}], timestep=timestep,
+        )
+    assert len(reservoir) == SCRIPTED_REPLAY_PER_STRATUM
+    assert next(iter(seen.values())) == 100
+    assert max(sample.timestep for sample in reservoir) > SCRIPTED_REPLAY_PER_STRATUM
+
+    replay = [
+        LifecycleSample(
+            stratum=f"{'empty' if index < 4 else 'seed_full'}:r1:p0_3:none",
+            timestep=index,
+            env_index=0,
+            obs={key: value.clone() for key, value in obs.items()},
+            action={key: value.clone() for key, value in action.items()},
+        )
+        for index in range(8)
+    ]
+    train = [sample for sample in replay if sample.timestep % 4 != 3]
+    holdout = [sample for sample in replay if sample.timestep % 4 == 3]
+
+    actor, critic = Actor(), Critic()
+    actor_opt = torch.optim.AdamW(actor.parameters(), lr=1e-4)
+    critic_opt = torch.optim.AdamW(critic.parameters(), lr=1e-4)
+    returns = torch.arange(8, dtype=torch.float32).unsqueeze(1)
+    nll, legal, value_loss, updates = _train_global_lifecycle_epoch(
+        actor, critic, actor_opt, critic_opt, train, returns,
+        device=torch.device("cpu"), use_bf16=False, minibatch=3,
+    )
+    assert torch.isfinite(torch.tensor([nll, value_loss])).all()
+    assert legal == 1.0 and updates == len(train)
+    metrics = _evaluate_global_lifecycle(
+        actor, critic, holdout, returns,
+        device=torch.device("cpu"), minibatch=2,
+    )
+    assert metrics["legal_frac"] == 1.0
+    assert metrics["stage_empty_count"] == 1.0
+    assert metrics["stage_seed_full_count"] == 1.0
+
+
+def test_rare_intent_lane_balances_actors_and_scores_semantic_factors():
+    from samples.rl.agent.pretrain_joint import (
+        LifecycleSample,
+        _action_factor_values,
+        _actor_balanced_factor_nll,
+        _evaluate_rare_intent_actors,
+        _rare_intent_actor_refs,
+        _ti_rare_intent_samples,
+        _train_rare_intent_actor_epoch,
+    )
+
+    logprob = torch.tensor(
+        [[-1.0, -3.0, 0.0], [-5.0, 0.0, 0.0]], requires_grad=True,
+    )
+    active = torch.tensor([[True, True, False], [True, False, False]])
+    balanced_nll, legal, per_actor = _actor_balanced_factor_nll(logprob, active)
+    assert legal == 1.0
+    assert torch.allclose(per_actor, torch.tensor([2.0, 5.0]))
+    assert torch.allclose(balanced_nll, torch.tensor(3.5))
+    factor_values = _action_factor_values({
+        "types": torch.tensor([[[1]]]),
+        "dirs": torch.tensor([[[2]]]),
+        "targets": torch.tensor([[[3]]]),
+        "amounts": torch.tensor([[[4]]]),
+        "construction_types": torch.tensor([[[5]]]),
+        "construction_tiles": torch.tensor([[[6]]]),
+        "body_counts": torch.arange(7, 15).view(1, 1, 1, N_BODY_PART),
+        "body_order": torch.arange(15, 23).view(1, 1, 1, N_BODY_PART),
+    })
+    assert factor_values[0, 0].tolist() == list(range(1, 23))
+
+    teacher = Actor().eval()
+    site_obs = _dummy_obs_batch(1)
+    site_obs["actor_mask"][0, 0] = 1
+    site_obs["actors"][0, 0, 0] = 1
+    site_obs["actors"][0, 0, _AF["isRoom"]] = 1
+    site = INTENT_TYPES.index("createConstructionSite")
+    site_obs["intent_mask"][0, 0, 0, site] = 1
+    tile = 17 * 50 + 23
+    alternate_tile = tile + 1
+    site_obs["construction_mask"][0, 0, 2, tile // 8] |= 1 << (tile % 8)
+    site_obs["construction_mask"][0, 0, 2, alternate_tile // 8] |= (
+        1 << (alternate_tile % 8)
+    )
+    site_obs["construction_mask"][0, 0, 1, tile // 8] |= 1 << (tile % 8)
+    site_obs["construction_mask"][0, 0, 1, alternate_tile // 8] |= (
+        1 << (alternate_tile % 8)
+    )
+
+    claim_obs = _dummy_obs_batch(1)
+    claim_obs["actor_mask"][0, 0] = 1
+    claim = INTENT_TYPES.index("claimController")
+    claim_obs["intent_mask"][0, 0, 0, claim] = 1
+    claim_obs["target_mask"][0, 0] = 1
+    claim_obs["target_select_mask"][0, claim, 0] = 1
+
+    action_fields = (
+        "types", "dirs", "targets", "amounts", "construction_types",
+        "construction_tiles", "body_counts", "body_order",
+    )
+    with torch.no_grad():
+        site_out = teacher(site_obs, deterministic=True)
+        claim_out = teacher(claim_obs, deterministic=True)
+    site_action = {name: getattr(site_out, name).clone() for name in action_fields}
+    claim_action = {name: getattr(claim_out, name).clone() for name in action_fields}
+    replay = [
+        LifecycleSample(
+            stratum="empty:r3:p12p:construction", timestep=0, env_index=0,
+            obs=site_obs, action=site_action,
+        ),
+        *[
+            LifecycleSample(
+                stratum="seed_claimer:r1:p0_3:control", timestep=index,
+                env_index=0, obs=claim_obs, action=claim_action,
+            )
+            for index in range(1, 4)
+        ],
+    ]
+    refs = _rare_intent_actor_refs(replay)
+    assert len(refs["createConstructionSite"]) == 1
+    assert len(refs["claimController"]) == 3
+
+    factor_count = int(site_out.factor_logprob.shape[-1])
+    site_eligible = torch.zeros(1, site_obs["actors"].shape[1], factor_count, dtype=torch.bool)
+    claim_eligible = torch.zeros_like(site_eligible)
+    site_eligible[0, 0, [0, 4]] = True
+    claim_eligible[0, 0, [0, 2]] = True
+    ti_samples, ti_refs = _ti_rare_intent_samples([
+        {"timestep": 11, "obs": site_obs, "action": site_action, "eligible": site_eligible},
+        {"timestep": 12, "obs": claim_obs, "action": claim_action, "eligible": claim_eligible},
+    ])
+    assert len(ti_samples) == 2
+    assert ti_refs == {
+        "createConstructionSite": [(0, 0)],
+        "claimController": [(1, 0)],
+    }
+
+    metrics = _evaluate_rare_intent_actors(
+        teacher, replay, refs, device=torch.device("cpu"), minibatch=2,
+    )
+    for intent, expected_count in (("createConstructionSite", 1), ("claimController", 3)):
+        assert metrics[f"{intent}_count"] == expected_count
+        assert metrics[f"{intent}_legal_frac"] == 1.0
+        assert metrics[f"{intent}_accuracy"] == 1.0
+        assert metrics[f"{intent}_factor_accuracy"] == 1.0
+        assert metrics[f"{intent}_type_accuracy"] == 1.0
+
+    mismatched_site_action = {name: value.clone() for name, value in site_action.items()}
+    predicted_tile = int(site_action["construction_tiles"][0, 0, 0])
+    mismatched_site_action["construction_tiles"][0, 0, 0] = (
+        alternate_tile if predicted_tile == tile else tile
+    )
+    mismatched_replay = [LifecycleSample(
+        stratum="empty:r3:p12p:construction", timestep=0, env_index=0,
+        obs=site_obs, action=mismatched_site_action,
+    )]
+    mismatched_refs = _rare_intent_actor_refs(mismatched_replay)
+    mismatched_metrics = _evaluate_rare_intent_actors(
+        teacher, mismatched_replay, mismatched_refs,
+        device=torch.device("cpu"), minibatch=1,
+    )
+    assert mismatched_metrics["createConstructionSite_type_accuracy"] == 1.0
+    # Legal tile preference is not a teacher-imitation target. The model owns
+    # placement quality; rare BC only preserves intent and structure type.
+    assert mismatched_metrics["createConstructionSite_factor_accuracy"] == 1.0
+    assert mismatched_metrics["createConstructionSite_accuracy"] == 1.0
+
+    mismatched_type_action = {
+        name: value.clone() for name, value in site_action.items()
+    }
+    predicted_type = int(site_action["construction_types"][0, 0, 0])
+    mismatched_type_action["construction_types"][0, 0, 0] = (
+        1 if predicted_type != 1 else 2
+    )
+    type_replay = [LifecycleSample(
+        stratum="empty:r3:p12p:construction", timestep=0, env_index=0,
+        obs=site_obs, action=mismatched_type_action,
+    )]
+    type_metrics = _evaluate_rare_intent_actors(
+        teacher, type_replay, _rare_intent_actor_refs(type_replay),
+        device=torch.device("cpu"), minibatch=1,
+    )
+    assert type_metrics["createConstructionSite_accuracy"] == 0.0
+
+    optimizer = torch.optim.AdamW(teacher.parameters(), lr=1e-4)
+    nll, legal, trained = _train_rare_intent_actor_epoch(
+        teacher, optimizer, replay, refs,
+        device=torch.device("cpu"), use_bf16=False, minibatch=2,
+        shuffle_generator=torch.Generator().manual_seed(13),
+    )
+    assert torch.isfinite(torch.tensor(nll))
+    assert legal == 1.0
+    assert trained == 6  # three actors from each intent after balancing
+
+
+def test_ti_critic_epoch_consumes_full_balanced_order():
+    from samples.rl.agent.pretrain_joint import CriticSample, _train_critic_replay_epoch
+
+    obs = _dummy_obs_batch(1)
+    replay = [
+        CriticSample(
+            stratum="rare" if index == 0 else "common",
+            timestep=index,
+            env_index=0,
+            obs={key: value.clone() for key, value in obs.items()},
+        )
+        for index in range(4)
+    ]
+    critic = Critic()
+
+    class CountingAdam(torch.optim.Adam):
+        def __init__(self, params):
+            super().__init__(params, lr=1e-4)
+            self.step_count = 0
+
+        def step(self, closure=None):
+            self.step_count += 1
+            return super().step(closure)
+
+    optimizer = CountingAdam(critic.parameters())
+    loss, trained = _train_critic_replay_epoch(
+        critic,
+        optimizer,
+        replay,
+        torch.arange(4, dtype=torch.float32).unsqueeze(1),
+        device=torch.device("cpu"),
+        use_bf16=False,
+        minibatch=2,
+        shuffle_generator=torch.Generator().manual_seed(7),
+    )
+    # Largest stratum has 3 rows, so both strata contribute 3: 6 total rows.
+    assert trained == 6
+    assert optimizer.step_count == 3
+    assert torch.isfinite(torch.tensor(loss))
+
+
+def test_dagger_actor_lane_trains_exact_semantics_without_site_tile_imitation():
+    from samples.rl.agent.pretrain_joint import (
+        DaggerSample,
+        _evaluate_dagger_actor,
+        _train_dagger_actor_epoch,
+    )
+
+    actor = Actor()
+    site_obs = _dummy_obs_batch(1)
+    site_obs["actor_mask"][0, 0] = 1
+    site_obs["actors"][0, 0, _AF["isNonCreep"]] = 1
+    site_obs["actors"][0, 0, _AF["isRoom"]] = 1
+    site = INTENT_TYPES.index("createConstructionSite")
+    site_obs["intent_mask"][0, 0, 0, site] = 1
+    for tile in (17 * 50 + 23, 17 * 50 + 24):
+        site_obs["construction_mask"][0, 0, 1, tile // 8] |= 1 << (tile % 8)
+
+    claim_obs = _dummy_obs_batch(1)
+    claim_obs["actor_mask"][0, 0] = 1
+    claim = INTENT_TYPES.index("claimController")
+    claim_obs["intent_mask"][0, 0, 0, claim] = 1
+    claim_obs["target_mask"][0, 0] = 1
+    claim_obs["target_select_mask"][0, claim, 0] = 1
+
+    fields = (
+        "types", "dirs", "targets", "amounts", "construction_types",
+        "construction_tiles", "body_counts", "body_order",
+    )
+    with torch.no_grad():
+        site_out = actor(site_obs, deterministic=True)
+        claim_out = actor(claim_obs, deterministic=True)
+    site_action = {name: getattr(site_out, name).clone() for name in fields}
+    claim_action = {name: getattr(claim_out, name).clone() for name in fields}
+    # A different legal tile remains semantically exact: placement preference
+    # belongs to the learned policy, not the correction teacher.
+    predicted_tile = int(site_action["construction_tiles"][0, 0, 0])
+    site_action["construction_tiles"][0, 0, 0] = (
+        17 * 50 + 24 if predicted_tile == 17 * 50 + 23 else 17 * 50 + 23
+    )
+    replay = [
+        DaggerSample(
+            kind="exact_intent", stratum="createConstructionSite:r2",
+            actor_index=0, obs=site_obs, action=site_action,
+        ),
+        *[
+            DaggerSample(
+                kind="exact_intent", stratum="claimController:r1",
+                actor_index=0, obs=claim_obs, action=claim_action,
+            )
+            for index in range(1, 4)
+        ],
+    ]
+
+    before = _evaluate_dagger_actor(
+        actor, replay, device=torch.device("cpu"), minibatch=2,
+    )
+    assert before["legal_frac"] == 1.0
+    assert before["intent_createConstructionSite_accuracy"] == 1.0
+    optimizer = torch.optim.AdamW(actor.parameters(), lr=1e-4)
+    nll, legal, after = _train_dagger_actor_epoch(
+        actor, optimizer, replay,
+        device=torch.device("cpu"), use_bf16=False, minibatch=2,
+        shuffle_generator=torch.Generator().manual_seed(17),
+    )
+    assert torch.isfinite(torch.tensor(nll))
+    assert legal == 1.0
+    assert after["legal_frac"] == 1.0
+    assert after["intent_createConstructionSite_count"] == 1.0
+    assert after["intent_claimController_count"] == 3.0
 
 
 def test_joint_ckpt_meta_contract():
@@ -638,6 +2365,10 @@ def test_joint_ckpt_meta_contract():
 
     actor = Actor()
     critic = Critic()
+    captured = artifact_meta(
+        "joint_pretrain", actor, critic, source_sha256="startup-source",
+    )
+    assert captured["source_sha256"] == "startup-source"
     payload = {
         "actor": actor.state_dict(),
         "critic": critic.state_dict(),
@@ -657,12 +2388,197 @@ def test_joint_ckpt_meta_contract():
     validate_artifact(restored, actor, critic, kinds=("joint_pretrain",))
 
 
+def test_joint_cli_requires_corpus_and_exposes_no_collection_overrides():
+    from samples.rl.agent.pretrain_joint import parse_args
+
+    try:
+        parse_args([])
+    except SystemExit as error:
+        assert error.code != 0
+    else:
+        raise AssertionError("joint pretraining accepted an implicit fresh collection")
+    args = parse_args(["--corpus", "immutable.pt"])
+    assert args.corpus == Path("immutable.pt")
+    assert args.nextlat_actor_coef == 1.0
+    assert args.nextlat_critic_coef == 1.0
+    assert args.nextlat_critic_kl_coef == 0.1
+    assert args.min_nextlat_relative_gap == 0.01
+    assert args.min_nextlat_counterfactual_rows == 128
+    for collection_only in (
+        "num_envs", "steps", "max_episode", "curriculum", "gamma",
+        "holdout_seed_offset", "ti_actor_steps", "ti_bot_dir", "node",
+    ):
+        assert not hasattr(args, collection_only)
+
+
+def test_artifact_rejects_pre_hl_gauss_learning_abi():
+    from samples.rl.agent.artifacts import artifact_meta, validate_artifact
+
+    actor = Actor()
+    critic = Critic()
+    meta = artifact_meta("joint_pretrain", actor, critic)
+    meta["contracts"] = dict(meta["contracts"])
+    meta["contracts"]["learningAbi"] -= 1
+    try:
+        validate_artifact({"meta": meta}, actor, critic, kinds=("joint_pretrain",))
+    except ValueError as error:
+        assert "checkpoint contracts" in str(error)
+    else:
+        raise AssertionError("pre-HL-Gauss learning ABI was accepted")
+
+
+def test_artifact_source_override_is_explicit_and_narrow():
+    from samples.rl.agent.artifacts import artifact_meta, validate_artifact
+
+    actor = Actor()
+    critic = Critic()
+    meta = artifact_meta("joint_pretrain", actor, critic)
+    meta["source_sha256"] = "different-source"
+    payload = {"meta": meta}
+    try:
+        validate_artifact(payload, actor, critic, kinds=("joint_pretrain",))
+    except ValueError as error:
+        assert "source fingerprint" in str(error)
+    else:
+        raise AssertionError("source mismatch was accepted without an explicit override")
+    restored = validate_artifact(
+        payload,
+        actor,
+        critic,
+        kinds=("joint_pretrain",),
+        allow_source_mismatch=True,
+    )
+    assert restored is meta
+    meta["kind"] = "ppo"
+    try:
+        validate_artifact(
+            payload,
+            actor,
+            critic,
+            kinds=("ppo",),
+            allow_source_mismatch=True,
+        )
+    except ValueError as error:
+        assert "source fingerprint" in str(error)
+    else:
+        raise AssertionError("source override accepted a PPO checkpoint")
+    restored = validate_artifact(
+        payload,
+        actor,
+        critic,
+        kinds=("ppo",),
+        evaluation_only_source_mismatch=True,
+    )
+    assert restored is meta
+
+
+def test_spawn_replay_coverage_uses_tensors_and_eval_seeds_are_disjoint():
+    from samples.rl.agent.pretrain_joint import (
+        _auxiliary_seed_overlap,
+        _evaluation_seed_overlap,
+        _spawn_replay_coverage,
+    )
+
+    def row(stratum: str, budget: int, counts: list[int]):
+        actors = torch.zeros(1, 1, ACTOR_FEAT)
+        actors[0, 0, ACTOR_FEATURE_INDEX["roomEnergyAvailable"]] = (
+            budget / MAX_ROOM_ENERGY
+        )
+        action = {
+            "types": torch.tensor([[[INTENT_TYPES.index("spawnCreep")]]]),
+            "body_counts": torch.tensor(counts).view(1, 1, 1, N_BODY_PART),
+        }
+        return stratum, 0, {"actors": actors}, action
+
+    coverage = _spawn_replay_coverage([
+        row("spawn:contract:spawn_flexible_300", 300, [1, 1, 1, 0, 0, 0, 0, 0]),
+        row("spawn:contract:spawn_hauler_3000", 3000, [25, 0, 25, 0, 0, 0, 0, 0]),
+        row("spawn:contract:spawn_builder_650", 650, [4, 2, 4, 0, 0, 0, 0, 0]),
+    ])
+    assert coverage["budget_le300"] == 1
+    assert coverage["budget_ge650"] == 2
+    assert coverage["length_le6"] == 1
+    assert coverage["length_7_15"] == 1
+    assert coverage["length_ge16"] == 1
+
+    meta = {
+        "seed": 3,
+        "train_env_map": [{"seed": 3 + index} for index in range(32)],
+        "holdout_env_map": [{"seed": 10_003 + index} for index in range(32)],
+    }
+    assert _evaluation_seed_overlap(meta, offset=1, num_envs=32)
+    assert _evaluation_seed_overlap(meta, offset=10_000, num_envs=32)
+    assert not _evaluation_seed_overlap(meta, offset=20_000, num_envs=32)
+    assert _auxiliary_seed_overlap(meta, {20, 30_003}) == {20}
+    assert not _auxiliary_seed_overlap(meta, {20_003, 30_003})
+
+
+def test_closed_loop_late_window_uses_current_not_peak_activity():
+    from types import SimpleNamespace
+
+    from samples.rl.agent.pretrain_joint import _validate_closed_loop
+
+    class ActorStub:
+        def eval(self):
+            return self
+
+        def __call__(self, _obs, deterministic=False):
+            assert deterministic
+            scalar = torch.zeros(1, 1, 1, dtype=torch.long)
+            return SimpleNamespace(
+                types=scalar, dirs=scalar, targets=scalar, amounts=scalar,
+                body_counts=torch.zeros(1, 1, 1, N_BODY_PART, dtype=torch.long),
+                body_order=torch.arange(N_BODY_PART).view(1, 1, 1, -1),
+                construction_types=scalar, construction_tiles=scalar,
+            )
+
+    class EnvStub:
+        def __init__(self):
+            self.n = 1
+            self.envs = [SimpleNamespace(seed=7)]
+            self.timestep = 0
+
+        def reset(self):
+            self.timestep = 0
+            return {}
+
+        def step(self, _actions):
+            self.timestep += 1
+            late = self.timestep == 5
+            info = {
+                "curriculum": "seed_outpost", "harvestDelta": 0,
+                "controlDelta": 0, "transferDelta": 0, "buildDelta": 0,
+                "claimDelta": 0, "remoteHarvestDelta": 3 if late else 0,
+                "remoteHomeDeliveryDelta": 2 if late else 0,
+                "remoteRoomsStaffed": 1 if late else 0,
+                "remoteProductiveCreeps": 1 if late else 0,
+                # Historical peaks alone must not increment late active ticks.
+                "remoteRoomsStaffedPeak": 1, "remoteProductiveCreepsPeak": 1,
+                "remoteOwnedRoomsPeak": 0, "neutralOutpostRooms": 1,
+                "creeps": 1, "spawnSuccess": 1 if late else 0,
+                "intentResults": [], "intentByType": {},
+            }
+            return {}, torch.zeros(1), torch.zeros(1), [info]
+
+    result = _validate_closed_loop(
+        ActorStub(), EnvStub(), steps=5, device=torch.device("cpu"),
+    )
+    stage = result["closed_loop_by_curriculum"]["seed_outpost"]
+    assert stage["late_transitions"] == 1.0
+    assert stage["late_remote_harvest"] == 3.0
+    assert stage["late_remote_home_delivery"] == 2.0
+    assert stage["late_remote_staffed_ticks"] == 1.0
+    assert stage["late_remote_productive_ticks"] == 1.0
+    assert stage["late_spawn_success"] == 1.0
+
+
 def test_joint_qualification_requires_critic_expansion_and_scale():
     from types import SimpleNamespace
 
-    from samples.rl.agent.pretrain_joint import _qualification_failures
+    from samples.rl.agent.pretrain_joint import SPAWN_CURRICULA, _qualification_failures
 
     args = SimpleNamespace(
+        curriculum="empty,seed_creep,seed_full,seed_claimer",
         min_teacher_delivery=1.0,
         min_teacher_build=1.0,
         min_teacher_claims=1,
@@ -671,12 +2587,46 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
         min_closed_loop_rate=0.1,
         min_closed_loop_creeps=4,
         min_closed_loop_claims=1,
+        min_outpost_closed_loop_success_rate=0.5,
+        min_nextlat_relative_gap=0.01,
+        min_nextlat_counterfactual_rows=128,
+        max_aux_lifecycle_nll_ratio=1.1,
+        max_spawn_validation_nll=1.5,
+        min_spawn_replay_accuracy=0.8,
+        max_rare_intent_nll=1.0,
+        min_rare_intent_accuracy=0.8,
     )
     validation = {
         "validation_factor_nll": 0.5,
         "validation_legal_frac": 1.0,
+        "validation_value_loss": 1.0,
         "validation_value_ev": 0.2,
+        "lifecycle_holdout_value_loss": 1.0,
+        "lifecycle_holdout_value_ev": 0.2,
+        "nextlat_holdout_actor_mse": 0.4,
+        "nextlat_holdout_actor_identity_mse": 0.5,
+        "nextlat_holdout_actor_counterfactual_action_mse": 0.6,
+        "nextlat_holdout_actor_counterfactual_reference_mse": 0.4,
+        "nextlat_holdout_critic_mse": 0.4,
+        "nextlat_holdout_critic_identity_mse": 0.5,
+        "nextlat_holdout_critic_counterfactual_action_mse": 0.6,
+        "nextlat_holdout_critic_counterfactual_reference_mse": 0.4,
+        "nextlat_holdout_counterfactual_rows": 256.0,
+        "lifecycle_after_joint_train_nll": 0.5,
+        "lifecycle_final_train_nll": 0.5,
     }
+    for stage in args.curriculum.split(","):
+        validation[f"lifecycle_holdout_stage_{stage}_ev"] = 0.2
+    for stage in SPAWN_CURRICULA:
+        validation[f"validation_{stage}_labels"] = 1.0
+        validation[f"validation_{stage}_nll"] = 0.5
+        validation[f"validation_{stage}_success"] = 1.0
+    for split in ("train", "holdout"):
+        for intent in ("createConstructionSite", "claimController"):
+            validation[f"rare_{split}_{intent}_count"] = 4.0
+            validation[f"rare_{split}_{intent}_nll"] = 0.2
+            validation[f"rare_{split}_{intent}_accuracy"] = 1.0
+            validation[f"rare_{split}_{intent}_legal_frac"] = 1.0
     closed_loop = {
         "closed_loop_skill_rate": 0.2,
         "closed_loop_invalid_frac": 0.0,
@@ -689,11 +2639,78 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
                 "invalid_frac": 0.0,
                 "delivery": 50.0,
                 "build": 5.0,
-                "claims": 1.0,
+                "control": 10.0,
+                "claims": 0.0,
                 "max_creeps": 8.0,
+            },
+            "seed_outpost": {
+                "transitions": 1000.0, "skill_rate": 0.2,
+                "invalid_frac": 0.0, "claims": 0.0,
+                "remote_harvest": 40.0, "remote_home_delivery": 40.0,
+                "remote_staffed_peak": 1.0, "remote_productive_peak": 1.0,
+                "remote_owned_peak": 0.0,
+                "late_transitions": 200.0, "late_remote_harvest": 10.0,
+                "late_remote_home_delivery": 10.0,
+                "late_remote_staffed_ticks": 100.0,
+                "late_remote_productive_ticks": 100.0,
+            },
+            "seed_claimer": {
+                "transitions": 1000.0, "skill_rate": 0.2,
+                "invalid_frac": 0.0, "claims": 1.0,
+                "remote_owned_peak": 1.0,
+            },
+        },
+        "closed_loop_by_env": {
+            "0": {
+                "curriculum": "empty", "delivery": 25.0, "build": 5.0,
+                "claims": 0.0, "max_creeps": 8.0, "invalid_frac": 0.0,
+            },
+            "4": {
+                "curriculum": "empty", "delivery": 25.0, "build": 5.0,
+                "claims": 0.0, "max_creeps": 8.0, "invalid_frac": 0.0,
+            },
+            "8": {
+                "curriculum": "seed_outpost", "claims": 0.0,
+                "remote_harvest": 20.0, "remote_home_delivery": 20.0,
+                "remote_staffed_peak": 1.0, "remote_productive_peak": 1.0,
+                "remote_owned_peak": 0.0, "invalid_frac": 0.0,
+                "late_transitions": 100.0, "late_remote_harvest": 5.0,
+                "late_remote_home_delivery": 5.0,
+                "late_remote_staffed_ticks": 50.0,
+                "late_remote_productive_ticks": 50.0,
+            },
+            "13": {
+                "curriculum": "seed_outpost", "claims": 0.0,
+                "remote_harvest": 20.0, "remote_home_delivery": 20.0,
+                "remote_staffed_peak": 1.0, "remote_productive_peak": 1.0,
+                "remote_owned_peak": 0.0, "invalid_frac": 0.0,
+                "late_transitions": 100.0, "late_remote_harvest": 5.0,
+                "late_remote_home_delivery": 5.0,
+                "late_remote_staffed_ticks": 50.0,
+                "late_remote_productive_ticks": 50.0,
             },
         },
     }
+    expected_spawn = {
+        "spawn_flexible_300": [1, 2, 0],
+        "spawn_miner_450": [1, 1, 1, 1, 0],
+        "spawn_hauler_3000": [2, 0] * 25,
+        "spawn_builder_650": [1, 2, 2, 0, 0] * 2,
+        "spawn_upgrader_550": [1, 1, 2, 0, 1, 1, 2],
+        "spawn_claimer_650": [6, 0],
+    }
+    expected_spawn = {
+        stage: [part for part in dict.fromkeys(parts) for _ in range(parts.count(part))]
+        for stage, parts in expected_spawn.items()
+    }
+    for stage in SPAWN_CURRICULA:
+        spawn_parts = expected_spawn[stage]
+        closed_loop["closed_loop_by_curriculum"][stage] = {
+            "spawn_success": 1.0,
+            "spawn_body_length": float(len(spawn_parts)),
+            "spawn_body_parts": spawn_parts,
+            "spawn_body_parts_all": [spawn_parts],
+        }
     teacher_by_curriculum = {
         "empty": {
             "transitions": 6000.0,
@@ -704,12 +2721,66 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
             "max_creeps": 8.0,
             "issued": 100.0,
             "invalid": 0.0,
+            "spawn_labels": 12.0,
+            "spawn_budget_le_300": 1.0,
+            "spawn_budget_301_549": 1.0,
+            "spawn_budget_550_649": 1.0,
+            "spawn_budget_ge_650": 1.0,
+            "spawn_length_le_6": 1.0,
+            "spawn_length_7_15": 1.0,
+            "spawn_length_ge_16": 1.0,
+        },
+        "seed_outpost": {
+            "transitions": 6000.0,
+            "remote_harvest": 40.0,
+            "remote_home_delivery": 40.0,
+            "remote_staffed_peak": 1.0,
+            "remote_productive_peak": 1.0,
+            "remote_owned_peak": 0.0,
+            "neutral_outposts": 1.0,
+            "late_transitions": 1200.0,
+            "late_remote_harvest": 20.0,
+            "late_remote_home_delivery": 20.0,
+            "late_remote_staffed_ticks": 600.0,
+            "late_remote_productive_ticks": 600.0,
+            "claims": 0.0,
+            "issued": 100.0,
+            "invalid": 0.0,
         },
     }
     common = dict(
         last_nll=0.5,
         last_vloss=1.0,
-        corpus_hist={"_bc_legal_frac": 1.0},
+        corpus_hist={
+            "_bc_legal_frac": 1.0,
+            "_spawn_replay_legal_frac": 1.0,
+            "_spawn_replay_size": 12.0,
+            "_spawn_replay_nll": 0.5,
+            "_spawn_replay_wait_legal_size": 3.0,
+            "_spawn_replay_wait_legal_strata": 3.0,
+            "_spawn_replay_wait_legal_type_nll": 0.2,
+            "_spawn_replay_wait_legal_type_accuracy": 1.0,
+            "_spawn_replay_spawn_type_accuracy": 1.0,
+            "_spawn_replay_spawn_body_accuracy": 1.0,
+            "_spawn_replay_spawn_min_stratum_body_accuracy": 1.0,
+            "_spawn_replay_budget_le300": 1.0,
+            "_spawn_replay_budget_301_549": 1.0,
+            "_spawn_replay_budget_550_649": 1.0,
+            "_spawn_replay_budget_ge650": 1.0,
+            "_spawn_replay_length_le6": 1.0,
+            "_spawn_replay_length_7_15": 1.0,
+            "_spawn_replay_length_ge16": 1.0,
+            "_lifecycle_replay_size": 5.0,
+            "_lifecycle_holdout_size": 2.0,
+            "_lifecycle_replay_nll": 0.5,
+            "_lifecycle_replay_legal_frac": 1.0,
+            "_lifecycle_holdout_legal_frac": 1.0,
+            "_lifecycle_replay_spawn": 1.0,
+            "_lifecycle_replay_harvest": 1.0,
+            "_lifecycle_replay_logistics": 1.0,
+            "_lifecycle_replay_construction": 1.0,
+            "_lifecycle_replay_control": 1.0,
+        },
         skill=0.2,
         total_delivered=50.0,
         total_built=5.0,
@@ -721,19 +2792,92 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
     )
     assert _qualification_failures(args, **common) == []
 
-    validation["validation_value_ev"] = -0.1
-    closed_loop["closed_loop_claims"] = 0.0
-    closed_loop["closed_loop_max_creeps"] = 1.0
-    failures = _qualification_failures(args, **common)
-    assert "validation_critic_ev" in failures
-    assert "closed_loop_claim" in failures
-    assert "closed_loop_population" in failures
+    teacher_by_curriculum["seed_outpost"]["remote_home_delivery"] = 0.0
+    assert "outpost_teacher_home_delivery" in _qualification_failures(args, **common)
+    teacher_by_curriculum["seed_outpost"]["remote_home_delivery"] = 40.0
+    teacher_by_curriculum["seed_outpost"]["late_remote_harvest"] = 0.0
+    assert "outpost_teacher_late_activity" in _qualification_failures(args, **common)
+    teacher_by_curriculum["seed_outpost"]["late_remote_harvest"] = 20.0
 
-    # Aggregate success assembled from seeded stages must not certify a model
-    # that cannot bootstrap and expand from the empty curriculum.
-    validation["validation_value_ev"] = 0.2
-    closed_loop["closed_loop_claims"] = 1.0
-    closed_loop["closed_loop_max_creeps"] = 8.0
+    validation["nextlat_holdout_actor_mse"] = 0.5
+    assert "nextlat_actor_beats_identity" in _qualification_failures(args, **common)
+    validation["nextlat_holdout_actor_mse"] = 0.4999
+    assert "nextlat_actor_beats_identity" in _qualification_failures(args, **common)
+    validation["nextlat_holdout_actor_mse"] = 0.4
+    validation["nextlat_holdout_critic_counterfactual_action_mse"] = 0.4
+    assert "nextlat_critic_uses_action" in _qualification_failures(args, **common)
+    validation["nextlat_holdout_critic_counterfactual_action_mse"] = 0.6
+
+    validation["lifecycle_final_train_nll"] = 0.551
+    assert "auxiliary_lifecycle_retention" in _qualification_failures(args, **common)
+    validation["lifecycle_final_train_nll"] = 0.5
+
+    validation["rare_holdout_createConstructionSite_accuracy"] = 0.75
+    assert "rare_intent_createConstructionSite" in _qualification_failures(args, **common)
+    validation["rare_holdout_createConstructionSite_accuracy"] = 1.0
+    validation["rare_train_claimController_nll"] = 1.01
+    assert "rare_intent_claimController" in _qualification_failures(args, **common)
+    validation["rare_train_claimController_nll"] = 0.2
+
+    args.ti_actor_steps = 20_000
+    common["corpus_hist"].update({
+        "_ti_actor_replay_rows": 8_192.0,
+        "_ti_actor_nll": 0.2,
+        "_ti_actor_legal_coverage": 1.0,
+    })
+    validation["ti_critic_holdout_value_ev"] = 0.2
+
+    closed_loop["closed_loop_by_env"]["13"]["remote_home_delivery"] = 0.0
+    assert _qualification_failures(args, **common) == []  # exactly 50% succeeds
+    closed_loop["closed_loop_by_env"]["8"]["remote_home_delivery"] = 0.0
+    assert "outpost_closed_loop_success_rate" in _qualification_failures(args, **common)
+    closed_loop["closed_loop_by_env"]["8"]["remote_home_delivery"] = 20.0
+    closed_loop["closed_loop_by_env"]["13"]["remote_home_delivery"] = 20.0
+    assert _qualification_failures(args, **common) == []
+    closed_loop["closed_loop_by_env"]["0"]["invalid_frac"] = 0.005
+    assert _qualification_failures(args, **common) == []
+    closed_loop["closed_loop_by_env"]["0"]["invalid_frac"] = 0.0
+    validation["ti_critic_holdout_value_ev"] = -0.1
+    # TI is an initialization/representation source from a different behavior
+    # policy. Its final-policy EV is diagnostic, not a promotion target.
+    assert _qualification_failures(args, **common) == []
+    validation["ti_critic_holdout_value_ev"] = 0.2
+
+    flexible = closed_loop["closed_loop_by_curriculum"]["spawn_flexible_300"]
+    flexible["spawn_body_parts"] = [3, 3, 3, 7]  # same length/cost, useless role body
+    assert "closed_loop_spawn_scenarios" in _qualification_failures(args, **common)
+    flexible["spawn_body_parts"] = expected_spawn["spawn_flexible_300"]
+
+    flexible["spawn_body_parts_all"].append([3, 3, 3, 7])
+    assert "closed_loop_spawn_scenarios" in _qualification_failures(args, **common)
+    flexible["spawn_body_parts_all"].pop()
+
+    common["corpus_hist"]["_spawn_replay_budget_ge650"] = 0.0
+    assert "spawn_replay_semantics" in _qualification_failures(args, **common)
+    common["corpus_hist"]["_spawn_replay_budget_ge650"] = 1.0
+
+    empty_closed = closed_loop["closed_loop_by_curriculum"]["empty"]
+    empty_closed["control"] = 0.0
+    assert "empty_closed_loop_control" in _qualification_failures(args, **common)
+    empty_closed["control"] = 10.0
+    empty_closed["max_creeps"] = args.min_closed_loop_creeps - 1
+    assert "empty_closed_loop_population" in _qualification_failures(args, **common)
+    empty_closed["max_creeps"] = 8.0
+
+    teacher_by_curriculum["empty"]["spawn_length_ge_16"] = 0.0
+    assert "teacher_spawn_body_coverage" in _qualification_failures(args, **common)
+    teacher_by_curriculum["empty"]["spawn_length_ge_16"] = 1.0
+
+    validation["lifecycle_holdout_value_ev"] = -0.1
+    failures = _qualification_failures(args, **common)
+    assert "lifecycle_holdout_critic_ev" in failures
+
+    # Aggregate success from seeded stages must not certify a model that cannot
+    # bootstrap its home economy.
+    validation["lifecycle_holdout_value_ev"] = 0.2
+    validation["lifecycle_holdout_stage_seed_full_ev"] = -0.1
+    assert "lifecycle_holdout_stage_ev" in _qualification_failures(args, **common)
+    validation["lifecycle_holdout_stage_seed_full_ev"] = 0.2
     closed_loop["closed_loop_by_curriculum"]["empty"] = {
         "transitions": 1000.0,
         "skill_rate": 0.2,
@@ -756,12 +2900,30 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
         "invalid": 1.0,
     }
     failures = _qualification_failures(args, **common)
-    assert "empty_teacher_claim" in failures
-    assert "empty_teacher_population" in failures
     assert "teacher_engine_legality" in failures
     assert "empty_teacher_engine_legality" in failures
-    assert "empty_closed_loop_claim" in failures
+    assert "empty_closed_loop_delivery" in failures
+    assert "empty_closed_loop_build" in failures
+    assert "empty_closed_loop_control" in failures
     assert "empty_closed_loop_population" in failures
+
+    closed_loop["closed_loop_by_curriculum"]["seed_outpost"][
+        "remote_home_delivery"
+    ] = 0.0
+    failures = _qualification_failures(args, **common)
+    assert "outpost_closed_loop_home_delivery" in failures
+    closed_loop["closed_loop_by_curriculum"]["seed_outpost"][
+        "remote_home_delivery"
+    ] = 40.0
+    closed_loop["closed_loop_by_curriculum"]["seed_outpost"][
+        "late_remote_productive_ticks"
+    ] = 0.0
+    assert "outpost_closed_loop_late_activity" in _qualification_failures(args, **common)
+    closed_loop["closed_loop_by_curriculum"]["seed_outpost"][
+        "late_remote_productive_ticks"
+    ] = 100.0
+    closed_loop["closed_loop_by_curriculum"]["seed_claimer"]["claims"] = 0.0
+    assert "seed_claimer_closed_loop_claim" in _qualification_failures(args, **common)
 
 
 def test_artifact_rejects_partial_actor_state():
@@ -791,11 +2953,13 @@ def test_pack_field_order_documented():
         "room_coords",
         "room_mask",
         "actor_mask",
+        "actor_outcome",
         "target_mask",
         "intent_mask",
         "dir_mask",
         "target_select_mask",
         "amount_mask",
+        "construction_mask",
     )
     import re
 
@@ -805,11 +2969,13 @@ def test_pack_field_order_documented():
     )
     assert encode_match is not None
     encode_names = tuple(re.findall(
-        r"\b(?:patchPacked|actors|targets|roomCoords|rm|am|tm|im|dm|tsm|amm)\b",
+        r"\b(?:patchPacked|actors|targets|roomCoords|rm|am|actorRole|actorOutcome|tm|im|dm|tsm|amm|constructionMask)\b",
         encode_match.group(1),
     ))
     assert encode_names == (
-        "patchPacked", "actors", "targets", "roomCoords", "rm", "am", "tm", "im", "dm", "tsm", "amm",
+        "patchPacked", "actors", "targets", "roomCoords", "rm", "am",
+        "actorOutcome", "tm", "im", "dm", "tsm", "amm",
+        "constructionMask",
     )
 
     server_source = (_RL / "env" / "server.mjs").read_text(encoding="utf-8")
@@ -818,62 +2984,125 @@ def test_pack_field_order_documented():
     server_names = tuple(re.findall(r"raw\.(\w+)", server_match.group(1)))
     assert server_names == (
         "patches", "actors", "targets", "roomCoords", "roomMask", "actorMask",
-        "targetMask", "intentMask", "dirMask", "targetSelectMask", "amountMask",
+        "actorOutcome", "targetMask", "intentMask", "dirMask",
+        "targetSelectMask", "amountMask", "constructionMask",
     )
 
     client_source = (_RL / "agent" / "env_client.py").read_text(encoding="utf-8")
     client_match = re.search(
-        r"patches = take_u8\(.*?amount_mask = take_u8\(.*?\n",
+        r"patches = take_u8\(.*?construction_mask = take_u8\(.*?\n",
         client_source,
         flags=re.DOTALL,
     )
     assert client_match is not None
     client_names = tuple(re.findall(
-        r"^\s*(patches|actors|targets|room_coords|room_mask|actor_mask|target_mask|"
-        r"intent_mask|dir_mask|target_select|amount_mask)\s*=\s*take_",
+        r"^\s*(patches|actors|targets|room_coords|room_mask|actor_mask|actor_outcome|target_mask|"
+        r"intent_mask|dir_mask|target_select|amount_mask|construction_mask)\s*=\s*take_",
         client_match.group(0),
         flags=re.MULTILINE,
     ))
     assert client_names == (
         "patches", "actors", "targets", "room_coords", "room_mask", "actor_mask",
-        "target_mask", "intent_mask", "dir_mask", "target_select", "amount_mask",
+        "actor_outcome", "target_mask", "intent_mask", "dir_mask",
+        "target_select", "amount_mask", "construction_mask",
     )
     assert tuple("target_select_mask" if name == "target_select" else name for name in client_names) == order
 
 
+def test_server_neutrality_avoids_fragile_reservation_username_getter():
+    """Long synthetic reservations may outlive their runtime user registry row."""
+    server_source = (_RL / "env" / "server.mjs").read_text(encoding="utf-8")
+    assert "function controllerHasActiveReservation(Game, controller)" in server_source
+    assert "function isNeutralController(Game, controller)" in server_source
+    assert "controller['#reservationEndTime']" in server_source
+    # A caught presentation lookup may populate optional username telemetry, but
+    # neutrality/readiness must never invoke that getter in a boolean condition.
+    assert "!room.controller.reservation" not in server_source
+    assert "!room.controller.owner" not in server_source
+
+
 def main() -> int:
     tests = [
+        test_muon_partition_covers_hidden_matrices_only,
+        test_polar_express_beats_newton_schulz_on_small_singular_values,
+        test_normuon_step_preserves_update_norm,
+        test_normuon_decay_is_cautious,
+        test_muon_second_moment_reweights_anisotropic_rows,
+        test_muon_batched_group_matches_one_matrix_at_a_time,
+        test_ppo_trainer_uses_hybrid_muon_with_rms_matched_rate,
+        test_hybrid_muon_optimizer_state_roundtrip,
+        test_muon_group_batches_same_shape_matrices,
+        test_muon_rejects_partial_gradients,
         test_gae_truncation_bootstraps,
         test_gae_cuts_chain_on_done,
+        test_gae_cuts_chain_on_truncation_without_done,
+        test_cleanrl_gae_shares_actor_advantage_and_critic_return,
         test_type_gated_logprob_none_low_entropy,
         test_hl_gauss_support,
+        test_hl_gauss_symlog_high_return_geometry_and_decode,
+        test_hl_gauss_rejects_instead_of_clamping_overflow,
         test_reward_normalizer_roundtrip,
         test_critic_scalar_default,
+        test_critic_value_head_stays_fp32_under_autocast,
+        test_value_contract_has_no_clipping_and_fixed_critic_grad_clip,
         test_schema_reward_values_productive_economy,
         test_intent_enum_parity,
         test_logprob_sample_matches_evaluate,
         test_entity_context_changes_peer_policy_and_critic,
+        test_creep_token_contains_exact_body_and_storage_state,
         test_per_actor_logprob_factorization,
         test_structure_cannot_select_remote_target_intent,
-        test_creep_construction_target_is_same_room_only,
-        test_construction_has_no_direction_factor,
+        test_immobile_creep_can_only_select_targets_already_in_primitive_range,
+        test_creep_cannot_issue_room_construction,
+        test_construction_uses_exact_type_and_tile_factors,
+        test_construction_sample_and_reevaluate_logprob_match,
+        test_spawn_count_chain_is_exactly_affordable_and_reevaluable,
+        test_spawn_count_chain_has_full_support_without_forced_cheap_suffix,
         test_resource_amount_bins_are_unique_for_selected_target,
         test_creep_cannot_transfer_to_itself,
         test_tower_attack_requires_creep_target,
         test_factorized_ppo_update_finite,
+        test_factorized_ppo_update_accepts_sparse_rollout_observations,
+        test_nextlat_ppo_pairs_are_causal_masked_and_train_both_trunks,
+        test_nextlat_time_major_pairing_cuts_done_truncation_and_tail,
+        test_nextlat_action_encoding_uses_target_features_not_table_identity,
+        test_nextlat_none_actions_have_zero_context_and_ignore_idle_state,
+        test_nextlat_issued_actions_are_sensitive_and_permutation_invariant,
+        test_nextlat_action_context_gradients_are_finite_and_mask_none_exactly,
         test_ppo_population_does_not_reweight_transitions,
         test_room_pack_keeps_expansion_capacity,
+        test_entity_capacity_buckets_preserve_live_policy_and_value,
+        test_rollout_zero_pads_compact_action_prefix,
         test_trunk_only_filter_for_reward_norm,
         test_safe_bc_nll_skips_neginf,
         test_safe_bc_nll_skips_finfo_min,
         test_safe_bc_nll_strict_rejects_masked_teacher_factor,
-        test_mc_returns_tn_shapes,
+        test_discounted_returns_tn_exact_recurrence_and_boundaries,
         test_host_rollout_buffer_write_and_flat,
+        test_sparse_rollout_pages_preserve_expansion_reorder_and_gather,
+        test_sparse_rollout_gather_uses_room_capacity_buckets,
+        test_sparse_rollout_reset_reuses_pages_without_stale_rooms,
+        test_sparse_rollout_memory_accounting_beats_dense_one_room_history,
         test_joint_train_chunk_shapes_and_finite,
+        test_spawn_replay_update_is_finite_and_strict,
+        test_spawn_replay_is_bounded_and_mixed_buckets_pad_locally,
+        test_global_lifecycle_reservoir_and_joint_epoch_are_finite,
+        test_rare_intent_lane_balances_actors_and_scores_semantic_factors,
+        test_ti_critic_epoch_consumes_full_balanced_order,
+        test_dagger_actor_lane_trains_exact_semantics_without_site_tile_imitation,
         test_joint_ckpt_meta_contract,
+        test_joint_cli_requires_corpus_and_exposes_no_collection_overrides,
+        test_artifact_rejects_pre_hl_gauss_learning_abi,
+        test_artifact_source_override_is_explicit_and_narrow,
+        test_spawn_replay_coverage_uses_tensors_and_eval_seeds_are_disjoint,
         test_joint_qualification_requires_critic_expansion_and_scale,
         test_artifact_rejects_partial_actor_state,
         test_pack_field_order_documented,
+        test_spawn_order_canonicalizes_zero_aliases_and_rejects_bad_wire_order,
+        test_spawn_factor_budget_is_eight_counts_plus_at_most_seven_order_choices,
+        test_ti_interleaved_spawn_supervises_counts_but_not_grouped_order,
+        test_closed_loop_late_window_uses_current_not_peak_activity,
+        test_server_neutrality_avoids_fragile_reservation_username_getter,
     ]
     failed = 0
     for t in tests:

@@ -37,12 +37,18 @@ for p in (_REPO, _RL_ROOT):
 
 try:
     from samples.rl.agent.artifacts import load_full_state, validate_artifact
-    from samples.rl.agent.constants import AMOUNT_BINS, INTENT_TYPES, MAX_ACTORS
+    from samples.rl.agent.constants import (
+        AMOUNT_BINS, BODY_PART_TYPES, CONSTRUCTION_TYPES, INTENT_TYPES,
+        MAX_ACTORS,
+    )
     from samples.rl.agent.env_client import ScreepsEnv
     from samples.rl.agent.model import Agent, count_params
 except ImportError:
     from agent.artifacts import load_full_state, validate_artifact
-    from agent.constants import AMOUNT_BINS, INTENT_TYPES, MAX_ACTORS
+    from agent.constants import (
+        AMOUNT_BINS, BODY_PART_TYPES, CONSTRUCTION_TYPES, INTENT_TYPES,
+        MAX_ACTORS,
+    )
     from agent.env_client import ScreepsEnv
     from agent.model import Agent, count_params
 
@@ -55,8 +61,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", type=Path, default=_RL_ROOT / "runs" / "policy.pt")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--room", type=str, default="W7N3")
+    p.add_argument("--curriculum", type=str, default="empty")
     p.add_argument("--ticks", type=int, default=2000, help="episode length / max steps")
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=3)
     p.add_argument("--node", type=str, default=None)
     p.add_argument("--deterministic", action="store_true", help="argmax actions (default: sample)")
     p.add_argument("--sample", action="store_true", help="sample actions (default)")
@@ -66,21 +73,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--password", type=str, default="rlwatch")
     p.add_argument("--print-every", type=int, default=1, help="HUD print interval (ticks)")
     p.add_argument("--no-compile", action="store_true")
+    p.add_argument(
+        "--allow-source-mismatch", action="store_true",
+        help=(
+            "evaluation only: load a schema/state-compatible local artifact "
+            "whose recorded executable source differs"
+        ),
+    )
     return p.parse_args()
 
 
-def load_agent(path: Path, device: torch.device) -> Agent:
+def load_agent(
+    path: Path, device: torch.device, *, allow_source_mismatch: bool = False,
+) -> Agent:
     agent = Agent().to(device)
     if not path.is_file():
         raise SystemExit(f"[watch] checkpoint does not exist: {path}")
     ckpt = torch.load(path, map_location=device, weights_only=False)
     if not isinstance(ckpt, dict) or "actor" not in ckpt or "critic" not in ckpt:
         raise SystemExit(
-            f"[watch] checkpoint {path} is not a complete schema-v2 artifact"
+            f"[watch] checkpoint {path} is not a complete current-schema artifact"
         )
     try:
         meta = validate_artifact(
             ckpt, agent.actor, agent.critic, kinds=("joint_pretrain", "ppo"),
+            evaluation_only_source_mismatch=allow_source_mismatch,
         )
         if meta["kind"] == "joint_pretrain" and (
             bool(meta.get("partial")) or not bool(meta.get("qualified"))
@@ -92,7 +109,8 @@ def load_agent(path: Path, device: torch.device) -> Agent:
         raise SystemExit(f"[watch] incompatible checkpoint: {error}") from error
     print(
         f"[watch] loaded {path} update={ckpt.get('update')} "
-        f"global_step={ckpt.get('global_step')} kind={meta['kind']}",
+        f"global_step={ckpt.get('global_step')} kind={meta['kind']}"
+        f" source_mismatch_override={allow_source_mismatch}",
         flush=True,
     )
     agent.eval()
@@ -113,6 +131,10 @@ def describe_actions(out, actor_meta: list, target_meta: list) -> list[str]:
     dirs = out.dirs[0].cpu()
     tgts = out.targets[0].cpu()
     amts = out.amounts[0].cpu()
+    body_counts = out.body_counts[0].cpu()
+    body_order = out.body_order[0].cpu()
+    construction_types = out.construction_types[0].cpu()
+    construction_tiles = out.construction_tiles[0].cpu()
     n = min(MAX_ACTORS, len(actor_meta) if actor_meta else types.shape[0])
     for ai in range(n):
         meta = actor_meta[ai] if ai < len(actor_meta) else {"id": f"a{ai}", "kind": "?"}
@@ -129,12 +151,37 @@ def describe_actions(out, actor_meta: list, target_meta: list) -> list[str]:
             tmeta = target_meta[tg] if target_meta and tg < len(target_meta) else {"id": tg}
             tid = tmeta.get("id", tg) if isinstance(tmeta, dict) else tg
             ab = AMOUNT_BINS[am] if 0 <= am < len(AMOUNT_BINS) else am
-            slots.append(f"{name}({dname},tgt={tid},amt={ab})")
+            if name == "spawnCreep":
+                counts = body_counts[ai, s]
+                body = []
+                for part in body_order[ai, s].tolist():
+                    name_part = (
+                        BODY_PART_TYPES[part]
+                        if 0 <= part < len(BODY_PART_TYPES) else str(part)
+                    )
+                    body.extend([name_part] * int(counts[part]))
+                slots.append(f"spawnCreep(body={body})")
+            elif name == "createConstructionSite":
+                ci = int(construction_types[ai, s].item())
+                structure = (
+                    CONSTRUCTION_TYPES[ci]
+                    if 0 <= ci < len(CONSTRUCTION_TYPES) else str(ci)
+                )
+                tile = int(construction_tiles[ai, s].item())
+                slots.append(
+                    f"createConstructionSite(type={structure},x={tile % 50},y={tile // 50})"
+                )
+            else:
+                slots.append(f"{name}({dname},tgt={tid},amt={ab})")
         if slots:
             aid = meta.get("id", ai)
             kind = meta.get("kind", "?")
+            role = meta.get("role")
+            outcome = meta.get("outcome")
             xy = f"{meta.get('x', '?')},{meta.get('y', '?')}"
-            lines.append(f"  [{kind} {aid} @{xy}] " + " | ".join(slots))
+            state = f" role={role}" if role else ""
+            state += f" prev={outcome}" if outcome and outcome != "none" else ""
+            lines.append(f"  [{kind} {aid} @{xy}{state}] " + " | ".join(slots))
     return lines
 
 
@@ -161,7 +208,10 @@ def main() -> int:
     os.environ["RL_ROOM"] = args.room
     os.environ["RL_MAX_EPISODE"] = str(args.ticks)
 
-    agent = load_agent(args.checkpoint, device)
+    agent = load_agent(
+        args.checkpoint, device,
+        allow_source_mismatch=args.allow_source_mismatch,
+    )
     print(
         f"[watch] device={device} actor_params={count_params(agent.actor):,} "
         f"deterministic={deterministic} headful={args.headful}",
@@ -181,6 +231,8 @@ def main() -> int:
         headful_password=args.password,
         tick_ms=tick_ms,
         no_open=args.no_open,
+        seed=args.seed,
+        curriculum=args.curriculum,
     )
     try:
         obs = env.reset()
@@ -192,6 +244,9 @@ def main() -> int:
             print("[watch] headful requested; check Node stderr for URL / port errors", flush=True)
 
         ep_ret = 0.0
+        total_harvest = total_control = total_delivery = total_build = 0.0
+        total_claims = total_invalid = total_issued = 0.0
+        max_creeps = 0
         t0 = time.time()
         step = -1
         for step in range(args.ticks):
@@ -203,9 +258,21 @@ def main() -> int:
                 "dirs": out.dirs.cpu(),
                 "targets": out.targets.cpu(),
                 "amounts": out.amounts.cpu(),
+                "body_counts": out.body_counts.cpu(),
+                "body_order": out.body_order.cpu(),
+                "construction_types": out.construction_types.cpu(),
+                "construction_tiles": out.construction_tiles.cpu(),
             }
             obs, reward, done, info = env.step(actions)
             ep_ret += reward
+            total_harvest += float(info.get("harvestDelta") or 0)
+            total_control += float(info.get("controlDelta") or 0)
+            total_delivery += float(info.get("transferDelta") or 0)
+            total_build += float(info.get("buildDelta") or 0)
+            total_claims += float(info.get("claimDelta") or 0)
+            total_invalid += float(info.get("intentInvalid") or 0)
+            total_issued += float(info.get("intentIssued") or 0)
+            max_creeps = max(max_creeps, int(info.get("creeps") or 0))
             g = info.get("globals") or (obs.get("_time") and {}) or {}
             if isinstance(g, dict) and not g and hasattr(env, "last_info"):
                 g = (env.last_info or {}).get("globals") or {}
@@ -240,7 +307,15 @@ def main() -> int:
                 break
 
         dt = time.time() - t0
-        print(f"[watch] finished ticks={step+1} ep_ret={ep_ret:.3f} wall={dt:.1f}s", flush=True)
+        print(
+            f"[watch] finished curriculum={args.curriculum} seed={args.seed} "
+            f"decode={'deterministic' if deterministic else 'sampled'} ticks={step+1} "
+            f"ep_ret={ep_ret:.3f} H={total_harvest:.0f} C={total_control:.0f} "
+            f"delivery={total_delivery:.0f} build={total_build:.0f} "
+            f"claims={total_claims:.0f} max_creeps={max_creeps} "
+            f"invalid={total_invalid:.0f}/{total_issued:.0f} wall={dt:.1f}s",
+            flush=True,
+        )
         if args.headful:
             print("[watch] client still open until process exits — Ctrl+C when done watching", flush=True)
             try:

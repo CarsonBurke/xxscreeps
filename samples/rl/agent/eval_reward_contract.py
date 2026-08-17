@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Prove productive-delivery reward cannot be recycled from a rewarded sink.
+"""Prove productive delivery cannot be recycled through protected sinks.
 
 This drives the real simulator, not a mocked reward function. It spends spawn
 energy, delivers the seeded worker's energy once, then verifies both the policy
-mask and executor reject withdrawing that energy back from the spawn.
+mask and executor reject withdrawing that energy back from the spawn. Delivery
+is a qualification diagnostic rather than scalar reward, but reversible sink
+semantics would still corrupt economic evaluation and teacher behavior.
 """
 from __future__ import annotations
 
@@ -11,20 +13,35 @@ import argparse
 
 import torch
 
-from .constants import INTENT_SLOTS, INTENT_TYPES, MAX_ACTORS
+from .constants import (
+    BODY_PART_TYPES, INTENT_SLOTS, INTENT_TYPES, MAX_ACTORS,
+)
 from .env_client import ScreepsEnv
 
 
 def blank_actions() -> dict[str, torch.Tensor]:
     shape = (1, MAX_ACTORS, INTENT_SLOTS)
-    return {
+    actions = {
         key: torch.zeros(shape, dtype=torch.long)
-        for key in ("types", "dirs", "targets", "amounts")
+        for key in (
+            "types", "dirs", "targets", "amounts", "construction_types",
+            "construction_tiles",
+        )
     }
+    n_parts = len(BODY_PART_TYPES)
+    actions["body_counts"] = torch.zeros(
+        1, MAX_ACTORS, INTENT_SLOTS, n_parts, dtype=torch.long,
+    )
+    actions["body_order"] = torch.arange(n_parts, dtype=torch.long).view(
+        1, 1, 1, n_parts,
+    ).expand(
+        1, MAX_ACTORS, INTENT_SLOTS, n_parts,
+    ).clone()
+    return actions
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Validate non-cyclic delivery reward")
+    parser = argparse.ArgumentParser(description="Validate non-cyclic delivery diagnostics")
     parser.add_argument("--room", default="W7N3")
     parser.add_argument("--ticks", type=int, default=80)
     parser.add_argument("--node", default=None)
@@ -51,6 +68,15 @@ def main() -> int:
             raise RuntimeError(f"spawn actor missing: {actor_meta}")
         actions = blank_actions()
         actions["types"][0, spawn_actor, 0] = spawn_intent
+        body = [
+            BODY_PART_TYPES.index("work"), BODY_PART_TYPES.index("carry"),
+            BODY_PART_TYPES.index("move"), BODY_PART_TYPES.index("move"),
+        ]
+        counts = torch.bincount(torch.tensor(body), minlength=len(BODY_PART_TYPES))
+        order = list(dict.fromkeys(body))
+        order.extend(type_ for type_ in range(len(BODY_PART_TYPES)) if not counts[type_])
+        actions["body_counts"][0, spawn_actor, 0] = counts
+        actions["body_order"][0, spawn_actor, 0] = torch.tensor(order)
         obs, _, _, info = env.step(actions)
         spawn_result = next(
             (r for r in info.get("intentResults", []) if r.get("type") == "spawnCreep"),

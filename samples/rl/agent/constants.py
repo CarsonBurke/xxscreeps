@@ -36,13 +36,28 @@ PATCHES_PER_ROOM = SCHEMA["patchesPerRoom"]
 MAX_ROOMS = SCHEMA["maxRooms"]
 MAX_ACTORS = SCHEMA["maxActors"]
 MAX_TARGETS = SCHEMA["maxTargets"]
+MAX_BODY_PARTS = SCHEMA["maxBodyParts"]
+MAX_ROOM_ENERGY = SCHEMA["maxRoomEnergy"]
 INTENT_SLOTS = SCHEMA["intentSlots"]
 TILE_FEAT = SCHEMA["tileFeat"]
 ACTOR_FEAT = SCHEMA["actorFeat"]
+ACTOR_FEATURES = SCHEMA["actorFeatures"]
+if len(ACTOR_FEATURES) != ACTOR_FEAT or len(set(ACTOR_FEATURES)) != ACTOR_FEAT:
+    raise RuntimeError("schema actorFeatures must uniquely name every actor feature")
+ACTOR_FEATURE_INDEX = {name: index for index, name in enumerate(ACTOR_FEATURES)}
 TARGET_FEAT = SCHEMA["targetFeat"]
 GLOBAL_FEAT = SCHEMA["globalFeat"]
 AMOUNT_BINS = SCHEMA["amountBins"]
 N_AMOUNT = len(AMOUNT_BINS)
+BODY_PART_TYPES = SCHEMA["bodyPartTypes"]
+BODY_PART_COSTS = SCHEMA["bodyPartCosts"]
+N_BODY_PART = len(BODY_PART_TYPES)
+ACTION_OUTCOMES = SCHEMA["actionOutcomes"]
+N_ACTION_OUTCOME = len(ACTION_OUTCOMES)
+CONSTRUCTION_TYPES = SCHEMA["constructionTypes"]
+N_CONSTRUCTION_TYPE = len(CONSTRUCTION_TYPES)
+N_CONSTRUCTION_TILE = ROOM_SIZE * ROOM_SIZE
+CONSTRUCTION_MASK_BYTES = (N_CONSTRUCTION_TILE + 7) // 8
 INTENT_TYPES = SCHEMA["intentTypes"]
 INTENT_SPECS = SCHEMA["intentSpecs"]
 N_INTENT = len(INTENT_TYPES)
@@ -50,4 +65,6 @@ N_DIR = 8
 PATCH_FLAT = PATCH_SIZE * PATCH_SIZE * TILE_FEAT
 
 MODEL_CFG = SCHEMA["model"]
+NEXTLAT_CFG = SCHEMA["nextLat"]
+VALUE_CFG = SCHEMA["value"]
 PPO_CFG = SCHEMA["ppo"]

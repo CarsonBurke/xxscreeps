@@ -1,12 +1,31 @@
 """Vectorized Screeps env — N independent Node sims, stepped in parallel."""
 from __future__ import annotations
 
+import threading
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import torch
 
 from .env_client import ScreepsEnv, stack_batches
+from .constants import MAX_ACTORS, MAX_ROOMS, MAX_TARGETS, N_BODY_PART
+
+
+def configure_host_threads() -> int:
+    """Pin host intra-op parallelism to one thread and report the setting.
+
+    Every environment worker thread calls into torch on the host to decode and
+    stack observations. With torch's default intra-op pool each of those calls
+    fans out across all cores, so N worker threads contend for N times the
+    hardware and the vector environment stops scaling entirely: measured
+    throughput was flat at ~370 aggregate ticks per second from four to
+    twenty-four environments, and rose to ~1,170 with a single intra-op thread.
+    Host-side work here is small tensors and byte copies, which never benefited
+    from intra-op parallelism in the first place.
+    """
+    torch.set_num_threads(1)
+    return torch.get_num_threads()
 
 
 _OBS_KEYS = (
@@ -15,14 +34,122 @@ _OBS_KEYS = (
     "room_coords",
     "actors",
     "actor_mask",
+    "actor_outcome",
     "targets",
     "target_mask",
     "intent_mask",
     "dir_mask",
     "target_select_mask",
     "amount_mask",
+    "construction_mask",
     "globals",
 )
+
+_ACTION_HOST_DTYPES = {
+    "types": torch.uint8,
+    "dirs": torch.uint8,
+    "targets": torch.uint8,
+    "amounts": torch.uint8,
+    "body_counts": torch.uint8,
+    "body_order": torch.uint8,
+    "construction_types": torch.uint8,
+    "construction_tiles": torch.int16,
+    "_behavior_logprob": torch.float32,
+    "_behavior_state_latent": torch.float32,
+}
+
+_ACTOR_BUCKETS = (8, 16, 32, 64, MAX_ACTORS)
+_TARGET_BUCKETS = (16, 32, 64, MAX_TARGETS)
+# Live room count reaches MAX_ROOMS once scouting and expansion expose
+# neighbors, but spends most of an episode at the seed room plus one. Two
+# buckets keep the common case cheap; both are captured up front by
+# `PPOTrainer.warmup`, so neither costs a mid-run recompile.
+ROOM_BUCKETS = (2, MAX_ROOMS)
+
+# Compaction trades a smaller attended sequence for a variable one. Rooms are
+# always compacted: the count is stable at the live rooms and the model's frozen
+# room pack is built from it. Actor and target capacity is what churns, climbing
+# 8 -> 16 -> 32 -> 64 -> 100 as a colony grows, so a compiled graph must see one
+# fixed capacity or `dynamic=False` mints a graph and a CUDA-graph pool per
+# bucket, mid-episode.
+_ENTITY_COMPACTION = True
+
+
+def set_entity_compaction(enabled: bool) -> bool:
+    """Enable or disable actor/target compaction; returns the new state."""
+    global _ENTITY_COMPACTION
+    _ENTITY_COMPACTION = bool(enabled)
+    return _ENTITY_COMPACTION
+
+
+def _capacity_bucket(live: int, buckets: tuple[int, ...]) -> int:
+    for capacity in buckets:
+        if live <= capacity:
+            return capacity
+    return buckets[-1]
+
+
+def _compact_entity_prefixes(
+    obs: dict[str, torch.Tensor],
+    *,
+    entities: bool = True,
+    rooms: int | None = None,
+) -> dict[str, torch.Tensor]:
+    """Slice front-packed entity tensors to a small finite capacity bucket.
+
+    Node packs all live actors and targets contiguously.  Host rollout storage
+    retains the full ABI; only model-bound batches are compacted.  Finite
+    buckets keep eager execution from attending over mostly-padding
+    100-actor/128-target sequences.  A compiled graph wants the opposite: every
+    dimension fixed, because `dynamic=False` specializes per shape and both the
+    entity bucket and the live room count move during an episode.
+    """
+    actor_mask = obs.get("actor_mask")
+    target_mask = obs.get("target_mask")
+    if actor_mask is None or target_mask is None:
+        return obs
+    def required_prefix(mask: torch.Tensor) -> int:
+        live = torch.nonzero(mask.detach().cpu() > 0, as_tuple=False)
+        return 1 if live.numel() == 0 else int(live[:, 1].max().item()) + 1
+
+    out = dict(obs)
+    room_live = required_prefix(obs["room_mask"])
+    room_cap = rooms if rooms is not None else _capacity_bucket(
+        max(1, room_live), ROOM_BUCKETS,
+    )
+    for key in ("patches", "room_mask", "room_coords", "construction_mask"):
+        if key not in out:
+            continue
+        stored = out[key]
+        rooms = stored.shape[1]
+        if rooms > room_cap:
+            out[key] = stored[:, :room_cap]
+        elif rooms < room_cap:
+            # Host storage packs rooms to its own capacity, which can be below
+            # the model bucket. Pad rather than hand a compiled graph a third
+            # room shape; the extra rooms are masked out.
+            pad = stored.new_zeros(
+                (stored.shape[0], room_cap - rooms, *stored.shape[2:]),
+            )
+            out[key] = torch.cat((stored, pad), dim=1)
+    if not entities:
+        return out
+    actor_live = required_prefix(actor_mask)
+    target_live = required_prefix(target_mask)
+    actor_cap = _capacity_bucket(max(1, actor_live), _ACTOR_BUCKETS)
+    target_cap = _capacity_bucket(max(1, target_live), _TARGET_BUCKETS)
+    for key in (
+        "actors", "actor_mask", "actor_outcome", "intent_mask",
+        "dir_mask", "amount_mask",
+    ):
+        if key in out:
+            out[key] = out[key][:, :actor_cap]
+    for key in ("targets", "target_mask"):
+        if key in out:
+            out[key] = out[key][:, :target_cap]
+    if "target_select_mask" in out:
+        out["target_select_mask"] = out["target_select_mask"][..., :target_cap]
+    return out
 
 
 def promote_obs_device(
@@ -31,13 +158,23 @@ def promote_obs_device(
     *,
     pin_hold: list[torch.Tensor] | None = None,
     non_blocking: bool | None = None,
+    rooms: int | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Host→device promotion. Spatial uint8 is dequantized; masks become float32."""
+    """Host→device promotion. Spatial uint8 is dequantized; masks become float32.
+
+    `rooms` pins the room pack instead of bucketing it. The compiled training
+    path uses it: one update graph at `MAX_ROOMS` costs padded spatial tokens,
+    while a graph per room pack costs a second minibatch-sized CUDA-graph
+    capture pool, and two of those do not fit on one device.
+    """
     device = torch.device(device)
     if non_blocking is None:
         non_blocking = device.type == "cuda"
     out: dict[str, torch.Tensor] = {}
-    for k, v in obs.items():
+    compact = _compact_entity_prefixes(
+        obs, entities=_ENTITY_COMPACTION, rooms=rooms,
+    )
+    for k, v in compact.items():
         if k.startswith("_"):
             out[k] = v
             continue
@@ -49,7 +186,8 @@ def promote_obs_device(
             if pin_hold is not None:
                 pin_hold.append(src)
         if src.dtype == torch.uint8:
-            t = src.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
+            dtype = torch.uint8 if k == "construction_mask" else torch.float32
+            t = src.to(device=device, dtype=dtype, non_blocking=non_blocking)
             if k == "patches":
                 t = t.mul(1.0 / 255.0)
         else:
@@ -97,6 +235,7 @@ class VecScreepsEnv:
         no_open: bool = False,
         curriculum: str | list[str] | tuple[str, ...] | None = None,
         lean_meta: bool | None = None,
+        seed: int = 0,
     ):
         self.n = n
         self.device = torch.device(device)
@@ -121,22 +260,105 @@ class VecScreepsEnv:
                 no_open=no_open,
                 curriculum=self.curricula[i % len(self.curricula)],
                 lean_meta=lean_meta,
+                seed=int(seed) + i,
             )
             for i in range(n)
         ]
         self._pool = ThreadPoolExecutor(max_workers=n, thread_name_prefix="screeps-env")
         self.headful = bool(headful)
         self.host_obs: dict[str, torch.Tensor] | None = None
+        # Two reusable host stacks keep s_t alive while workers produce s_{t+1}.
+        # CUDA stacks are pinned once; this removes per-tick cat allocations and
+        # fourteen repeated pin_memory allocations without racing rollout writes.
+        self._obs_host_buffers: tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]] = (
+            {}, {},
+        )
+        self._obs_host_index = 0
         # Pinned host buffers for rewards/dones (avoid per-step tiny H2D allocs).
         self._reward_host = torch.zeros(n, dtype=torch.float32).pin_memory() if self.device.type == "cuda" else torch.zeros(n, dtype=torch.float32)
         self._done_host = torch.zeros(n, dtype=torch.float32).pin_memory() if self.device.type == "cuda" else torch.zeros(n, dtype=torch.float32)
         # Keep last non_blocking H2D sources alive until the next transfer.
         self._pin_hold: list[torch.Tensor] = []
+        # Reused pinned D2H action planes.  Copying every factor with `.cpu()`
+        # serialized the CUDA stream once per factor; these buffers launch all
+        # copies and require one synchronization before worker threads consume
+        # them.
+        self._action_host: dict[str, torch.Tensor] = {}
+        self.last_host_actions: dict[str, torch.Tensor] | None = None
+        self.last_host_reward: torch.Tensor | None = None
+        self.last_host_done: torch.Tensor | None = None
+        self._restart_state_init()
+
+    def _stack_host_obs(
+        self,
+        batches: list[dict[str, torch.Tensor]],
+        *,
+        buffer_index: int,
+    ) -> dict[str, torch.Tensor]:
+        if len(batches) != self.n:
+            raise RuntimeError(f"observation batch count {len(batches)} expected {self.n}")
+        buffers = self._obs_host_buffers[buffer_index]
+        out: dict[str, torch.Tensor] = {}
+        for key in _OBS_KEYS:
+            first = batches[0][key]
+            shape = (self.n, *first.shape[1:])
+            destination = buffers.get(key)
+            if (
+                destination is None
+                or tuple(destination.shape) != shape
+                or destination.dtype != first.dtype
+            ):
+                destination = torch.empty(
+                    shape,
+                    dtype=first.dtype,
+                    device="cpu",
+                    pin_memory=self.device.type == "cuda",
+                )
+                buffers[key] = destination
+            torch.cat([batch[key] for batch in batches], dim=0, out=destination)
+            out[key] = destination
+        return out
+
+    def _actions_to_host(
+        self, actions: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        if self.device.type != "cuda":
+            return {key: value.detach().cpu() for key, value in actions.items()}
+
+        copied: dict[str, torch.Tensor] = {}
+        for key, value in actions.items():
+            dtype = _ACTION_HOST_DTYPES.get(key, value.dtype)
+            buffer = self._action_host.get(key)
+            if (
+                buffer is None
+                or buffer.shape != value.shape
+                or buffer.dtype != dtype
+            ):
+                buffer = torch.empty(
+                    value.shape, dtype=dtype, device="cpu", pin_memory=True,
+                )
+                self._action_host[key] = buffer
+            buffer.copy_(value.detach(), non_blocking=True)
+            copied[key] = buffer
+        torch.cuda.current_stream(self.device).synchronize()
+        return copied
 
     def reset(self) -> dict[str, torch.Tensor]:
-        futs = [self._pool.submit(env.reset) for env in self.envs]
+        """Start every env. With a `start_provider`, lanes that own a start state
+        begin there instead of at tick zero, so a resumed run does not have to
+        replay a full fresh segment before its reservoir takes effect."""
+        def _one(index: int) -> dict[str, torch.Tensor]:
+            path = self.start_provider(index) if self.start_provider is not None else None
+            if path is None:
+                self._note_restart("reset")
+                return self.envs[index].reset()
+            self._note_restart("restore")
+            return self.envs[index].restore(path)
+
+        futs = [self._pool.submit(_one, index) for index in range(self.n)]
         batches = [f.result() for f in futs]
-        self.host_obs = stack_batches(batches)
+        self._obs_host_index = 0
+        self.host_obs = self._stack_host_obs(batches, buffer_index=self._obs_host_index)
         self._pin_hold = []
         return promote_obs_device(self.host_obs, self.device, pin_hold=self._pin_hold)
 
@@ -151,59 +373,131 @@ class VecScreepsEnv:
             self._done_host[i] = float(r[2])
         infos = [r[3] for r in results]
 
-        self.host_obs = stack_batches(obs_list)
+        self._obs_host_index = 1 - self._obs_host_index
+        self.host_obs = self._stack_host_obs(
+            obs_list, buffer_index=self._obs_host_index,
+        )
         pin_hold: list[torch.Tensor] = []
         obs = promote_obs_device(self.host_obs, self.device, pin_hold=pin_hold)
         self._pin_hold = pin_hold
         rew = self._reward_host.clone()
         done = self._done_host.clone()
-        return (
-            obs,
-            rew.to(self.device, non_blocking=False),
-            done.to(self.device, non_blocking=False),
-            infos,
-        )
+        # Expose the owning CPU copies for rollout storage.  Callers must consume
+        # these before the next step overwrites the reusable pinned buffers.
+        self.last_host_reward = rew
+        self.last_host_done = done
+        # Training targets and normalization are host-side; callers that truly
+        # need device rewards can promote these tiny vectors explicitly.
+        return obs, rew, done, infos
 
-    @staticmethod
+    def _restart_state_init(self) -> None:
+        """Initialize start-state control (called from the constructor)."""
+        self.start_provider: Callable[[int], str | None] | None = None
+        self._restart_requests: set[int] = set()
+        self.restart_counts = {"reset": 0, "restore": 0}
+        # Restarts run on the worker pool; the counters must not race.
+        self._restart_lock = threading.Lock()
+
+    def _note_restart(self, kind: str) -> None:
+        with self._restart_lock:
+            self.restart_counts[kind] += 1
+
+    def request_restart(self, index: int) -> None:
+        """Truncate env `index` at the next step boundary and start a new segment."""
+        if not 0 <= index < self.n:
+            raise IndexError(f"env index {index} outside [0,{self.n})")
+        self._restart_requests.add(int(index))
+
+    def pending_restarts(self) -> frozenset[int]:
+        return frozenset(self._restart_requests)
+
+    def snapshot(
+        self, requests: Sequence[tuple[int, str, Sequence[str]]],
+    ) -> list[dict[str, Any]]:
+        """Capture snapshots for several envs concurrently.
+
+        Each request is `(env index, destination path, event tags)`. Capture must
+        happen while the env still holds the observed post-tick state, so callers
+        issue it immediately after `step` and before the next action.
+        """
+        if not requests:
+            return []
+        futures = [
+            self._pool.submit(self.envs[index].snapshot, path, tags)
+            for index, path, tags in requests
+        ]
+        out: list[dict[str, Any]] = []
+        for (index, path, _tags), future in zip(requests, futures, strict=True):
+            try:
+                descriptor = future.result()
+            except Exception as error:  # noqa: BLE001
+                print(
+                    f"[vec_env] snapshot env={index} path={path} failed ({error!s:.160})",
+                    flush=True,
+                )
+                continue
+            out.append({**descriptor, "env": int(index)})
+        return out
+
     def _handle_done(
+        self,
+        index: int,
         env: ScreepsEnv,
         o: dict[str, torch.Tensor],
         info: dict[str, Any],
         d: bool,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-        """Time-limit truncation: keep pre-reset obs for GAE bootstrap."""
-        if d:
-            term = {
-                k: v.detach().clone()
-                for k, v in o.items()
-                if not str(k).startswith("_") and torch.is_tensor(v)
-            }
+        """Episode end or requested segment end: keep pre-restart obs for GAE."""
+        requested = index in self._restart_requests
+        if not d and not requested:
+            return o, {**info, "episode_done": False, "truncated": False}
+        self._restart_requests.discard(index)
+        term = {
+            k: v.detach().clone()
+            for k, v in o.items()
+            if not str(k).startswith("_") and torch.is_tensor(v)
+        }
+        path = self.start_provider(index) if self.start_provider is not None else None
+        if path is None:
             o = env.reset()
-            info = {
-                **info,
-                "episode_done": True,
-                "truncated": True,  # pure time-limit env today
-                "terminal_observation": term,
-            }
+            kind = "reset"
         else:
-            info = {**info, "episode_done": False, "truncated": False}
-        return o, info
+            o = env.restore(path)
+            kind = "restore"
+        self._note_restart(kind)
+        start_info = env.last_info or {}
+        return o, {
+            **info,
+            # A completed 20k horizon is an episode boundary; a requested segment
+            # end is not, but both cut the trajectory and bootstrap from V.
+            "episode_done": bool(d),
+            "truncated": True,
+            "segment_boundary": bool(requested and not d),
+            "restart_kind": kind,
+            "restart_path": path,
+            "start_tick": int(start_info.get("time") or 0),
+            "start_step": int(start_info.get("step") or 0),
+            "terminal_observation": term,
+        }
 
     def step(
         self, actions: dict[str, torch.Tensor]
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
         """
-        actions tensors are [N, ...] (batched over envs).
+        actions tensors are [N, ...] (batched over envs). Private underscore
+        planes may carry behavior-policy statistics to the host staging copy;
+        the wire encoder ignores them.
         All N Node sims run concurrently; returns stacked obs on self.device.
         Also updates `self.host_obs` for zero-D2H rollout buffering.
         """
         # Slice on host once so worker threads never touch CUDA tensors.
-        acts_cpu = {k: v.detach().to("cpu", non_blocking=False) for k, v in actions.items()}
+        acts_cpu = self._actions_to_host(actions)
+        self.last_host_actions = acts_cpu
 
         def _one(i: int) -> tuple[dict[str, torch.Tensor], float, bool, dict[str, Any]]:
             act_i = {k: v[i : i + 1] for k, v in acts_cpu.items()}
             o, r, d, info = self.envs[i].step(act_i)
-            o, info = self._handle_done(self.envs[i], o, info, bool(d))
+            o, info = self._handle_done(i, self.envs[i], o, info, bool(d))
             return o, float(r), bool(d), info
 
         futs = [self._pool.submit(_one, i) for i in range(self.n)]
@@ -222,7 +516,7 @@ class VecScreepsEnv:
         """Vectorized scripted teacher step (same expert for BC + critic).
 
         Returns (obs_dev, rewards, dones, infos, actions_tn) where actions_tn is
-        padded [N, MAX_ACTORS, INTENT_SLOTS] long tensors for types/dirs/targets/amounts.
+        padded action tensors for every factor in the shared spawn/action contract.
         Pre-step decision state is the previous `host_obs` (caller must buffer it).
         """
         from .actions_util import pad_actions
@@ -233,7 +527,7 @@ class VecScreepsEnv:
         ]:
             try:
                 o, r, d, info, actions = self.envs[i].step_scripted()
-                o, info = self._handle_done(self.envs[i], o, info or {}, bool(d))
+                o, info = self._handle_done(i, self.envs[i], o, info or {}, bool(d))
                 return o, float(r), bool(d), info, pad_actions(actions)
             except Exception as err:  # noqa: BLE001
                 # Keep fleet alive: hard-reset dead worker; mark done so MC chain cuts.
@@ -254,8 +548,19 @@ class VecScreepsEnv:
                 }
                 empty = {
                     k: torch.zeros(MAX_ACTORS, INTENT_SLOTS, dtype=torch.long)
-                    for k in ("types", "dirs", "targets", "amounts")
+                    for k in (
+                        "types", "dirs", "targets", "amounts",
+                        "construction_types", "construction_tiles",
+                    )
                 }
+                empty["body_counts"] = torch.zeros(
+                    MAX_ACTORS, INTENT_SLOTS, N_BODY_PART, dtype=torch.long,
+                )
+                empty["body_order"] = torch.arange(N_BODY_PART).view(
+                    1, 1, N_BODY_PART,
+                ).expand(
+                    MAX_ACTORS, INTENT_SLOTS, N_BODY_PART,
+                ).clone()
                 return o, 0.0, True, info, empty
 
         futs = [self._pool.submit(_one, i) for i in range(self.n)]
@@ -264,9 +569,48 @@ class VecScreepsEnv:
         obs, rew, done, infos = self._finish_step(base)
         acts = {
             k: torch.stack([r[4][k] for r in results], dim=0)
-            for k in ("types", "dirs", "targets", "amounts")
+            for k in (
+                "types", "dirs", "targets", "amounts",
+                "body_counts", "body_order", "construction_types", "construction_tiles",
+            )
         }
         return obs, rew, done, infos, acts
+
+    def step_labeled(
+        self, actions: dict[str, torch.Tensor],
+    ) -> tuple[
+        dict[str, torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        list[dict[str, Any]],
+        dict[str, torch.Tensor],
+    ]:
+        """Apply batched learner actions and return pre-state scripted labels."""
+        from .actions_util import pad_actions
+
+        acts_cpu = self._actions_to_host(actions)
+        self.last_host_actions = acts_cpu
+
+        def _one(i: int) -> tuple[
+            dict[str, torch.Tensor], float, bool, dict[str, Any], dict[str, torch.Tensor]
+        ]:
+            act_i = {key: value[i : i + 1] for key, value in acts_cpu.items()}
+            obs, reward, done, info, teacher = self.envs[i].step_labeled(act_i)
+            obs, info = self._handle_done(i, self.envs[i], obs, info, bool(done))
+            return obs, float(reward), bool(done), info, pad_actions(teacher)
+
+        futures = [self._pool.submit(_one, i) for i in range(self.n)]
+        results = [future.result() for future in futures]
+        base = [(row[0], row[1], row[2], row[3]) for row in results]
+        obs, rewards, dones, infos = self._finish_step(base)
+        teacher = {
+            key: torch.stack([row[4][key] for row in results], dim=0)
+            for key in (
+                "types", "dirs", "targets", "amounts",
+                "body_counts", "body_order", "construction_types", "construction_tiles",
+            )
+        }
+        return obs, rewards, dones, infos, teacher
 
     def close(self) -> None:
         try:

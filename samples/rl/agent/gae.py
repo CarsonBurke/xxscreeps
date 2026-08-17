@@ -1,8 +1,12 @@
-"""GAE helpers for decoupled policy and critic return estimation.
+"""Discounted-return and CleanRL-style GAE helpers.
 
-VAPO (arXiv:2504.05118):
-  · critic targets use full Monte Carlo (λ_critic = 1.0)
-  · policy advantages use one explicit λ for every transition
+PPO uses one GAE recurrence for both outputs:
+  · actor advantage = GAE(gamma, lambda)
+  · critic target = actor advantage + behavior-policy value
+
+Supervised critic pretraining instead uses finite-horizon discounted
+reward-to-go at the same gamma.  It has no reliable behavior-value baseline
+from which to construct GAE before the critic is trained.
 
 Time-limit vs terminal (Gym TimeLimit):
   · true terminal → bootstrap 0
@@ -66,7 +70,7 @@ def compute_gae_tn(
         # Bootstrap V(s') on both true terminals (V≈0 via next_values) and time-limits
         # (V(terminal_obs) spliced into next_values_tn / next_value).
         # Always CUT the λ-chain on any done — otherwise advantages leak into the
-        # post-reset episode (SB3/CleanRL TimeLimit handling).
+        # post-reset episode (Gym/SB3-style time-limit bootstrapping).
         done_t = dones[t]
         if nv is not None:
             nextvalues = nv[t]
@@ -81,8 +85,12 @@ def compute_gae_tn(
         # δ uses V on non-terminated steps; on pure terminal next_nonterminal=0 → no V
         bootstrap_ok = 1.0 - terminated
         delta = rewards[t] + gamma * nextvalues * bootstrap_ok - values[t]
-        # λ-chain cuts on ANY episode end (done), including truncation
-        chain = 1.0 - done_t
+        # λ-chain cuts on ANY trajectory cut: a true terminal, a time limit, or a
+        # start-state segment boundary. A segment boundary reports done=0 with
+        # truncation=1 because the environment episode continues elsewhere, and
+        # leaving the chain intact there would leak one world's advantages into
+        # the unrelated world restored in its place.
+        chain = 1.0 - torch.clamp(done_t + trunc_t, max=1.0)
         if per_step:
             lastgaelam = delta + gamma * lam_tn[t] * chain * lastgaelam
         else:
@@ -92,53 +100,44 @@ def compute_gae_tn(
     return adv, returns
 
 
-def decoupled_gae(
+def cleanrl_gae(
     rewards: Tensor,
     values: Tensor,
     dones: Tensor,
     *,
     gamma: float = 0.99,
-    policy_lambda: float | None = None,
+    gae_lambda: float = 0.95,
     next_value: Tensor | None = None,
     truncations: Tensor | None = None,
     next_values_tn: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, dict[str, float]]:
     """
     Returns:
-      advantages_policy  — explicit-λ GAE (for policy)
-      returns_critic     — λ=1.0 MC-style returns (for value loss)
-      info               — mean λ_policy etc.
+      advantages — GAE(gamma, lambda), used by the policy surrogate
+      returns    — advantages + behavior values, used by the value loss
+      info       — estimator parameters and geometric effective horizon
     """
-    T, N = rewards.shape
-    device = rewards.device
-
-    if policy_lambda is None:
-        # Retain the helper for experiments, but use a single explicit lambda in
-        # production. A rollout-end partial length is not the episode length and
-        # previously assigned the wrong lambda to earlier reset segments.
-        policy_lambda = 0.95
-    lam_policy = torch.full(
-        (N,), float(policy_lambda), device=device, dtype=rewards.dtype,
+    advantages, returns = compute_gae_tn(
+        rewards,
+        values,
+        dones,
+        gamma=gamma,
+        lam=gae_lambda,
+        next_value=next_value,
+        truncations=truncations,
+        next_values_tn=next_values_tn,
     )
-
-    adv_policy, _ = compute_gae_tn(
-        rewards, values, dones, gamma, lam_policy, next_value,
-        truncations=truncations, next_values_tn=next_values_tn,
-    )
-    _, ret_critic = compute_gae_tn(
-        rewards, values, dones, gamma, 1.0, next_value,
-        truncations=truncations, next_values_tn=next_values_tn,
-    )
+    decay = float(gamma) * float(gae_lambda)
     info = {
-        "lambda_policy_mean": float(lam_policy.mean().item()),
-        "lambda_policy_min": float(lam_policy.min().item()),
-        "lambda_policy_max": float(lam_policy.max().item()),
-        "lambda_critic": 1.0,
+        "gamma": float(gamma),
+        "gae_lambda": float(gae_lambda),
+        "gae_decay": decay,
+        "effective_horizon": 1.0 / (1.0 - decay),
     }
-    return adv_policy, ret_critic, info
+    return advantages, returns, info
 
 
-def mc_returns_tn(
+def discounted_returns_tn(
     rewards: Tensor,
     dones: Tensor,
     *,
@@ -147,10 +146,12 @@ def mc_returns_tn(
     truncations: Tensor | None = None,
     next_values_tn: Tensor | None = None,
 ) -> Tensor:
-    """λ=1 Monte Carlo returns with values≡0 (critic pretrain / joint pretrain).
+    """Finite-horizon discounted reward-to-go for critic pretraining.
 
-    `next_value` bootstraps the last step; `next_values_tn` can splice V(terminal_obs)
-    on mid-chunk time-limits. Returns shape [T, N].
+    `next_value` optionally bootstraps the last step; `next_values_tn` can splice
+    V(terminal_obs) on mid-chunk time limits.  With a zero endpoint at the end
+    of a declared finite lifecycle this is the exact discounted return target.
+    Returns shape [T, N].
     """
     T, N = rewards.shape
     values_dummy = torch.zeros(T, N, device=rewards.device, dtype=rewards.dtype)

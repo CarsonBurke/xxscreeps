@@ -25,8 +25,10 @@ for p in (_REPO, _RL_ROOT):
 
 try:
     from samples.rl.agent.env_client import ScreepsEnv
+    from samples.rl.agent.ti_intents import summarize_ti_labels, translate_ti_intents
 except ImportError:
     from agent.env_client import ScreepsEnv
+    from agent.ti_intents import summarize_ti_labels, translate_ti_intents
 
 
 def main() -> int:
@@ -43,6 +45,14 @@ def main() -> int:
         help="report post-warmup skill excluding first N ticks (matches critic pretrain default)",
     )
     p.add_argument("--curriculum", type=str, default="empty")
+    p.add_argument(
+        "--capture-intents", action="store_true",
+        help="capture exact raw TI intent payloads at the runner boundary",
+    )
+    p.add_argument(
+        "--intent-samples", type=int, default=0,
+        help="print the first N non-empty captured payloads as compact JSON",
+    )
     args = p.parse_args()
 
     env = ScreepsEnv(
@@ -52,6 +62,7 @@ def main() -> int:
         expert=True,
         bot_dir=args.bot_dir,
         curriculum=args.curriculum,
+        capture_expert_intents=args.capture_intents,
     )
     try:
         env.reset()
@@ -60,6 +71,9 @@ def main() -> int:
         creeps_peak = 0
         first_creep = None
         step_skill: list[float] = []
+        intent_ticks = intent_rooms = intent_objects = 0
+        intent_samples = 0
+        translated = []
         for t in range(args.ticks):
             _, r, done, info = env.step(None)
             h = float(info.get("harvestDelta") or 0)
@@ -67,6 +81,34 @@ def main() -> int:
             H += h
             C += c
             step_skill.append(h + c)
+            raw_intents = info.get("expertIntents")
+            if isinstance(raw_intents, dict):
+                intent_ticks += 1
+                # TickResult.intentPayloads is the room-name map itself. Accept
+                # a future explicit {room: ...} wrapper without miscounting the
+                # current wire shape.
+                rooms = raw_intents.get("room") if "room" in raw_intents else raw_intents
+                rooms = rooms or {}
+                intent_rooms += len(rooms)
+                intent_objects += sum(
+                    len((payload or {}).get("object") or {})
+                    for payload in rooms.values()
+                    if isinstance(payload, dict)
+                )
+                if rooms and intent_samples < args.intent_samples:
+                    import json
+                    print(
+                        "[eval_expert] intent_sample="
+                        + json.dumps(raw_intents, separators=(",", ":"), sort_keys=True),
+                        flush=True,
+                    )
+                    intent_samples += 1
+                translated.extend(translate_ti_intents(
+                    raw_intents,
+                    info.get("expertActorMeta") or [],
+                    info.get("expertTargetMeta") or [],
+                    info.get("expertRoomNames") or [],
+                ))
             if t >= args.skip_warmup:
                 H_w += h
                 C_w += c
@@ -98,6 +140,18 @@ def main() -> int:
             f"return={R:.2f} first_creep_tick={first_creep} creeps_peak={creeps_peak}",
             flush=True,
         )
+        if args.capture_intents:
+            print(
+                f"[eval_expert] raw_intents ticks={intent_ticks}/{args.ticks} "
+                f"rooms={intent_rooms} object_rows={intent_objects}",
+                flush=True,
+            )
+            import json
+            print(
+                "[eval_expert] translated="
+                + json.dumps(summarize_ti_labels(translated), sort_keys=True),
+                flush=True,
+            )
         # Gates: TI cold start is expected — G1 may fail early; post-warmup skill is the signal.
         ok = True
         if first_creep is None:

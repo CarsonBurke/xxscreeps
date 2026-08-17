@@ -1,13 +1,13 @@
 {
-  "version": 2,
+  "version": 4,
   "artifact": {
     "formatVersion": 1,
-    "modelAbi": 3,
-    "observationAbi": 4,
-    "actionAbi": 7,
-    "rewardAbi": 2,
-    "teacherAbi": 9,
-    "learningAbi": 5
+    "modelAbi": 9,
+    "observationAbi": 8,
+    "actionAbi": 11,
+    "rewardAbi": 3,
+    "teacherAbi": 20,
+    "learningAbi": 14
   },
   "roomSize": 50,
   "patchSize": 5,
@@ -20,17 +20,35 @@
   "maxTargets": 128,
   "intentSlots": 1,
   "tileFeat": 28,
-  "actorFeat": 28,
+  "actorFeat": 36,
+  "actorFeatures": [
+    "isNonCreep", "x", "y", "roomIndex",
+    "totalMove", "totalWork", "totalCarry", "totalAttack",
+    "totalRangedAttack", "totalHeal", "totalClaim", "totalTough",
+    "activeMove", "activeWork", "activeCarry", "activeAttack",
+    "activeRangedAttack", "activeHeal", "activeClaim", "activeTough",
+    "storeFill", "storeFree", "storedEnergy", "storeCapacity",
+    "fatigue", "hits", "ticksToLive", "spawning",
+    "storeEmpty", "storeFull", "tired", "isSpawn", "isTower",
+    "roomEnergyAvailable", "roomEnergyCapacity", "isRoom"
+  ],
+  "actorFeatureScaling": {
+    "_comment": "All fields are in [0,1]. Total and active body-part counts divide by maxBodyParts; positions divide by roomSize-1; roomIndex divides by maxRooms-1; storedEnergy/storeCapacity and room energy divide by maxRoomEnergy; fatigue divides by 10; ticksToLive divides by 1500. The original body and its currently usable subset are both recoverable.",
+    "bodyPartCountDivisor": 50,
+    "energyDivisor": 20000
+  },
   "targetFeat": 24,
   "globalFeat": 12,
+  "maxRoomEnergy": 20000,
   "amountBins": [0, 1, 5, 10, 25, 50, 100, 200, 500, 1000],
-  "bodyTemplates": [
-    { "name": "worker_basic", "body": ["work", "carry", "move", "move"], "cost": 250 },
-    { "name": "miner", "body": ["work", "work", "move"], "cost": 250 },
-    { "name": "hauler", "body": ["carry", "carry", "carry", "move", "move", "move"], "cost": 300 },
-    { "name": "upgrader", "body": ["work", "work", "carry", "move"], "cost": 300 },
-    { "name": "builder", "body": ["work", "carry", "carry", "move", "move"], "cost": 300 },
-    { "name": "claimer", "body": ["claim", "move"], "cost": 650 }
+  "maxBodyParts": 50,
+  "bodyPartTypes": ["move", "work", "carry", "attack", "ranged_attack", "heal", "claim", "tough"],
+  "bodyPartCosts": [50, 100, 50, 80, 150, 250, 600, 10],
+  "diagnosticRoles": ["flexible", "miner", "hauler", "builder", "upgrader", "claimer", "scout", "melee", "ranged", "healer", "unknown"],
+  "actionOutcomes": [
+    "none", "ok", "not_enough_energy", "busy", "invalid_target", "invalid_args",
+    "no_bodypart", "full", "tired", "name_exists", "not_enough_resources",
+    "no_path", "not_owner", "rcl_not_enough", "approaching", "other"
   ],
   "constructionTypes": [
     "extension",
@@ -82,8 +100,8 @@
     "reserveController": { "factors": ["target"] },
     "attackController": { "factors": ["target"] },
     "dismantle": { "factors": ["target"] },
-    "spawnCreep": { "factors": ["amount"] },
-    "createConstructionSite": { "factors": ["target", "amount"], "localTarget": true }
+    "spawnCreep": { "factors": ["bodyCounts", "bodyOrder"] },
+    "createConstructionSite": { "factors": ["constructionType", "constructionTile"], "strategicActor": "room" }
   },
   "directions": [
     { "dx": 0, "dy": -1 },
@@ -97,11 +115,8 @@
   ],
   "reward": {
     "energyHarvested": 0.1,
-    "energyDelivered": 0.25,
-    "buildProgress": 0.5,
     "controlPoints": 1.0,
-    "roomClaim": 500.0,
-    "_comment": "Primary score remains raw H+C in evaluation. Training also values productive logistics, construction, and territorial control; no direct spawn reward."
+    "_comment": "Only harvested energy and controller progress enter reward. Delivery, construction, claims, spawning, and storage flows remain diagnostics and qualification gates because gross progress signals can be gamed."
   },
   "model": {
     "dModel": 128,
@@ -133,36 +148,44 @@
       "spawnCreep": 2.0
     }
   },
+  "nextLat": {
+    "horizon": 1,
+    "actorMseCoef": 0.1,
+    "criticMseCoef": 1.0,
+    "criticKlCoef": 0.1,
+    "_comment": "Action-conditioned one-step latent dynamics. Future encodings and critic teacher logits are detached; terminal, reset, and rollout-tail transitions are excluded."
+  },
   "value": {
-    "hlGauss": false,
-    "vMin": -10.0,
-    "vMax": 10.0,
-    "numBins": 101,
-    "sigmaRatio": 2.0,
+    "loss": "hlGauss",
+    "transform": "symlog",
+    "maxAbsReturn": 1000000000.0,
+    "interiorBins": 400,
+    "marginBins": 4,
+    "sigmaRatio": 1.0,
     "prior": 0.0,
-    "lrWarmupUpdates": 10,
-    "_comment": "Enable HL-Gauss only after scale-aligned MSE critic has EV>0 (round-2: premature as P0)"
+    "criticMaxGradNorm": 0.5,
+    "_comment": "HL-Gauss categorical critic on a signed-log support. The 409 bins center exactly on zero and +/-1e9 expected-return anchors, with four tail-margin bins per side. The margin makes the hard representable target bound approximately +/-1.594e9; targets beyond it fail instead of clamping. Critic gradients clip at 0.5 and values are never clipped."
   },
   "ppo": {
-    "gamma": 0.999,
-    "gaeLambda": 0.97,
+    "gamma": 0.995,
+    "gaeLambda": 0.95,
     "clip": 0.2,
     "clipHigh": 0.28,
     "entropyCoef": 0.005,
     "valueCoef": 1.0,
     "maxGradNorm": 0.5,
     "lr": 1e-4,
-    "epochs": 2,
-    "minibatch": 128,
+    "epochs": 3,
+    "minibatch": 1536,
     "rolloutSteps": 512,
-    "numEnvs": 8,
-    "maxRolloutSteps": 1024,
+    "numEnvs": 24,
+    "maxRolloutSteps": 512,
     "extendSteps": 256,
     "extendRateThreshold": 5.0,
     "normalizeReward": true,
     "rewardNormClip": 10.0,
-    "targetKl": 0.03,
+    "targetKl": 0.0,
     "valueWarmupUpdates": 0,
-    "_targetKlNote": "KL is measured per live actor after factorization; 0.03 is a conservative PPO early-stop threshold."
+    "_targetKlNote": "KL is diagnostic only. PPO always completes the configured three epochs; clipping, not a KL anchor, defines the policy update."
   }
 }

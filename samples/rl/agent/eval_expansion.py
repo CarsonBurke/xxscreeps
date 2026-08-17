@@ -13,7 +13,7 @@ import argparse
 
 import torch
 
-from .constants import INTENT_SLOTS, INTENT_TYPES, MAX_ACTORS, SCHEMA
+from .constants import INTENT_SLOTS, INTENT_TYPES, MAX_ACTORS, N_BODY_PART, SCHEMA
 from .env_client import ScreepsEnv
 
 
@@ -39,8 +39,8 @@ def validate_scripted_claim(args: argparse.Namespace, claim: int) -> int:
                     raise RuntimeError("teacher claimed without exposing a claim label")
                 if int(info.get("claimDelta") or 0) != 1:
                     raise RuntimeError(f"teacher claim missing claimDelta=1: {info}")
-                if reward < float(SCHEMA["reward"]["roomClaim"]):
-                    raise RuntimeError(f"teacher claim reward={reward} below contract")
+                if reward < 0:
+                    raise RuntimeError(f"teacher claim produced negative H+C reward={reward}")
                 return tick
             if done:
                 break
@@ -106,8 +106,19 @@ def main() -> int:
             shape = (1, MAX_ACTORS, INTENT_SLOTS)
             actions = {
                 key: torch.zeros(shape, dtype=torch.long)
-                for key in ("types", "dirs", "targets", "amounts")
+                for key in (
+                    "types", "dirs", "targets", "amounts", "construction_types",
+                    "construction_tiles",
+                )
             }
+            actions["body_counts"] = torch.zeros(
+                1, MAX_ACTORS, INTENT_SLOTS, N_BODY_PART, dtype=torch.long,
+            )
+            actions["body_order"] = torch.arange(N_BODY_PART, dtype=torch.long).view(
+                1, 1, 1, N_BODY_PART,
+            ).expand(
+                1, MAX_ACTORS, INTENT_SLOTS, N_BODY_PART,
+            ).clone()
             actions["types"][0, actor_idx, 0] = claim if own_reservation else reserve
             actions["targets"][0, actor_idx, 0] = target_idx
             obs, reward, done, info = env.step(actions)
@@ -116,8 +127,8 @@ def main() -> int:
                     raise RuntimeError("claim bypassed the reserve-to-claim contract")
                 if int(info.get("claimDelta") or 0) != 1:
                     raise RuntimeError(f"claim did not emit claimDelta=1: {info}")
-                if reward < float(SCHEMA["reward"]["roomClaim"]):
-                    raise RuntimeError(f"claim reward={reward} below contract")
+                if reward < 0:
+                    raise RuntimeError(f"claim produced negative H+C reward={reward}")
                 teacher_tick = validate_scripted_claim(args, claim)
                 print(
                     f"[eval_expansion] PASS executor_claim_tick={tick} "
