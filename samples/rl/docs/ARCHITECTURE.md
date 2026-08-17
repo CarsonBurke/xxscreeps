@@ -23,7 +23,7 @@ demonstrate reliable economy-funded expansion or control of 64 live creeps.
 flowchart TB
     O["Current observation<br/>4 rooms · 100 actors · 128 targets"]
 
-    subgraph A["Actor — 1,400,998 parameters"]
+    subgraph A["Actor · 1,566,118 parameters"]
         A1["Room patches<br/>100 × 700 uint8 values per room"]
         A2["Spatial transformer<br/>128d · 4 heads · 2 layers"]
         A3["Global + room + actor + target tokens<br/>up to 233 tokens"]
@@ -32,7 +32,7 @@ flowchart TB
         A1 --> A2 --> A3 --> A4 --> A5
     end
 
-    subgraph C["Centralized critic — 1,324,889 parameters"]
+    subgraph C["Centralized critic · 1,490,009 parameters"]
         C1["Independent spatial encoder"]
         C2["Independent entity transformer"]
         C3["Global token → MLP → 409-bin HL-Gauss value"]
@@ -47,9 +47,9 @@ flowchart TB
 
 | Network | Trunk | Head | Total |
 |---|---:|---:|---:|
-| Actor | 1,239,104 | 161,894 | **1,400,998** |
-| Critic | 1,239,104 | 85,785 | **1,324,889** |
-| Combined training model | — | — | **2,725,887** |
+| Actor | 1,239,104 | 327,014 | **1,566,118** |
+| Critic | 1,239,104 | 250,905 | **1,490,009** |
+| Combined training model | 2,478,208 | 577,919 | **3,056,127** |
 
 The actor alone is sufficient for deployment. Actor and critic trunks have the
 same architecture but do not share weights. This isolates the actor
@@ -205,8 +205,8 @@ the restored budget is auditable without an extra step.
 The captured room set is the union of the processor queues, the player's
 intent, presence, and vision rooms, and the seed and expansion rooms. The queues
 alone are not sufficient: a room put to sleep with an infinite wake time belongs
-to neither queue, and player residue that schedules no wake-up — a construction
-site, for example — would then be restored from the pristine imported blob.
+to neither queue, and player residue that schedules no wake-up, a construction
+site for example, would then be restored from the pristine imported blob.
 
 Executor route caches are deliberately not captured. They are per-process
 operational state, cleared by `resetNavigationCaches()` in `env/actions.mjs` at
@@ -225,8 +225,8 @@ with a UTF-8 JSON payload `{"path": str, "events": [str]}`:
 A restore instantiates a fresh shard and applies the captured state to it.
 Expert code is never reloaded, so a state collected while The International was
 driving restores into a plain learner session. Snapshot metadata carries a
-world identity — seed room, expansion room, source count, schema version, and
-the observation and action ABI identifiers — and a restore into a mismatched
+world identity (seed room, expansion room, source count, schema version, and
+the observation and action ABI identifiers), and a restore into a mismatched
 environment fails loudly instead of training on a different world.
 
 Every step reply carries `info.events`, the tags that fired on that tick:
@@ -238,7 +238,7 @@ spawn and extension energy can already afford a useful worker body, and
 `pre_claim` fires when a claim-capable creep exists and a neutral outpost is
 visible. A policy restored at those states must make the decision itself rather
 than inherit the collecting teacher's. The `post_*` tags mark the tick after
-that decision was committed — a spawn body accepted, a controller claimed — and
+that decision was committed, such as a spawn body accepted or a controller claimed, and
 the remaining tags mark the execution and recovery states the decision leads to.
 The remote tags describe the economy, not mere presence: `remote_outbound`
 requires live `CARRY`, `remote_at_source` requires live `WORK` next to a source,

@@ -327,7 +327,7 @@ Run 24 environments as `--start-mix fresh=12,policy=8,teacher=4`:
   lane instead of reverting to tick zero.
 
 Without `--start-mix` the run puts half the fleet in the fresh lane and a third
-of the remainder in the teacher lane, which is this split at 24 environments —
+of the remainder in the teacher lane, which is this split at 24 environments:
 but only when `--teacher-start-states` is also passed. Without a teacher
 directory the teacher lane is empty and those environments join the policy
 lane.

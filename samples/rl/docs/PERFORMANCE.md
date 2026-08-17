@@ -54,7 +54,7 @@ transitions at twelve environments and minibatch 384 decomposes as roughly
 independent of environment count), 10.5 s of environment stepping, and 16.4 s of
 PPO update (36,864 sample-passes at about 2,250 per second). Collection is no
 longer the limiter, so the next real gains are a larger optimizer minibatch when
-the device is free, or CUDA graphs for the per-step forward — not a faster
+the device is free, or CUDA graphs for the per-step forward, rather than a faster
 environment driver.
 
 Observation payload is 201 KB per environment tick: 140 KB of spatial patches
@@ -82,7 +82,7 @@ tick path, plain eager on the minibatch path. That split is the result of four
 measured failures, all worth keeping written down.
 
 What is checked every run: after warmup `PPOTrainer.graph_stats()` reports
-**four unique graphs, zero graph breaks, and zero late shape mints** — actor and
+**four unique graphs, zero graph breaks, and zero late shape mints**: actor and
 critic, at both room packs, all captured before the first timed rollout.
 `_note_shape` records every `(call site, shape)` a compiled graph is asked for
 and prints any that appears after warmup, so a recompile stall is attributed
@@ -118,7 +118,7 @@ Four defects had to be fixed, and one design attempt had to be abandoned:
 - Room capacity had a one-room bucket, and the live count reaches `MAX_ROOMS`
   once expansion exposes neighbors. Two buckets remain, `(2, MAX_ROOMS)`, and
   `warmup` captures the tick path at both. Before that, six graphs were minted
-  mid-run — 43 s inside a timed optimizer step in the worst case.
+  mid-run, costing 43 s inside a timed optimizer step in the worst case.
 - Host rollout storage packs rooms to its own capacity, which can sit below the
   model bucket, so `_compact_entity_prefixes` pads up to the bucket instead of
   handing the model a third room shape.
