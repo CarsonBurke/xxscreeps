@@ -43,9 +43,11 @@ const processRoomsPendingKey = (time: number) =>
 	`tick${time}/processRoomsPending`;
 const finalizedRoomsPendingKey = (time: number) =>
 	`tick${time}/finalizedRoomsPending`;
-const intentsListForRoomKey = (roomName: string) =>
+// Cross-tick intent lists survive a tick boundary, so state capture/restore
+// tooling (see samples/rl) must be able to name them exactly.
+export const intentsListForRoomKey = (roomName: string) =>
 	`rooms/${roomName}/intents`;
-const finalIntentsListForRoomKey = (roomName: string) =>
+export const finalIntentsListForRoomKey = (roomName: string) =>
 	`rooms/${roomName}/finalIntents`;
 
 const SCardStore = new KeyvalScript(
