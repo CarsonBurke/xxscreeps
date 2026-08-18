@@ -31,7 +31,9 @@ waste, invalid actions, and overflow.
 Before collecting a serious pretraining or PPO run:
 
 - all synthetic learning, action, schema, artifact, and architecture contracts pass;
-- the fixed-seed 20,000-tick scripted economy expands from empty with zero engine-invalid teacher intents;
+- the fixed-seed 20,000-tick teacher economy expands from empty, and its
+  liveness record shows the expert acting on at least 50% of graded ticks with
+  no silence longer than 30 consecutive ticks;
 - cross-room navigation and reserve/claim execute in the real engine and emit the claim diagnostic;
 - rewarded delivery cannot be recycled through a legal withdrawal path;
 - the current semantic schema and all ABI identifiers match the artifact exactly;
@@ -43,6 +45,7 @@ simulator, spawn-body contract, or teacher:
 
 ```bash
 export RL_NODE="$(mise exec node@24 -- which node)"
+export CUDA_VISIBLE_DEVICES=
 
 python3 -m samples.rl.agent.test_latent_unit
 python3 -m samples.rl.agent.eval_scripted \
@@ -51,21 +54,74 @@ python3 -m samples.rl.agent.eval_expansion --ticks 500
 python3 -m samples.rl.agent.eval_reward_contract
 ```
 
-Aggregate reward is insufficient. The scripted gate must establish zero
-rejected labels and actual post-tick resource effects, not merely successful
-navigation toward a target.
+These contracts are CPU-only by construction, and `CUDA_VISIBLE_DEVICES=` is
+part of the command rather than an optimization: a torch process that
+initializes CUDA reserves an enormous virtual address space and tens of
+gigabytes of page tables on this host, so running several of them concurrently
+has OOM-killed the machine. Run one contract process at a time, in the
+foreground; anything that genuinely needs a GPU goes through `mlq`.
+
+Cap that with a *soft* limit only (`ulimit -Sv 12000000`, not `ulimit -v`). The
+limit exists to bound torch's host reservations; the simulator has the opposite
+profile. V8 reserves heap cages, every WebAssembly instance reserves gigabytes
+of address space it never makes resident, and the in-engine teacher loads WASM,
+so a hard cap kills the environment server with
+`WebAssembly.Instance(): Out of memory` while resident use stays small. Spawned
+environments raise their own soft limit back to the hard limit for that reason.
+
+Aggregate reward is insufficient. The teacher gate must establish a live expert,
+labels validated against the tick that produced them, and actual post-tick
+resource effects, not merely successful navigation toward a target.
+`eval_scripted` is the hand-written baseline the learned policy is compared
+against; it is not a teacher and its labels never enter training.
+
+## The teacher is configured for the observation ABI
+
+The International plays a larger game than the observation can hold. With stock
+radii - `maxRemoteRoomDistance = 5` and unbounded scouting - it runs a 7-to-8
+room, 111-to-122 creep colony on this map: measured over three 20,000-tick
+lifecycles a room the bot held stake in was dropped on 74-86% of ticks (first at
+tick 571-1,389), 3.5-5.5 creeps per tick sat outside the action space, live
+creeps exceeded `maxCreepActors` from tick 2,201-10,577, and targets exceeded
+`maxTargets` from tick 5,752-10,401. Those ticks label creeps in rooms the
+observation does not contain, so the corpus would supervise actions whose subject
+is invisible.
+
+The teacher is therefore built with `maxRemoteRoomDistance = 1` **and**
+`maxScoutRoomDistance = 1` (`src/constants/general.ts` in the bot checkout;
+`npm run build` reproduces the shipped bundle byte-for-byte, so the change is
+auditable). Two 20,000-tick episodes under those radii dropped no owned or mined
+room at any tick, cut hidden creeps to 0.4-0.6 per tick, and reduced room-slot
+pressure from 83-86% of ticks to 29%, all scouts. The creep cap then binds first,
+at tick 2,666-3,638, which is where teacher supervision and bridge snapshots stop
+being faithful.
+
+`schema.json` declares both required values under `teacher`, and collection reads
+the constants back out of the executed bundle: `CorpusConfig.validate` and the
+snapshot collector's config both fail before a run starts when the loaded teacher
+disagrees. Corpus meta records `ti_room_radii` beside the bundle hash, so an
+artifact states which teacher configuration produced it.
+
+Teacher runs are not reproducible, and no gate may assume they are. A virtual
+player clock and canonical room ordering removed the host leaks (see
+[`DECISIONS.md`](./DECISIONS.md#a-reproducible-teacher-needs-a-virtual-clock-and-canonical-room-order)),
+which made short twins bit-identical, but longer twins still diverge inside the
+player realm. Compare teacher-derived numbers across repeated seeds, never as
+single-run replays. The learner path is reproducible, including restored
+snapshots, and that is what the reservoir depends on.
 
 ## Same-stream pretraining
 
-The International supplies the strongest value/representation trajectories and
-an exact conservative actor-label subset captured from raw engine intents.
-In-range target commands, construction, and spawn compositions are used only
-when they map exactly. Spawn ordering is included only for bodies already
-grouped into contiguous part-type blocks; interleaved bodies supervise their
-exact counts but not a different order. Immediate moves, concurrent commands,
-and unsupported commands are rejected, never relabeled as `none`. The scripted
-planner still supplies complete one-slot macro labels and the end-to-end
-expansion qualification stream.
+The International supplies every label and every value trajectory. Its raw
+engine intents are captured at the runner boundary and translated into macro
+action factors; in-range target commands, construction tiles, and spawn
+compositions are supervised only where they map exactly. Spawn type and body
+counts are exact; ordering is supervised only for bodies already grouped into
+contiguous part-type blocks, and interleaved bodies supervise counts but not a
+different order. Immediate moves, concurrent commands, and unsupported commands
+are rejected, never relabeled as `none`. Supervision is therefore partial by
+construction: a per-tick eligibility mask records which factors the teacher
+actually decided, and the loss reads no other factor.
 
 ```bash
 mlq submit --name screeps-ti-critic --max-parallel-runs 1 --cwd "$PWD" -- \
@@ -78,15 +134,16 @@ mlq submit --name screeps-ti-critic --max-parallel-runs 1 --cwd "$PWD" -- \
 
 The TI critic is an optional experiment, not a prerequisite. It qualifies only
 on a fresh full-length TI trajectory where explained variance is positive and
-absolute error beats the constant-return baseline by at least 10%. The long
-horizon makes endpoint bootstrapping negligible at `gamma=0.995`; a low
+absolute error beats the constant-return baseline by at least 10%. The declared
+20,000-tick horizon still makes endpoint bootstrapping negligible at
+`gamma=0.9995` (`0.9995^20000 = 4.5e-5`); a low
 training loss or a biased, nearly constant prediction remains insufficient. Do
 not pass an unqualified artifact into joint pretraining.
 
 Behavior cloning and critic adaptation consume a reusable immutable corpus:
 
 ```text
-scripted state/action/reward         independent TI reward streams
+teacher state/action/eligibility        independent TI reward streams
         |                    |                    |
         v                    v                    v
 per-factor masked CE     discounted reward-to-go (zero endpoint)
@@ -96,22 +153,24 @@ per-factor masked CE     discounted reward-to-go (zero endpoint)
                    complete joint-pretrain artifact
 ```
 
-The standalone collector first completes the whole scripted and TI lifecycles.
+The standalone collector first completes the whole teacher lifecycle.
 A bounded
 per-stage/state/action reservoir preserves examples across early, middle, and
-late economy phases; every optimization epoch globally shuffles the scripted
-corpus for actor BC and final critic fitting. Returns are full finite-horizon reward-to-go,
+late economy phases; every optimization epoch globally shuffles the corpus for
+actor BC and final critic fitting. Returns are full finite-horizon reward-to-go,
 not bootstrapped from the critic being trained. A separate full-lifecycle fleet
 under independent seeds is never optimized and supplies the promotion EV. TI
 critic rows have their own independent full-return train and holdout splits and
-are used once to initialize value representation before actor-aligned scripted
+are used once to initialize value representation before actor-aligned factor
 fitting. Repeating their behavior-policy-dependent returns would create a
-contradictory value target. Unlabeled TI rows never enter actor BC. Exactly
-representable TI action factors remain a separate actor-only auxiliary lane.
+contradictory value target. Ticks on which the teacher issued nothing carry an
+all-false eligibility mask and contribute only a critic target and a temporal
+row.
 Corpus storage schema v3 also retains a separately bounded temporal replay
 directly from
 same-tick `(observation, complete joint action, next observation)` triples for
-both scripted train and independently seeded holdout fleets. It never joins
+both the teacher train fleet and an independently seeded holdout fleet. It never
+joins
 reservoir rows after collection. Episode-ending rows are excluded before the
 vector environment's reset observation can become a false target, with terminal
 and truncation exclusions recorded in the content hash and manifest provenance.
@@ -204,7 +263,7 @@ select a directory when multiple corpora exist.
 
 If only the six one-step spawn scenarios change without an observation/action
 ABI or long-lifecycle teacher change, derive a new immutable corpus rather than
-recollecting 640,000 scripted transitions and both TI streams:
+recollecting every teacher lifecycle and both TI streams:
 
 ```bash
 python3 -m samples.rl.agent.refresh_spawn_contract_corpus \
@@ -226,25 +285,39 @@ mlq submit --name screeps-joint-pretrain --max-parallel-runs 1 --cwd "$PWD" -- \
 
 A release-qualified artifact requires:
 
-1. full teacher factor legality and zero engine-invalid issued intents;
+1. full teacher factor legality: every retained label validated against the
+   candidate masks of the tick that produced it. There is no engine-invalid
+   teacher-intent gate, because `step_expert` returns no intent summary — the
+   bot issues its intents inside the engine and the wire never sees an
+   issued/invalid count. Teacher wakefulness is gated at collection by the
+   liveness record instead;
 2. finite actor and critic losses with per-factor coverage diagnostics;
 3. a separate actor-only rare-intent lane that balances
    `createConstructionSite` and `claimController` actors and averages selected
-   semantic factors within each actor. Construction supervises intent and
-   structure type, not the teacher's arbitrary legal tile; claim supervises
-   intent and controller target. Both train and holdout require NLL ≤1.0 and
-   deterministic semantic-factor accuracy ≥0.8 for each intent;
-4. exact spawn-body supervision for economy, logistics, work, and claim
-   compositions across ≤300, 301–549, 550–649, and ≥650 energy contexts and
-   short (≤6), medium (7–15), and long (≥16) bodies;
+   semantic factors within each actor. Construction supervises intent, structure
+   type, and the exact tile the teacher built on — a demonstration is a structure
+   at a position, and construction is rare enough (a few hundred rows against
+   tens of thousands) that the corpus mean cannot carry placement; claim
+   supervises intent and controller target. Both train and holdout require NLL
+   ≤1.0 and deterministic semantic-factor accuracy ≥0.8 for each intent;
+4. exact spawn-body supervision across the ≤300, 301–549, 550–649, and ≥650
+   energy-budget buckets, and across the body-length buckets the teacher can
+   actually reach. Measured over the six contract worlds: budgets 1/1/1/3, and
+   lengths ≤6 = 3, 7–15 = 3, ≥16 = 0. The ≥16 bucket is recorded as a named
+   unreached gap (`teacher_spawn_length_unreached_ge16`,
+   `_spawn_replay_length_unreached_ge16`) rather than required: the engine
+   charges at least 50 energy per part, so a 16-part body needs 800+ energy in
+   one spawn, which these RCL1–RCL2 curricula never fund. A seeded higher-RCL
+   curriculum promotes it back to fatal by moving one tuple entry. Any reachable
+   bucket that comes back empty still fails;
 5. affordable ordered body labels with zero invalid spawn executions;
 6. per-scenario held-out spawn semantic NLL ≤1.5 plus a successful
    deterministic engine spawn of the exact intended ordered body;
 7. positive aggregate and per-curriculum critic explained variance on the
-   never-optimized scripted full-return holdout. TI value rows are a one-time
-   representation initialization from a different behavior policy; their EV
-   after actor-aligned scripted fitting is diagnostic, not a contradictory
-   release gate. The short fresh-reset critic metric is also diagnostic;
+   never-optimized full-return teacher holdout. Value rows and action labels now
+   come from the same behavior policy, so this holdout is a release gate rather
+   than a cross-policy diagnostic. The short fresh-reset critic metric remains
+   diagnostic;
 8. an `empty` teacher trajectory that independently delivers, constructs,
    reaches the declared population gate, and funds a room claim;
 9. deterministic learned-policy reproduction on a third, never-collected seed
@@ -261,20 +334,26 @@ A release-qualified artifact requires:
 13. an atomic checkpoint marked `partial=false, qualified=true`.
 
 Partial checkpoints are resumable pretraining state but cannot start PPO.
-The focused spawn contract exercises six distinct body archetypes, four energy bands, and
-three body-length bands through the real engine:
+The focused spawn contract measures what the teacher decides rather than
+comparing it against a frozen archetype: in each of the six worlds it snapshots
+the pre-decision state, takes the teacher's body from the tick it labelled, then
+restores that exact world into a learner session and requires the engine to
+spawn the measured body. At the labelled tick every world is one idle spawn
+holding the energy its name advertises — TI removes the seeded context creeps
+and the builder world's construction site within two ticks and decides at tick
+seven — so the gate asserts spawn legality and funded budget, and reports the
+context counts as telemetry:
 
 ```bash
 mlq submit --name screeps-spawn-pretrain-contract --max-parallel-runs 1 --cwd "$PWD" -- \
   python3 -m samples.rl.agent.eval_spawn_contract
 ```
 Pretraining resume reloads the same validated corpus and restores model,
-optimizer, global RNG, general shuffle RNG, and isolated rare-intent shuffle
-RNG state, plus the dedicated DAgger and NextLat shuffle streams. The isolated
-streams ensure auxiliary oversampling cannot perturb lifecycle or temporal
-minibatch order. Configuration, temporal objective, row counts, or corpus
-identity drift is rejected, while the requested target epoch may be increased
-beyond the completed epoch. Fresh
+optimizer, global RNG, general shuffle RNG, and the isolated rare-intent, spawn
+and NextLat shuffle streams. The isolated streams ensure auxiliary oversampling
+cannot perturb lifecycle or temporal minibatch order. Configuration, temporal
+objective, row counts, or corpus identity drift is rejected, while the requested
+target epoch may be increased beyond the completed epoch. Fresh
 teacher-forced and full closed-loop
 qualification still run after optimization; these policy-dependent checks are
 never cached in the corpus.
@@ -282,18 +361,41 @@ never cached in the corpus.
 ## PPO
 
 The current PPO implementation sums active action-argument log-probabilities
-within each creep, clips a likelihood ratio per live creep, averages creeps
-within a transition, then averages transitions. All creeps use the shared team
-advantage. This keeps team states equally weighted across population sizes, but
-it is an engineering choice rather than the only mathematically correct team
-objective. Full-team and semantic-group ratios are required ablations in
-[`ROADMAP.md`](./ROADMAP.md#joint-policy-ratio-ablation).
+within each creep and clips a likelihood ratio per live creep. The surrogate
+is then reduced token-level in the DAPO/VAPO sense (eq. 7): every live actor
+decision in the minibatch is summed and divided by the total number of live
+actors, so a 40-creep tick carries ten times the weight of a 4-creep tick. It
+previously averaged creeps within a transition and then averaged transitions,
+which weighted both ticks equally and left the states carrying most of the
+colony's decisions least able to correct them. All creeps still use the shared
+team advantage, which remains an engineering choice rather than the only
+mathematically correct team objective; full-team and semantic-group ratios are
+required ablations in
+[`ROADMAP.md`](./ROADMAP.md#joint-policy-ratio-ablation). The ratio
+diagnostics — approximate KL and clip fraction — stay per team state so their
+scale remains comparable across runs.
 
 Other implemented contracts:
 
-- PPO `gamma=0.995`;
-- one CleanRL-style GAE with `lambda=0.95`: the actor uses its advantage and
-  the critic target is exactly `advantage + behavior_value`;
+- PPO `gamma=0.9995`;
+- decoupled GAE (VAPO §4.1): the critic target is the `lambda=1` return, which
+  under the truncation bootstrap above is the discounted Monte-Carlo return over
+  the segment, while the actor uses advantages at a length-adaptive
+  `lambda_policy = 1 - 1/(alpha*l)` (VAPO eq. 5) with
+  `gaeLambdaPolicyAlpha=0.5` and `l` the mean transitions per uncut segment
+  that environment collected. At a full 2048-transition segment - the largest
+  horizon host RAM allows at four live rooms - this is
+  `lambda_policy=0.99902`, a credit window of `1/(1-gamma*lambda)=677` ticks
+  against 18 under the previous single `lambda=0.95`; the critic target's window
+  is `1/(1-gamma)=2000`;
+- a positive-example NLL term (VAPO eq. 9-10) at `selfImitationCoef=0.1` over
+  the transitions of the environments whose per-segment return sits at or above
+  the `selfImitationQuantile=0.8` quantile of that rollout's segment returns.
+  The threshold is relative and recomputed per rollout, because a dense reward
+  has no verifier to define a correct sample;
+- `groupStartsPerState=2` environments begin each rollout from the same
+  reservoir start state (VAPO §4.3 group sampling), grouped within a lane so a
+  fresh-lane environment still runs an untouched full lifecycle;
 - critic pretraining uses finite-horizon discounted reward-to-go at the same
   gamma; supervised actor BC has no temporal return estimator, while both
   trunks receive action-conditioned one-step latent prediction;
@@ -327,10 +429,10 @@ Run 24 environments as `--start-mix fresh=12,policy=8,teacher=4`:
   lane instead of reverting to tick zero.
 
 Without `--start-mix` the run puts half the fleet in the fresh lane and a third
-of the remainder in the teacher lane, which is this split at 24 environments:
-but only when `--teacher-start-states` is also passed. Without a teacher
-directory the teacher lane is empty and those environments join the policy
-lane.
+of the remainder in the teacher lane, which reproduces this split at 24
+environments - but the teacher lane is populated only when
+`--teacher-start-states` is also passed. Without a teacher directory those
+environments join the policy lane.
 
 A stratum is `(lane, event, phase, outcome)`. Events are the environment tags
 in [`ARCHITECTURE.md`](./ARCHITECTURE.md#environment-state-snapshots) plus a
@@ -372,9 +474,11 @@ Teacher bridging is temporary and retires per phase. Once the policy lane holds
 at least 32 records spanning at least 3 distinct events in a phase, that
 phase's teacher strata stop being sampled.
 
-Collect the bridge sets once, before PPO. The scripted planner supplies the
-late-economy bridge, because it stays inside the observation ABI for the whole
-horizon:
+Collect the bridge sets once, before PPO. A start state is a world, not a label:
+the policy chooses every action from it, so a bridge set may be generated by any
+driver that reaches interesting states. The hand-written planner supplies the
+late-economy bridge, because it is the only driver that stays inside the
+observation ABI for the whole horizon:
 
 ```bash
 python3 -m samples.rl.agent.teacher_snapshots \
@@ -388,8 +492,9 @@ Measured: 464 records, none dropped by restore verification, 1.92 MB, phases
 `early=85 mid=135 late=148 endgame=96`, eight event tags including
 `replacement_due=103` and `remote_loaded_home=61`, and zero overflow rejections.
 
-The International is a second, optional set and covers only the opening of the
-economy. Collect it with at most two concurrent environments:
+The International, the label teacher, is a second and optional set. It plays
+well enough to outgrow the observation capacity, so it covers only the opening
+of the economy. Collect it with at most two concurrent environments:
 
 ```bash
 python3 -m samples.rl.agent.teacher_snapshots \
@@ -405,7 +510,7 @@ Both limits are recorded in [`ROADMAP.md`](./ROADMAP.md#immediate-learning-block
 
 The collector prints one content-addressed directory holding `manifest.json`
 and the snapshots it indexes. Pass each directory with its own
-`--teacher-start-states`; the flag is repeatable because different teachers
+`--teacher-start-states`; the flag is repeatable because different drivers
 cover different phases. Records are imported by reference and are never evicted
 or deleted by a training run.
 
@@ -464,7 +569,7 @@ both source fingerprints. This override is not a promotion.
 ```bash
 mlq submit --name screeps-ppo --max-parallel-runs 1 --cwd "$PWD" -- \
   uv run --project samples/rl python -m samples.rl.agent.train \
-    --num-envs 12 --steps 512 --max-rollout-steps 512 --minibatch 1536 \
+    --num-envs 12 --steps 2048 --max-rollout-steps 2048 --minibatch 1024 \
     --max-episode 20000 --device cuda --seed 3 --compile \
     --curriculum empty,seed_creep,seed_full,seed_claimer,seed_outpost \
     --start-mix fresh=6,policy=4,teacher=2 \
@@ -475,6 +580,23 @@ mlq submit --name screeps-ppo --max-parallel-runs 1 --cwd "$PWD" -- \
     --allow-unqualified-joint \
     --save samples/rl/runs/policy_v4.pt
 ```
+
+Every number in that command is measured, and two of them are hard ceilings.
+
+`--minibatch 1024` is the largest update that fits. Measured at observation-ABI
+capacity (4 live rooms, 64 live actors, 128 candidates) on a 31.4 GiB RTX 5090,
+a complete update peaks at 2.2 GiB at minibatch 128 and scales linearly to
+16.5 GiB allocated / 17.7 GiB reserved at 1024; 1536 and 2048 both OOM. The
+earlier documented `--minibatch 1536` was never run against full actor rows and
+is not viable.
+
+`--steps 2048` is bounded by host RAM, not VRAM. `HostRolloutBuffer` needs
+15.8 GiB for 24 environments x 2048 steps once environments hold 4 live rooms
+(6.2 GiB at one room), and 31.5 GiB at 4096 steps - more than this box has free.
+A 4096-step horizon therefore requires either 16 environments or worlds that
+stay under two live rooms, which restored mature starts do not. The trainer
+prints the projection before allocating; a run that has to shrink mid-flight has
+already failed.
 
 Twelve environments and `--compile` are both measured choices, recorded in
 [`PERFORMANCE.md`](./PERFORMANCE.md#optimizer-batch-and-compilation): the box

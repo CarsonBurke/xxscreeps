@@ -98,7 +98,8 @@ Minibatch is transitions per optimizer step, and a transition here is a whole
 team state: two room patch planes, up to 100 actor rows, 128 targets, and the
 masks, driven through a spatial transformer and a 233-token entity transformer
 with conditional heads per actor. Measured activation cost is about 15 MB per
-transition, so the schema default of 1536 peaks near 13.6 GB.
+transition at the occupancy those runs saw, and about 16 MiB per transition at
+full ABI capacity, which is what sets the schema default of 1024.
 
 Sizing the minibatch down to survive alongside another job is a false economy:
 at twelve environments and 512 steps, minibatch 1536 runs an update in 17.5 s
@@ -131,6 +132,41 @@ Collection, which is 60% of an update, runs 1.7x faster. The tick path is where
 that comes from: `act` and `value_only` are called once per simulated tick at
 B=12, thousands of launch-bound calls per update, which is exactly what
 `reduce-overhead` removes.
+
+### The measured ceiling is at capacity, not at typical occupancy
+
+The table above is honest about what those runs did and misleading as a launch
+budget, because `_compact_entity_prefixes` slices entity tensors to the smallest
+bucket that holds the live population (8/16/32/64/100 actors, 16/32/64/128
+targets, 1/2/4 rooms). A colony of thirty creeps trains in the 32-actor bucket,
+so an update costs a fraction of what the ABI allows. Restoring mature start
+states moves occupancy up, and the configuration has to survive the top bucket.
+
+Measured directly at capacity (4 live rooms, 100 actor rows with 64 creeps, 128
+candidates, every mask live) through a complete update with both optimizers and
+the same bf16 autocast, on a 31.4 GiB RTX 5090:
+
+| minibatch | peak allocated | peak reserved |
+|---:|---:|---:|
+| 128 | 2.19 GiB | 2.54 GiB |
+| 256 | 4.26 GiB | 4.58 GiB |
+| 384 | 6.30 GiB | 6.64 GiB |
+| 512 | 8.35 GiB | 9.47 GiB |
+| 768 | 12.45 GiB | 13.16 GiB |
+| 1024 | 16.54 GiB | 17.71 GiB |
+| 1536 | OOM | OOM |
+| 2048 | OOM | OOM |
+
+Cost is linear in minibatch at about 16 MiB per capacity transition, which
+matches the 15 MB per-transition estimate above; what changed is that the
+estimate is now anchored to the worst bucket rather than the observed one. The
+usable ceiling is therefore **minibatch 1024**.
+
+Host memory binds the horizon separately. `HostRolloutBuffer.projected_bytes`
+at four live rooms needs 3.9 GiB for 24x512, 15.8 GiB for 24x2048, and 31.5 GiB
+for 24x4096; at one live room the same shapes need 1.5 / 6.2 / 12.3 GiB. With
+about 35 GiB free on this box, a 4096-step horizon is only reachable at 16
+environments or in worlds that stay under two live rooms.
 
 Four defects had to be fixed, and one design attempt had to be abandoned:
 
@@ -182,14 +218,14 @@ magic "XRL1" | version u8 | flags u8 | schema_version u16 little-endian
 XRL1 response version: 4
 
 flags: bit0=ok, bit1=done, bit2=has_observation,
-       bit3=has_scripted_teacher_actions
+       bit3=has_action_tail
 
 blob order:
   u8:  patches
   f32: actors, targets, roomCoords
   u8:  roomMask, actorMask, actorOutcome, targetMask,
        intentMask, dirMask, targetSelectMask, amountMask, constructionMask
-  when bit3 is set, a trailing teacher-action payload:
+  when bit3 is set, a trailing action payload:
     u8:  types, dirs, targets, amounts, constructionTypes
     u16: constructionTiles (little-endian)
     u8:  bodyCounts[8], bodyOrder[8]
@@ -202,11 +238,14 @@ this is 2,300 payload bytes, still deterministic and
 allocation-light compared with nested JSON.
 
 `step_scripted` responses use the same 23-byte actor-slot plane layout in a
-binary tail. Metadata carries only `teacherActions: {rows, slots, byteLength}`;
-the nested `info.actions` object remains available only in JSON debug response
-formats. The client requires an exact length, validates every categorical and
-body-order invariant, and slices the teacher tail before observation decoding.
-There is intentionally no XRL1 v3 compatibility path.
+binary tail, carrying the scripted baseline's chosen planes. Metadata carries
+only `teacherActions: {rows, slots, byteLength}`; the nested `info.actions`
+object remains available only in JSON debug response formats. The client
+requires an exact length, validates every categorical and body-order invariant,
+and slices the tail before observation decoding. There is intentionally no XRL1
+v3 compatibility path. Behaviour-cloning labels never use this tail:
+`step_expert` returns the expert's captured intents as `expertIntents`,
+`expertActorMeta`, and `expertTargetMeta` metadata instead.
 
 The server sends only active room patches plus `roomsUsed`; Python pads to the
 four-room model ABI. Host masks and spatial patches remain uint8 until bulk
@@ -228,14 +267,30 @@ change requires a real environment round-trip contract.
 ## Rollout storage
 
 `HostRolloutBuffer` preallocates dense non-spatial state but stores only active
-uint8 room pages in reusable 256-page chunks. The default rollout is 512 steps
-across 24 environments: 12,288 transitions. It uses a 1,536-transition
-minibatch, exactly eight minibatches per epoch, and three PPO epochs. The room
-page store grows only with rooms actually represented. The 16 spawn
-count/order values are uint8 on host.
+uint8 room pages in reusable chunks. The default rollout is 4096 steps across 24
+environments: 98,304 transitions. It uses a 1,536-transition minibatch, so
+exactly 64 minibatches per epoch and three PPO epochs, 192 optimizer steps per
+update. The room page store grows only with rooms actually represented. The 16
+spawn count/order values are uint8 on host.
 
-The normal schema allows one 256-step extension up to a 1,024-step cap. For
-predictable wall-clock jobs, pass equal `--steps` and `--max-rollout-steps`.
+Chunk size is derived from the rollout rather than fixed at 256 pages, because
+every minibatch gather runs one host `index_copy_` per chunk its rows touch: at
+a fixed 256 pages that loop grew with the horizon, roughly 32 chunks at 512×24
+and 384 at 4096×24 with one live room. Sizing chunks from `t_max × n_envs`
+(2048 pages at 4096×24, capped there) holds it near 48. Page ids are int32 in
+`patch_refs` and the store refuses to outgrow that range rather than wrapping
+into another transition's rooms.
+
+The horizon dominates host RAM: a filled 4096×24 rollout projects 12.3 GiB at
+one live room and 31.5 GiB at four, against 1.5 GiB for the old 512-step
+default. `HostRolloutBuffer.projected_bytes` reports this and the trainer prints
+it, plus a warning when the four-room projection exceeds available memory,
+before the collector starts filling: the failure mode is otherwise an OOM kill
+thousands of ticks into an update with the whole rollout lost.
+
+The schema now sets `rolloutSteps` equal to `maxRolloutSteps`, so the adaptive
+256-step extension never triggers; for predictable wall-clock jobs at a
+different horizon, keep passing equal `--steps` and `--max-rollout-steps`.
 Observation host mirrors avoid a full device-to-host copy on every step. The
 construction legality field is itself bit-packed: four rooms × seven types ×
 313 bytes rather than a dense 70,000-byte mask.
@@ -267,7 +322,9 @@ Actions and behavior log-probabilities share one reusable pinned GPU-to-host
 staging barrier. Those exact host action planes feed both Node and rollout
 storage, avoiding duplicate transfers. Reward/done stay on the host. One
 CleanRL-style GAE recurrence computes both actor advantages and critic returns
-on CPU instead of bouncing a small trajectory through CUDA.
+on CPU instead of bouncing a small trajectory through CUDA. VAPO's decoupled GAE
+runs that recurrence twice, once per lambda; measured at 4096×24 on one thread
+that is 196 ms against 105 ms, which is noise beside a multi-minute update.
 
 The behavior actor world latent shares that same D2H barrier. The deferred
 critic pass returns its scalar value, world latent, and value logits together.

@@ -157,6 +157,33 @@ withdraw amounts are conditioned on the selected target's
 available energy or capacity. Cross-room goals are available to mobile creeps;
 structure actors remain room-local.
 
+### Teacher labels
+
+Behaviour-cloning labels come from The International running inside the engine
+as a real player. `env/server.mjs` captures its raw intent payload at the runner
+boundary before engine processing, `agent/ti_intents.py` translates the exactly
+representable intents into this action ABI, and `pretrain_corpus.TiLabeller`
+decides which factors of each tick are supervised.
+
+Three properties are load-bearing:
+
+- **Partial supervision.** Every row carries a bool eligibility mask shaped
+  `[1, actors, 6 + 2 × 8]` over the intent, direction, target, amount,
+  construction type, construction tile, and body count/order factors. Only
+  eligible factors enter the loss. 83.8% of measured teacher decisions are
+  representable; the rest are dropped with a named counter.
+- **Legality is checked at the tick that produced the label.** A label whose
+  target, amount, or construction tile is not in that tick's candidate mask is
+  dropped, never admitted by widening the mask.
+- **Late attribution.** Raw movement is not a macro action, so an approach is
+  held in a 50-tick per-environment window and retro-labelled to the harvest,
+  transfer, or claim it served once that action completes. Rows leave the
+  labeller only when no later action can still claim them, which is why the
+  collector commits per environment rather than per tick.
+
+The hand-written planner in `env/scripted_baseline.mjs` is an evaluation
+baseline only (`agent/eval_scripted.py`) and produces no label.
+
 ### Critic
 
 The centralized critic receives every room, actor, target, and global feature
@@ -219,8 +246,8 @@ with a UTF-8 JSON payload `{"path": str, "events": [str]}`:
 
 | Opcode | Command | Reply |
 |---:|---|---|
-| 9 | `snapshot` | writes the file, returns `info.snapshot` with path, bytes, tick, step, rooms, curriculum, expert flag, and event tags; no observation |
-| 10 | `restore` | a `reset` reply, plus `info.restored`, `info.snapshotTick`, and `info.step` |
+| 8 | `snapshot` | writes the file, returns `info.snapshot` with path, bytes, tick, step, rooms, curriculum, expert flag, and event tags; no observation |
+| 9 | `restore` | a `reset` reply, plus `info.restored`, `info.snapshotTick`, `info.step`, and the restored world's own `info.curriculum` |
 
 A restore instantiates a fresh shard and applies the captured state to it.
 Expert code is never reloaded, so a state collected while The International was

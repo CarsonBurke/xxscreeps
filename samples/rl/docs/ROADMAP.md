@@ -5,23 +5,65 @@ This file contains unresolved work. Implemented behavior belongs in
 [`TRAINING.md`](./TRAINING.md), and settled conclusions in
 [`DECISIONS.md`](./DECISIONS.md).
 
+## Consequences of a single real teacher
+
+Cloning only The International removes label sources we authored ourselves and
+leaves three open items. None is a regression to be patched; each is a
+capability the scripted planner faked.
+
+1. **On-policy correction has no teacher.** DAgger relabelled learner-visited
+   states with the scripted planner. A black-box bot cannot be asked what it
+   would do in a state it never reached, so the scripted DAgger and outpost
+   actor supplement corpora were deleted rather than kept as a second label
+   source. The honest replacement uses machinery that now exists: snapshot a
+   learner-visited state, restore it into an expert session, step the bot one
+   tick, and capture its intents through the same labeller. Cost is one process
+   boot plus one tick per correction, so it belongs in a batched offline pass,
+   not the PPO loop. Until then, correction after cloning comes only from PPO.
+
+2. **Body-length coverage is bounded by the simulated economy.** The old
+   `ge16`-part coverage bucket was reachable only because a hand-written teacher
+   could be told to emit any body in a 3,000-energy world. The real teacher
+   spawns what its RCL affords: at the RCL1-RCL2 economy this stack simulates, a
+   16-part body needs 800+ energy and never appears. Its measured contract
+   bodies span 300-850 energy and 5-11 parts. Recovering that bucket needs a
+   seeded RCL6+ scenario with extensions, not a relaxed gate; the gate records
+   the unreached bucket explicitly so it can be promoted back to fatal.
+
+3. **Placement supervision is now the teacher's, not ours.** Construction tile
+   labels come from where the bot actually built. That is a real placement
+   distribution rather than an arbitrary legal tile, and it is the first time
+   this stack can measure whether placement is learnable at all. Whether the
+   policy reproduces the teacher's base plan is an open measurement.
+
 ## Immediate learning blockers
 
 Before another substantial PPO continuation:
 
 0. **Investment behaviour is unfunded, and the cause is not established.**
-   `gamma=0.995` gives an effective horizon of 200 ticks on a 20,000-tick
-   problem, and construction and claiming both repay well beyond it. That makes
-   discounting a candidate explanation for their suppression, not a finding.
+   The credit window was the first candidate and it has now been changed, but
+   nothing has been measured under the change yet. `gamma=0.995` with a single
+   `lambda=0.95` gave a credit window of `1/(1-gamma*lambda)=18` ticks — the
+   discount alone allowed 200 — on a 20,000-tick problem where construction and
+   claiming repay over thousands. The objective now runs `gamma=0.9995` with
+   VAPO decoupled GAE: a length-adaptive `lambda_policy` worth a 677-tick
+   window at a full 2048-transition segment (the largest horizon host RAM allows
+   at four live rooms), and a `lambda=1` critic target
+   whose window is `1/(1-gamma)=2000`. Whether that funds investment is an open
+   measurement, not a finding.
 
    The obvious counterexample has to be accounted for by any explanation:
    spawning is delayed payoff too, since a body costs about 300 energy and
    repays over a ~1,500-tick life, and it was retained under the same discount
    (`spawnCreep` intents at 0.85x of their early rate, 27-35 creeps sustained).
-   Remote harvesting has a round trip of hundreds of ticks and grew. A second
-   candidate is specific to construction: placement is never supervised, since
-   teacher labels carry an arbitrary legal tile, so a built structure's expected
-   payoff may be near zero at any horizon.
+   Remote harvesting has a round trip of hundreds of ticks and grew. The second
+   candidate was specific to construction: placement was never supervised,
+   because the hand-written teacher's labels carried an arbitrary legal tile, so
+   a built structure's expected payoff could be near zero at any horizon. The
+   teacher cutover removed that candidate at the source - construction labels now
+   carry the tile The International actually built on - so the next matched run
+   tests the credit window against a real placement distribution for the first
+   time.
 
    The matched pair measured the consequence. Both runs inherited a working
    ~51-creep colony from behavior cloning; the fresh-start control decayed to
@@ -40,17 +82,34 @@ Before another substantial PPO continuation:
    spread. The reservoir prevents the population collapse by re-seeding mature
    states; it changes neither the discount nor placement supervision.
 
-   Separate the two candidates before changing the objective. Placing a
-   teacher-quality base and measuring whether throughput improves within a few
-   hundred ticks answers whether good placement pays back inside the current
-   horizon. Only if it does not is a discount change the indicated fix, and then
-   on the same matched protocol, one change at a time: a longer discount with
-   the existing finite-horizon critic target, an investment-aware auxiliary
-   value head, or the temporal abstraction in
-   [`DECISIONS.md`](./DECISIONS.md).
-1. **Observation overflow.** Overflow averaged 28.3% over the final ten
-   rollouts and reached 75% in one rollout. Diagnose which actor, room, and
-   candidate categories overflow at each economy stage before changing caps.
+   The two candidates are now asymmetric rather than tied: both halves of the
+   diagnosis have been applied, the credit window by the objective change and
+   placement by the teacher cutover, so the next run cannot attribute an
+   improvement to either on its own. Placing a teacher-quality base and
+   measuring whether throughput improves within a few hundred ticks still
+   isolates the placement half directly. Run it on the same matched protocol,
+   one change at a time,
+   before adding an investment-aware auxiliary value head or the temporal
+   abstraction in [`DECISIONS.md`](./DECISIONS.md).
+1. **Observation caps, diagnosed; the remaining question is whether to raise
+   them.** The diagnosis asked for here is done. Per-tick cap instrumentation
+   over five 20,000-tick teacher episodes says room pressure is not production
+   pressure: with the teacher bounded to the observation radius, **no owned or
+   mined room was dropped at any tick**, and the 29% of ticks that lose a room
+   slot lose a wandering scout (0.4-0.6 hidden creeps per tick). Stake-ranked
+   room slots, not name order, are what make that true.
+
+   What actually binds is population: live creeps reach 111-118 against 64 creep
+   slots, first exceeding them at tick 2,666-3,638, and candidate targets exceed
+   128 from tick 5,859-7,492. So the open item is a cap decision with a measured
+   cost, not a diagnosis: raising `maxCreepActors` 64 -> 128 and `maxTargets`
+   128 -> 256 roughly doubles actor rows and quadruples the actor-target
+   attention cost, against a host rollout footprint already projected by
+   `HostRolloutBuffer.projected_bytes`. Decide it from the VRAM probe plus a
+   matched run, and keep the honest reporting either way: `droppedOwnedRooms`,
+   `droppedCreepOnlyRooms`, and `hiddenCreepActors` distinguish data loss from
+   correct budgeting, and `roomOverflow` fires only when a room with stake is
+   dropped.
 2. **Economic composition.** Prevent excess generalist/harvester production,
    ensure enough haulers recover dropped energy, and spawn/assign creeps for
    remote work. Record body-composition deficits, source utilization, ground energy, sink
@@ -65,34 +124,42 @@ Before another substantial PPO continuation:
    the first PPO continuation while `empty` and `seed_full` improved. Evaluate
    every stage under several scenario and action seeds and select checkpoints
    with a declared balanced scorecard.
-5. **Teacher late-game remote staffing decays.** The oscillation that stopped
-   remote delivery entirely is fixed: a remote returner ranked the home spawn
-   above the home bank, the spawn's free capacity flipped as it filled and
-   drained, and the destination alternated between two sinks on opposite sides
-   of the room, so the executor reversed its route every tick and the carrier
-   never left the outpost. Remote cargo now targets the bank, and
-   `test_seed_outpost_harvests_and_hauls_without_claiming` passes. What remains
-   is decay, not deadlock: at seed 7 the seeded outpost worker survives to tick
-   1,497 but stops delivering after tick 1,200, only one remote delivery happens
-   after 1,200, and there is no remote harvest or delivery at all after tick
-   1,600 (`test_outpost_route_finisher_and_replacement_remain_productive` still
-   fails on its aging-finisher assertion). The teacher stops restaffing the
-   outpost, which is the same late-activity collapse the learned policies show,
-   so the planner replacement in "Data, curriculum, and generalization" owns it.
-6. **The International outgrows the observation ABI immediately.** Collecting
-   teacher start states from TI rejected 10,466 of 12,000 candidate ticks for
-   overflow (`roomOverflow` 10,455, `actorOverflow` 6,667, `targetOverflow`
-   2,051) and yielded 22 usable states, 21 of them in the first 2,000 ticks and
-   none after `mid`. TI is therefore unusable as a late-phase bridge until
-   blocker 1 raises the caps, and the scripted planner supplies that bridge
-   instead (464 states spanning all four phases). This also bounds what the TI
-   critic and actor-auxiliary streams can represent.
-7. **The International crashes natively under concurrency.** Four concurrent
-   expert sandboxes killed one environment at tick 5,211 with `free(): invalid
-   pointer`; the same curriculum, seed, and horizon ran clean alone, so the
-   fault is nondeterministic rather than tick-dependent. Collect TI with at most
-   two concurrent environments until the sandbox or native pathfinder is
-   diagnosed.
+5. **Late-game remote staffing decays, and the real teacher is unmeasured.**
+   The measurements here were taken on the hand-written planner, which is no
+   longer a teacher: at seed 7 its seeded outpost worker survived to tick 1,497
+   but stopped delivering after tick 1,200, and no remote harvest or delivery
+   happened after tick 1,600
+   (`test_outpost_route_finisher_and_replacement_remain_productive` still fails
+   on its aging-finisher assertion, and that test now describes the evaluation
+   baseline only). The learned policies showed the same late-activity collapse,
+   so the question survives the cutover: whether The International restaffs a
+   remote outpost through the full horizon is an open measurement. The corpus
+   already fails closed on it - `_validate_outpost_teacher_readiness` requires
+   remote harvest, home delivery, and staffed and productive ticks inside the
+   final collection window of the `seed_outpost` split - so a decaying teacher
+   blocks collection rather than silently teaching decay.
+6. **Teacher coverage ends where the observation stops being faithful.** The
+   earlier rejection rate (10,466 of 12,000 candidate ticks, 22 usable states)
+   was measured against a stock teacher that outgrew the ABI on almost every
+   tick. With the teacher bounded to the observation radius and the wall-clock
+   leak fixed, the faithful prefix is 570-2,700 ticks and no production room is
+   ever dropped, so the bridge lane is usable through `early` and into `mid` -
+   but `late` teacher states remain unreachable until the creep and target caps
+   in blocker 1 are decided. The same caps apply while labelling: a creep whose
+   actor row is truncated cannot be supervised and the labeller drops it, so
+   measure labelled-decision counts and drop reasons per economy phase, not only
+   overflow fractions. Recollect bridge states and report the new admission
+   rate; the old one describes a teacher that no longer exists.
+7. **The native concurrency crash no longer reproduces, and the cause was never
+   found.** Four concurrent expert sandboxes once killed an environment at tick
+   5,211 with `free(): invalid pointer`. Re-measured after the reproducibility
+   work (virtual player clock, canonical room order, serialized finalizers),
+   sixteen concurrent expert sandboxes ran 8,000 ticks with no crash, twice,
+   sustaining 228-306 env-ticks/s aggregate while growing 18-105 creep colonies.
+   Collection now runs at sixteen environments on that evidence. Since no root
+   cause was identified, a repeat is possible: a collection that dies in a native
+   allocator is this blocker returning, not a new fault, and the width should be
+   halved and the crash captured under a debugger rather than retried.
 
 ## Start-state coverage
 
@@ -270,12 +337,17 @@ the actor representation.
 
 ## Data, curriculum, and generalization
 
-- Replace the bootstrap teacher with a planner that robustly demonstrates
-  mining, hauling, refilling, construction, upgrading, replacement, scouting,
-  claiming, remote staffing, storage, and defense.
+- The bootstrap teacher is now a real bot rather than a planner we maintain, so
+  the demonstration question becomes measurement: record which of mining,
+  hauling, refilling, construction, upgrading, replacement, scouting, claiming,
+  remote staffing, storage, and defense The International actually exhibits per
+  curriculum, and treat an absent behaviour as missing coverage rather than a
+  planner bug to fix.
 - Balance pretraining by stage, body composition, and intent; retain scarce examples rather
   than training and discarding non-IID chunks.
-- Add DAgger on learner-visited states after closed-loop BC meets the teacher.
+- Add snapshot-restore DAgger once closed-loop BC meets the teacher: restore a
+  learner-visited state into an expert session, step the bot one tick, and label
+  through the same capture path. See "Consequences of a single real teacher".
 - Generate deterministic seeded room layouts and connected 2–4-room topology
   families with held-out seeds.
 - Add visible-only scouting and remembered intel; keep pre-exposed neighboring
@@ -289,7 +361,7 @@ action validity + overflow diagnostics
   → stage-balanced evaluation and economic scorecard
   → start-state reservoir vs matched fresh-start-only PPO
   → NextLat on/off ablation
-  → stronger planner teacher + closed-loop BC/DAgger
+  → snapshot-restore DAgger on learner-visited states
   → ratio-group and dual-encoder ablations
   → persistent options and learned memory
   → strategic planner + multi-room scenario families

@@ -89,16 +89,128 @@ and semantic-group objectives empirically.
 
 ## Learning pipeline
 
-### Imitation first, then closed-loop correction
+### One real teacher, supervising only what it demonstrably chose
 
-Sparse long-horizon economy behavior is unlikely to emerge efficiently from a
-random policy. The actor and critic pretrain on the same scripted stream, then
-the learned actor must demonstrate the behavior in closed loop before PPO.
-Training-set NLL or teacher return cannot qualify a learned policy.
+Behaviour cloning learns from The International running inside the engine, and
+from nothing else. The hand-written planner in `env/scripted_baseline.mjs`
+remains only as an evaluation baseline (`agent/eval_scripted.py`); it produces
+no training label, no qualification expectation, and no corpus row.
 
-The bootstrap teacher is not an oracle. It must cover every required body composition and stage it
-is used to certify, and learner-visited states should be relabelled through
-DAgger once basic imitation works.
+A hand-authored teacher can be told to emit any body, any placement, and any
+role assignment, which makes its labels a description of its author rather than
+of competent play. Cloning it teaches the policy to reproduce our own guesses,
+and every gate built on those guesses then certifies agreement with the guess.
+
+The cost is that supervision becomes partial. A real bot issues raw engine
+intents conditioned on private memory and plans, so most of what it does is not
+one of our macro actions. Measured over 2,000 expert ticks, 83.8% of its
+decisions are exactly representable; the remainder are raw movement en route
+(retro-labelled to the macro action they serve when that action completes),
+multi-intent ticks, and amounts our bins cannot express. Every row therefore
+carries an eligibility mask over action factors, and the loss supervises only
+eligible factors with `safe_bc_nll(..., strict=True)`. Unlabelled factors stay
+free for PPO.
+
+Labels are validated against the same tick's candidate masks before they are
+retained. A label the engine accepted but our observation cannot express is
+dropped rather than admitted by widening a mask: the teacher's intent is
+evidence about the world, not about what this ABI can represent.
+
+Learner-visited relabelling (DAgger) is not available from a black-box bot,
+because the bot cannot be asked what it would do in a state it did not reach.
+The scripted DAgger and outpost supplement corpora were removed with the
+scripted teacher rather than kept as a second label source. Restoring a
+learner-visited snapshot into an expert session is the honest way to recover
+on-policy correction and is specified in `ROADMAP.md`.
+
+### A silent teacher is a broken teacher, and it must fail closed
+
+The International aborts its whole tick when a memory segment it expects is
+absent, and the abort is load-sensitive: two runs of one declared seed produced
+660 and 2 labels, with byte-identical bot logs in both. Silence is the only
+observable, so `TiLivenessGate` grades every episode on it.
+
+Thresholds are measured, not guessed. In a healthy 3,000-tick episode the
+expert acted on 2,974 ticks (99.1%) and its longest silence was 12 ticks, ending
+at tick 20 while the first creep was still spawning; every later silence lasted
+a single tick. The gate therefore ignores the first 50 ticks, fails an episode
+that goes 30 consecutive graded ticks without an engine intent, and fails a run
+that acts on under 50% of graded ticks. Stalled runs measured 2.5%-20%.
+
+The persisted corpus carries the aggregate, and loading validates it, so a
+corpus collected from a stalled teacher cannot be trained on later.
+
+The expert wire reports no learner-intent counters at all: `intentIssued` and
+`intentInvalid` measured exactly zero over 1,500 expert ticks, because the bot's
+intents are executed inside the engine rather than through our action path. The
+corpus gate that required them to be zero was therefore vacuous and was replaced
+by the liveness gate. Those counters remain in the scorecard as readings of the
+learner path, which is empty during teacher collection.
+
+### The teacher is configured to the observation, and collection asserts it
+
+A teacher whose colony outgrows the observation labels actions whose subject the
+policy cannot see. Stock The International runs remotes to distance 5 and scouts
+outward without bound; measured over three 20,000-tick episodes it reached 7-8
+visible rooms and 111-122 live creeps against 4 room slots and 64 creep slots,
+dropped a staked room on 74-86% of ticks, and left 3.5-5.5 creeps per tick
+outside the action space.
+
+`maxRemoteRoomDistance` and `maxScoutRoomDistance` are therefore both set to 1
+in the teacher build. Bounding exploration is not cosmetic: with it, two further
+20,000-tick episodes dropped **no** owned or mined room at any tick, hidden
+creeps fell to 0.4-0.6 per tick, and room-slot pressure fell from 83-86% of
+ticks to 29% - all of it wandering scouts rather than production.
+
+`schema.json:teacher` declares both radii, and `validate_teacher_configuration`
+reads them back out of the executed bundle (`dist/main.js`), not the source
+tree, before any collection or bridge-snapshot run starts. Corpus meta records
+`ti_room_radii`. Changing either radius changes what a corpus means and must
+bump `teacherAbi`.
+
+What remains unrepresentable is the mature economy, not the map: the creep cap
+binds first at tick 2,666-3,638 and the target cap at 5,859-7,492, so the fully
+faithful prefix of a bounded-teacher episode is roughly 570-2,700 ticks. This is
+why teacher states are a bridge lane with a hard admission gate rather than the
+training distribution, and why raising `maxCreepActors`/`maxTargets` is a
+measured experiment in `ROADMAP.md` rather than an assumed fix.
+
+### A reproducible teacher needs a virtual clock and canonical room order
+
+Two runs of one declared seed diverged at tick 45 and ended 33 versus 66 creeps.
+The engine and the scripted baseline were byte-identical over 1,500 ticks, so the
+divergence was specific to running a real bot, and three host leaks were found:
+
+- **Wall clock.** The player realm read host time. The International stores
+  `Date.now()` deltas in `Memory.stats` and branches on them, so a replay billed
+  whatever the host was doing. `deterministicClock` now installs a virtual clock
+  that advances one simulated second per tick, covering `Date.now()`, the `Date`
+  constructor, and `performance.now()` through a proxy that leaves every other
+  `Date` overload intact.
+- **Room order.** Visible and intent room sets arrived in storage order, which
+  is the order concurrent room finalizers happened to write them. That order
+  becomes `Game.rooms` key order, and bots iterate their rooms. Both sets are
+  now sorted before they reach the sandbox.
+- **Finalizer order.** The simulated shard finalized rooms concurrently, so id
+  allocation and shared-state writes interleaved by host scheduling. Finalizers
+  now run in canonical room order.
+
+With all three fixed, a 400-tick teacher twin is bit-identical and 20,000-tick
+growth changed materially (creeps at tick 2,000 fell from 67 to ~35), but the
+teacher is still not fully reproducible: bisecting world digests against captured
+intents puts the first disagreement at a tick where the observed world and the
+engine telemetry are identical and only the bot's intents differ. The residue is
+inside the player realm, and the bundle imports no entropy (no `crypto`,
+`WeakRef`, `FinalizationRegistry`, or randomness import in its WASM), so it is
+not attributable to a host input we control.
+
+The consequence is a contract, not a caveat: **teacher trajectories are samples,
+not replays.** Corpora record `ti_runtime_source_sha256` and their measured
+liveness rather than promising reproduction, and matched teacher comparisons need
+repeated seeds. What the reservoir depends on is the learner path, which *is*
+reproducible: a teacher-sourced snapshot reopened in a learner session with no
+expert code replays bit-identically, asserted by
+`test_teacher_state_replays_identically_in_a_learner_session`.
 
 ### Optimize H+C; gate the rest independently
 
@@ -253,9 +365,12 @@ live trajectory.
   same corpus `dea70f38…`, same seed 3, same 16 global epochs) regressed to
   control rate 0.59, produced zero remote harvest in `empty`, `seed_creep`, and
   `seed_full`, and worsened lifecycle NLL to 0.139.
-- The optional actor-supplement lane is therefore not enabled for PPO
-  baselining. Start-state reservoir runs initialize from a joint artifact
-  collected without `--actor-supplement`; in this workspace that artifact is
+- Those two runs are the measured case against the correction lanes. Both were
+  relabelled by the hand-written planner, and the supplement made every
+  gameplay metric worse. The lanes have since been deleted with the scripted
+  teacher, so the entries above are the final record of them rather than a
+  configuration choice. Start-state reservoir runs initialize from a joint
+  artifact collected without them; in this workspace that artifact is
   `joint_pretrain_nextlat_fused_bootstrap16.pt`.
 - The matched start-state pair is the first controlled PPO comparison in this
   stack. Both runs resumed `joint_pretrain_nextlat_fused_bootstrap16.pt` at seed
