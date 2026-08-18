@@ -286,6 +286,21 @@ optimizer steps, about 16 seconds on one RTX 5090 with 7.7 of that in collection
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) has the measurements, including two
 compile configurations that were tried and rejected on memory.
 
+## Related work
+
+[Overmind-RL](https://github.com/bencbartlett/Overmind-RL) is the other public
+Screeps RL project. It is a 2020 course environment for official-server micro:
+creeps injected for 300 ticks into empty plains, either 8-dir `move` toward
+each other or `{approach, avoid}` while Overmind scripts combat. No economy,
+spawn, or construction. The policy is stock rllib PPO, or a 4→30→8 MLP in the
+notebook. The paper claims 1,900 room-ticks/s on 64 cores; the committed
+cluster config does not match that, and per-core it is still the official
+server's ~30 Hz. Throughput contrast lives in
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md#external-baseline-overmind-rl).
+
+This stack is a colony controller on `xxscreeps`, not a remake of that
+sandbox. Combat is the one skill they demonstrated and this policy has not.
+
 ## Repository layout
 
 ```text

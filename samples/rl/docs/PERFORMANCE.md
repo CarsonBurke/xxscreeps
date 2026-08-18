@@ -61,6 +61,37 @@ Observation payload is 201 KB per environment tick: 140 KB of spatial patches
 for the two active rooms, the remainder actor, target, and mask planes. A sparse
 dynamic-entity encoding would cut it, but that is an observation ABI change.
 
+## External baseline, Overmind-RL
+
+The only other public Screeps RL stack is
+[Overmind-RL](https://github.com/bencbartlett/Overmind-RL), a 2020 Stanford
+course project against the official server. It is a different game, cited here
+so the numbers above have an external anchor, not a like-for-like bake-off.
+
+Official Screeps runs about 30 ticks/s per room. Overmind-RL packed about ten
+disconnected empty rooms onto one server and reported a peak of 1,900
+room-ticks/s on 64 `n1-standard-2` cores with a Tesla K80 head. That figure is
+the course paper's claim. The committed `cluster-EXAMPLE.yaml` is a CPU image,
+`max_workers=8`, and the trainers set `num_gpus=0`. Per-core that claim is
+still about 30 Hz: the official server after room packing. Code only
+`console.log`s throughput; no measured number is checked in.
+
+A training tick there is a 4-integer observation and an 8-way or 2-way
+discrete action on creeps injected with `lifetime=300` into empty plains.
+A training tick here is a 201 KB colony observation through a 1.57M-parameter
+actor. One environment still runs 1,479 ticks/s, about 50x the official
+server, and four independent processes reach 3,523 ticks/s on this box. The
+gap is the simulator, not a bigger cluster.
+
+Capability is not close. Overmind-RL trains approach (8-dir `move`, clump
+reward) or combat kiting (`approachHostiles` / `avoidHostiles`) while
+Overmind scripts attack and heal. Structures, spawning, and economy were
+omitted; the shipped trainer defaults to approach with combat commented out.
+The only explicit network is a 4→30→8 REINFORCE MLP. Production scripts call
+stock rllib PPO. This stack runs a live RCL1–RCL2 economy with held-out
+harvest-plus-progress of 13.1–18.5 per tick; combat intents exist in the ABI
+and have not been trained. See [`../README.md`](../README.md#related-work).
+
 ## Optimizer batch and compilation
 
 Minibatch is transitions per optimizer step, and a transition here is a whole
