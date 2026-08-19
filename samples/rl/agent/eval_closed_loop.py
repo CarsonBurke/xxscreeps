@@ -52,6 +52,11 @@ def parse_args() -> argparse.Namespace:
         "--device", type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
+    parser.add_argument(
+        "--sample", action="store_true",
+        help="sample actions instead of greedy decoding; required to observe "
+             "behaviour that survives only as low-probability policy mass",
+    )
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 
@@ -100,6 +105,7 @@ def main() -> int:
     try:
         result = _validate_closed_loop(
             agent.actor, envs, steps=args.ticks, device=device,
+            deterministic=not args.sample,
         )
     finally:
         envs.close()
@@ -112,6 +118,7 @@ def main() -> int:
         "eval_seed": args.seed,
         "eval_ticks": args.ticks,
         "eval_num_envs": args.num_envs,
+        "decode": "sampled" if args.sample else "greedy",
         "curriculum": args.curriculum,
         "initialization_source_sha256": meta.get("initialization_source_sha256"),
         **result,
