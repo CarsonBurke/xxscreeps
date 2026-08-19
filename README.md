@@ -1,221 +1,367 @@
-# xxscreeps
+# Screeps RL
 
-This is a from-scratch rewrite of the Screeps backend services, brought to you by the author of
-the [path finder](https://github.com/screeps/driver/blob/master/native/src/pf.cc) and also
-[isolated-vm](https://github.com/laverdet/isolated-vm). The goal of this project is to build a very
-fast version of the Screeps backend service which will greatly improve upon the local single-player
-experience, and perhaps eventually the multiplayer world as well.
+One neural policy runs a whole Screeps colony, emitting one masked macro action for
+every live creep, spawn and tower on every simulator tick. It is cloned from [The
+International](https://github.com/The-International-Screeps-Bot/The-International-Open-Source)
+playing inside the engine, then trained with PPO against the live simulator. The
+1,566,118-parameter actor is the only network needed to play, and a
+1,490,009-parameter critic trains alongside it. A research stack rather than a
+competitive bot.
 
+The environment is a real Screeps server rather than a reimplementation of the game:
+[`xxscreeps`](packages/xxscreeps/README.md) is vendored here and stepped in process,
+so the rules the policy learns are the rules a Screeps server enforces.
 
-## Concepts
+## What it does
 
-### Blobs
-At the heart of xxscreeps is a custom binary format created specifically to efficiently represent
-the state of a room. Instead of storing a sea of objects indexed by room in a shared database, each
-room is stored as a blob ranging in size from 250 bytes to 60kb for most rooms. A room blob
-represents game state in the same way a C program might represent it. For reference, a simple object
-like a `StructureWall` can be represented in 44 bytes, and a creep with a fully loaded
-50-length body is about 274 bytes.
+| Cloned from the teacher | After PPO |
+|:---:|:---:|
+| [![cloned policy placing construction sites](samples/rl/docs/media/bc_building.webp)](https://youtu.be/MSGC9j2Smok) | [![reinforced policy running its economy](samples/rl/docs/media/ppo_economy.webp)](https://youtu.be/rFsW3197xaY) |
 
-![Hex Dump](./docs/room-hex.png)
+Twelve-second excerpts from two full runs, recorded with
+[`samples/rl/tools/record_showcase.py`](samples/rl/tools/record_showcase.py); each clip
+links to its complete run. The cloned policy on the left reproduces the teacher's whole
+repertoire and spreads itself thin doing it: about 33 creeps working while
+construction sites sit unfinished across the room instead of clustered into a base,
+still RCL2 after 40,000 ticks. The reinforced policy on the right runs about 30 creeps with both sources
+saturated and a hauling lane to the controller, reaching RCL3 in 7,600 ticks and
+placing no construction sites under greedy decoding.
 
-The first advantage of this is greatly improved performance of the runner service. Game state is
-read from the database as an
-[`ArrayBuffer`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/ArrayBuffer)
-which can be *instantly* transferred into the player's runtime for free. In vanilla Screeps the
-process of requesting game state from the database and loading it into the runner requires several
-costly serialization and deserialization steps.
+Scores come from ten fresh, untouched 20,000-tick worlds at seed 900, used by
+neither training nor teacher collection, decoded greedily. The quantity scored is
+`harvested_energy + controller_progress` per tick. Every measurement and clip in
+this document predates both the current objective described below and the move to a
+single teacher: the policy shown was cloned from the hand-written planner plus The
+International, and a rerun from the real teacher alone is in progress.
 
-The real crazy part is that we can overlay JavaScript game state directly *on top* of these room
-blobs. Inherited [getters](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Functions/get)
-are created which reach into the blob and pull out game state as it requested by the user's script.
-So, for example, if you go an entire tick without accessing the `body` property on a `Creep`, that
-array along with all its contents will never be materialized into the v8 heap. This greatly reduces
-the burden of the garbage collector which robs every player of a significant portion of CPU.
+| Scenario | Score/tick |
+|---|---:|
+| `empty`, one spawn in a bare room | 17.1 |
+| `seed_creep`, one seeded worker | 18.5 |
+| `seed_claimer`, plus 2 room claims | 17.4 |
+| `seed_full`, an inherited mature colony | 13.1 |
+| `seed_outpost`, a neutral outpost | 16.6 |
 
-Storage of room blobs can be efficiently sharded within a world shard as well. These blobs are no
-different than a very small JPEG file, like from the 90's. We could theoretically infinitely scale a
-game world in all directions by linearly adding more processor workers.
+## Design
 
-### Parallelization
-In xxscreeps room processing can begin as soon as all player scripts in a single room have
-completed. Most rooms are only accessible by 1 or *maybe* 2 users at a time. Right now in vanilla
-Screeps the processor service just sits around doing nothing until *all* player scripts are done. By
-overlapping running and processing we can improve scalability of a world shard.
-
-### Modernization
-[Private class
-fields](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Classes/Private_class_fields),
-[proxies](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Proxy),
-[reflection](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Reflect),
-and a custom [Babel](https://babeljs.io/) transform have simplified the player sandbox
-implementation. We can now share code between the runtime and processor and implement game logic
-using the same APIs that the player uses. Compare the work needed to implement a Creep's `transfer`
-method in xxscreeps:
-[[Creep.prototype.transfer](https://github.com/laverdet/xxscreeps/blob/4fd2b89528b6e270f4ae45b810d1a464cdc285fd/src/mods/creep/creep.ts#L299-L307),
-[checkTransfer](https://github.com/laverdet/xxscreeps/blob/4fd2b89528b6e270f4ae45b810d1a464cdc285fd/src/mods/creep/creep.ts#L396-L408),
-and ['transfer'
-intent](https://github.com/laverdet/xxscreeps/blob/4fd2b89528b6e270f4ae45b810d1a464cdc285fd/src/mods/creep/processor.ts#L72-L79)]
-to the same feature in vanilla Screeps:
-[[Creep.prototype.transfer](https://github.com/screeps/engine/blob/78631905d975700d02786d9b666b9f97b1f6f8f9/src/game/creeps.js#L428-L491),
-[intents/creep/transfer.js](https://github.com/screeps/engine/blob/78631905d975700d02786d9b666b9f97b1f6f8f9/src/processor/intents/creeps/transfer.js)].
-Of course the functionality in xxscreeps is incomplete in some ways but the foundation is solid.
-
-### Mods
-The "core" xxscreeps engine is meant to be abstract and extendable. Almost all game logic is
-implemented as mods which can be turned on and off independently of one and other. Even `Creep`
-objects are implemented a mod! As the scope of gameplay in Screeps has expanded over time it's
-become more difficult to reason about any one gameplay component since its logic might be scattered
-over many different and unrelated files. Furthermore by "dogfooding" the mods API we will be
-confident that it's powerful and easy as possible to use.
-
-### Experience
-There's a lot of factors that can make Screeps difficult to work with. Every player of Screeps knows
-the disappointment of typing `console.log(creep)` into the console and seeing `[Object object]`
-echoed back. xxscreeps comes with robust console support just like you get in nodejs. Full support
-for the Chrome Web Inspector or VS Code debugger is planned as well, which will make it possible to
-step through your script line by line to troubleshoot issues. Source map support is built-in to the
-player sandbox so if you use a transpiler (like TypeScript or Webpack) you will be able to see the
-original file name and line number in stack traces. And the whole thing is written with detailed
-TypeScript annotations and inline documentation as well which greatly improves the player's access
-to information about game APIs.
-
-![Console Example](./docs/console-demo.png)
-
-
-## Getting Started
-
-To get xxscreeps running here's what you need to do. This should work on Linux, macOS, and Windows.
-First step is make sure nodejs v24.x is installed, older versions will probably not work.
-```
-mkdir xxscreeps
-cd xxscreeps
-# note: we use @screeps/launcher to generate terrain
-npm install xxscreeps @screeps/launcher
-npx xxscreeps import
-npx xxscreeps start
+```mermaid
+flowchart LR
+    W["xxscreeps world<br/>real engine · 50×50 rooms"]
+    O["Observation · 201 KB/tick<br/>4 room patch planes<br/>100 actors · 128 targets · masks"]
+    AC["Actor · 1.57M params<br/>spatial → entity transformer<br/>→ per-actor masked heads"]
+    CR["Critic · 1.49M params<br/>independent trunks<br/>→ 409-bin HL-Gauss value"]
+    A["One macro action per entity<br/>intent · direction · target · amount<br/>construction · spawn body"]
+    X["Executor<br/>pathfinding · traffic · engine intents"]
+    W -->|encode after the tick| O
+    O --> AC
+    O --> CR
+    AC --> A
+    A --> X
+    X -->|advance one tick| W
+    CR -.->|advantages, during PPO| AC
 ```
 
-Now there is a Screeps server running at http://localhost:21025.
+A Screeps tick is not one decision: a forty-creep colony plus its spawn and towers
+presents forty-odd simultaneous choices, each from a legal set that changes every
+tick. Each design below takes one part of that problem.
 
-If you want to use the Steam client you need to go here: https://steamcommunity.com/dev/apikey and
-get an API key. Then add it to `.screepsrc.yaml`:
-```yaml
-backend:
-  steamApiKey: <your steam key>
+### Macro actions and a deterministic executor
+
+Driving a creep through the engine API means picking one of eight directions on
+every tick of a walk lasting hundreds of ticks, so the network spends capacity
+rediscovering pathfinding a search does better while credit assignment drowns in
+steps of no strategic content. A learned action is therefore a goal: harvest that
+source, transfer to that structure, claim that controller. The executor takes one
+navigation or work step toward it per tick, with traffic-aware movement and routes
+cached for ten ticks under bounded searches, and the policy reselects its goal every
+tick, so it can abandon a route halfway. One action is a handful of factors, each
+active only when the chosen intent needs it, and inactive factors are masked out of
+the likelihood, so they never enter cloning, entropy or the PPO ratio.
+
+| Factor | Choices | Active when |
+|---|---:|---|
+| Intent | 20 | always |
+| Direction | 8 | the intent is directional |
+| Target | 128 candidates | the intent needs an object |
+| Amount | 10 bins | the intent moves resources |
+| Construction | 7 types x 2,500 tiles | room actors only |
+| Spawn body | 8 part counts plus a learned part order | spawns only |
+
+### Spawn bodies without a sequence decoder
+
+A body is up to 50 parts drawn from 8 types and the engine cares about their order,
+which as a sequence means a 50-step decoder plus a length decision over a space
+where many sequences denote the same creep. Instead one neural pass emits count
+logits for all eight types, a fixed conditional scan masks them so every sampled
+composition is non-empty, at most 50 parts and affordable at current room energy,
+and a Plackett-Luce head orders only the non-zero types while the rest take a
+canonical suffix. One executed body then has one encoding and one exact likelihood,
+with no length action, no 50-step decoder and no cross-tick energy reservation.
+
+### Legality as part of the action definition
+
+Legality moves every tick: a transfer is legal until the target fills, a claim until
+the control level caps out, a tile until something occupies it, and a policy free to
+emit illegal intents learns from a signal shaped by its own bookkeeping errors. So
+the action space admits only executable actions: candidate masks, model
+compatibility, executor validation and engine behaviour describe the same action, a
+legal intent with no executable argument is never offered, and construction draws
+its tile from the engine validator's own bit-packed support. An invalid action is
+then a defect to report, at 2 out of 344,078 in a recorded 40,000-tick run.
+
+### Seeing the tick that just happened, and valuing it
+
+Encoding the world before the engine applies intents would leave every decision
+acting on a state one tick stale, with the previous action's outcome invisible.
+Observations are therefore encoded after the tick is applied: 201 KB per tick, four
+room slots of 100 patches by 700 values, 100 actor rows, 128 target candidates and
+the legality masks. Terminal observations are retained so value can bootstrap
+through them and chains are cut at truncation, so a rollout ending on its time limit
+does not truncate credit. All coordination happens inside a tick, with no recurrent
+state, so long-lived tasks are
+[roadmap](samples/rl/docs/ROADMAP.md#temporal-memory-and-options) work.
+
+Returns span orders of magnitude, since an empty room and a mature colony are not
+the same regression problem and a scalar head spends its accuracy on whatever
+magnitudes dominate the batch. The critic instead predicts a 409-bin HL-Gauss
+distribution over a signed-log support and decodes an expectation for bootstrapping,
+with targets outside the support failing loudly instead of being clipped into range.
+
+### Start states drawn from a reservoir
+
+Twelve environments that all begin at tick zero advance in lockstep, so each update
+draws from one narrow band of a 20,000-tick timeline, and behaviour that only
+matters later, such as remote hauling, stops appearing and is unlearned.
+
+![matched PPO runs differing only in start states](samples/rl/docs/media/training_curves.png)
+
+Two PPO runs share a cloned checkpoint, seed, optimizer and code fingerprint and
+both stop at update 204 and global step 1,259,520, differing only in their start
+states; both inherit a roughly 50-creep colony from cloning. The tick-zero-only run
+falls to 8 creeps by update 60 and settles at a score near 4, while the reservoir
+run holds 27 to 35 creeps and climbs past 15. Held-out evaluation, summed over the
+five scenarios above, agrees:
+
+| | Reservoir | Tick-zero only |
+|---|---:|---:|
+| Score per tick | 82.7 | 20.0 |
+| Controller progress rate | 27.2 | 0.1 |
+| Remote-room harvesting | 32,228 | 0 |
+| Remote energy delivered home | 311 | 0 |
+| Room claims | 2 | 0 |
+
+PPO therefore draws start states from an event-stratified reservoir across its
+twelve environments, split `fresh=6, policy=4, teacher=2` in segments of 2,048
+ticks. Half the fleet stays on untouched full lifecycles, the only worlds whose late
+states follow from the policy's own earlier decisions; the rest resume from
+snapshots of recent policy runs, successful and failed, while a temporary teacher
+lane bridges phases the policy cannot reach yet and retires per phase.
+
+Snapshots are stratified by event rather than sampled periodically, since periodic
+sampling overrepresents long plateaus. Capture happens before a decision as well as
+after, so a resumed policy chooses its own body and placement rather than executing
+a teacher's committed choice. Evaluation never uses snapshots, since a policy scored
+from restored states is never required to reach them; the contract is in
+[`samples/rl/docs/TRAINING.md`](samples/rl/docs/TRAINING.md#start-states).
+
+### One optimizer, and compiling only the path that pays
+
+Two stages with different optimizers make the handoff between them a change of
+update geometry as well as of objective. Both stages therefore share one optimizer:
+Muon with Polar Express orthogonalization and NorMuon second-moment reweighting on
+the hidden transformer matrices, fused AdamW on embeddings and heads, and no
+learning-rate schedule. PPO's Muon rate is RMS-matched to the AdamW step it
+replaces, so adopting it changes update geometry rather than step size.
+
+A 512-tick update across 12 environments stepped in parallel, followed by 12
+optimizer steps, took about 16 seconds on one RTX 5090 with 7.7 seconds of that in
+collection, and collection is thousands of small launch-bound calls, one per
+simulated tick at batch 12. `--compile` therefore CUDA-graphs the per-tick forward
+and leaves the minibatch path eager, raising collection from about 531 to about 876
+environment steps per second, roughly 1.7x. A capture pool at minibatch 1536 needed
+about 28.5 GB and did not fit, which is what keeps that half eager;
+[`samples/rl/docs/PERFORMANCE.md`](samples/rl/docs/PERFORMANCE.md) has the measurements.
+
+## Training
+
+```mermaid
+flowchart LR
+    I["The International<br/>exact engine intents"] --> C
+    C["Immutable corpus<br/>content-addressed"] --> BC
+    BC["Joint pretraining<br/>masked behaviour cloning + value"] --> PPO
+    R["Start-state reservoir<br/>fresh · policy · teacher"] --> PPO
+    PPO["PPO<br/>per-actor clipped ratio"] --> E["Evaluation<br/>fresh 20k worlds only"]
 ```
 
-You can also this to your `.screepsrc.yaml` file to enable email + password registration.
-```yaml
-backend:
-  allowEmailRegistration: true
+There is one teacher, and it is a real bot. [The
+International](https://github.com/CarsonBurke/The-International-Open-Source) plays
+the game inside the engine, and the harness captures its raw intent payload at the
+runner boundary, translates the exactly representable intents into the macro action
+ABI, and marks per-factor which of them are supervised. 83.8% of its measured
+decisions are representable; immediate moves are held and retro-labelled to the
+harvest, transfer or claim they served, while multi-command ticks and amounts
+outside our bins are dropped with a named counter instead of guessed. A label whose
+target, amount or construction tile is not in that tick's candidate mask is dropped
+too, rather than admitted by widening the mask.
+
+The hand-written planner in
+[`samples/rl/env/scripted_baseline.mjs`](samples/rl/env/scripted_baseline.mjs) is now
+only a baseline to beat. It emits the same macro action format, so it can be scored
+against the policy on the same worlds, but a teacher we authored ourselves teaches the
+policy our own guesses about roles, bodies and placement, and every gate built on those
+guesses then certifies agreement with the guess. It supplies no training label.
+
+A real bot can also stop playing: The International aborts a whole tick when a
+memory segment it expects is missing, load-sensitively, so two runs of one seed
+produced 660 and 2 labels with identical bot logs. Collection therefore grades
+liveness. A healthy 3,000-tick episode acts on 2,974 ticks with a worst silence of
+12 ticks while the opening creep spawns, so an episode that goes 30 graded ticks
+without an intent, or acts on under half of them, fails closed and the persisted
+corpus carries the record. Corpus lifecycles are collected once into an immutable,
+content-addressed artifact, and training refuses a different corpus on resume.
+
+PPO clips a likelihood ratio per live actor and normalizes the loss per actor
+decision rather than per team state. `gamma = 0.9995` puts the critic's target
+window at 2,000 ticks, and the two GAE lambdas are decoupled: the critic fits the
+lambda-1 return while the policy advantage uses a length-adaptive `1 - 1/(0.5 l)`
+over the mean uncut segment length, which is a 1,012-tick credit window at 4,096
+transitions against 18 before. The best fifth of environments by return is imitated
+again at weight 0.1. The objective is `0.1 x harvest + 1.0 x
+controller_progress` and nothing else: delivery, construction, claims and spawning
+stay diagnostics and gates, since gross deltas are gameable.
+
+Construction is the current frontier. Under greedy decoding the reinforced policy
+places no sites and builds no energy, while the cloned policy built 18,582 energy
+over a 40,000-tick sampled run and stayed at RCL2. The cause is not settled. Those
+runs discounted at `gamma = 0.995`, a 200-tick effective horizon against an
+extension that repays over thousands, though delayed payoff by itself is clearly not
+disqualifying: a creep body repays over roughly 1,500 ticks and spawning was
+retained. The current 2,000-tick window tests the horizon directly, and
+[`samples/rl/docs/ROADMAP.md`](samples/rl/docs/ROADMAP.md) carries the candidates.
+
+## Running it
+
+Requires Python 3.10+, Node 22+, PyTorch, NumPy and TensorBoard. Local training and
+GPU evaluation go through `mlq`, and `samples/rl/runs/` is gitignored.
+
+```bash
+export RL_NODE="$(mise exec node@24 -- which node)"
+
+# Contracts: model, action ABI, reward, teacher, environment
+python3 -m samples.rl.agent.test_latent_unit
+python3 -m samples.rl.agent.eval_scripted --ticks 20000 --max-episode 20000 --seed 3
+python3 -m samples.rl.agent.eval_reward_contract
 ```
 
-You might also consider installing the xxscreeps client backend, which will allow you to view the
-world directly in your browser:
-[@xxscreeps/client](https://github.com/laverdet/xxscreeps/blob/main/packages/client/README.md).
+Watch a policy play, live in the Screeps client at `http://127.0.0.1:21025` or
+as a 2K recording with a time lapse:
 
-If you're using VS Code and you have the [YAML extension](https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml) installed all the options should
-autocomplete. If not you can read the [config
-schema](src/config/config.ts).
+```bash
+python3 -m samples.rl.agent.watch \
+  --checkpoint samples/rl/runs/policy.pt --headful --deterministic --ticks 20000
 
-If you want to use your bot script, use `npx xxscreeps import --overwrite-code ../your-bot/dist` to replace builtin bots.
-
-### Adding bots
-
-`import --overwrite-code` replaces the built-in bots. To add a *named* bot — and optionally place
-its first spawn — without touching the built-ins, use the `manage` subcommand:
-
-```
-npx xxscreeps manage bot add <name> <dir> --spawn <room>
+python3 samples/rl/tools/record_showcase.py \
+  --checkpoint samples/rl/runs/policy.pt \
+  --out samples/rl/runs/showcase/run --ticks 40000
 ```
 
-`<dir>` is a flat directory of a bot's built modules — `main.js` (CommonJS), `main.mjs` (ESM), or a
-`main.wasm`/`*.wasm` binary. Subdirectories are ignored, so point it at the build output (often `src`
-or `dist`), not the source tree of a bot that still needs compiling. `--spawn` also places the bot's
-first spawn, whether or not a server is running; drop it to just save the code.
+Training runs in three queued stages. The first prints a content-addressed
+corpus path that the second consumes.
 
-This repo ships **Apex**, a multi-room empire sample (economy, remotes, combat, expansion):
+```bash
+mlq submit --name screeps-corpus --priority 10 --max-parallel-runs 1 --cwd "$PWD" -- \
+  python3 -m samples.rl.agent.pretrain_corpus \
+    --num-envs 32 --steps 20000 --max-episode 20000 \
+    --curriculum empty,seed_creep,seed_full,seed_claimer,seed_outpost \
+    --ti-actor-steps 20000 --output samples/rl/runs/pretrain-corpora
 
-```
-npx xxscreeps manage bot add apex samples/bots/apex --spawn W5N5
-```
+mlq submit --name screeps-pretrain --max-parallel-runs 1 --cwd "$PWD" -- \
+  python3 -m samples.rl.agent.pretrain_joint \
+    --corpus samples/rl/runs/pretrain-corpora/<sha256> \
+    --global-epochs 16 --seed 3 --device cuda \
+    --save samples/rl/runs/joint_pretrain.pt
 
-See [samples/bots/README.md](samples/bots/README.md). Open-source bots published for vanilla servers
-also work as-is:
+mlq submit --name screeps-ppo --max-parallel-runs 1 --cwd "$PWD" -- \
+  python3 -m samples.rl.agent.train \
+    --resume samples/rl/runs/joint_pretrain.pt --save samples/rl/runs/policy.pt \
+    --device cuda --compile --seed 3 \
+    --num-envs 12 --steps 4096 --minibatch 1536 --max-episode 20000 \
+    --curriculum empty,seed_creep,seed_full,seed_claimer,seed_outpost \
+    --reservoir samples/rl/runs/reservoirs/run \
+    --start-mix fresh=6,policy=4,teacher=2 --segment-ticks 2048
 
-```
-npm install screeps-bot-tooangel
-npx xxscreeps manage bot add tooangel node_modules/screeps-bot-tooangel/src --spawn W5N5
-```
-
-`manage` also has `user` verbs plus `bot update`/`bot remove`; run `xxscreeps manage` with no
-arguments to print the full command list.
-
-## Operator CLI
-
-`xxscreeps cli` opens a JavaScript REPL in the CLI process's host realm, and
-`xxscreeps eval` runs one-shot scripts with `-e`, `--file`, or `--stdin`, plus
-an optional `--json` envelope mode for tooling. See
-[packages/xxscreeps/cli/README.md](packages/xxscreeps/cli/README.md) for flags
-and the JSON envelope schema.
-
-## Scripting
-
-The CLI is for quick tinkering; for anything heavier, import the engine
-modules directly from a Node script. This avoids the CLI's eval surface
-and gives full TypeScript types on the operations you call.
-
-```ts
-import { Database, Shard } from 'xxscreeps/engine/db/index.js';
-import { generateRoom } from 'xxscreeps/scripts/room-gen.js';
-
-await using db = await Database.connect();
-await using shard = await Shard.connect(db, 'shard0');
-
-await generateRoom(shard, 'W12N5');
-await generateRoom(shard, 'W11N5', { terrainType: 3, swampType: 2 });
-await Promise.all([ db.save(), shard.save() ]);
+mlq submit --name screeps-eval --max-parallel-runs 1 --cwd "$PWD" -- \
+  python3 -m samples.rl.agent.eval_closed_loop \
+    --checkpoint samples/rl/runs/policy.pt --ticks 20000 --num-envs 10 --seed 900
 ```
 
-`generateRoom` adds a room with procedurally generated terrain to the shard's
-terrain blob and `rooms` set. Like `npx xxscreeps import`, it is an offline
-operation — stop the server before running it so cached world state in the
-backend, processor, and runner workers doesn't go stale. Exits are read from
-any already-generated neighbor, so adjacent generated rooms connect.
+Teacher snapshots for the reservoir's bridge lane are collected once with
+`samples.rl.agent.teacher_snapshots`. A PPO resume restores weights, both
+optimizers, reward normalization, counters and RNG state, but environments restart,
+so it continues the optimization, not the trajectories.
 
-## Docker
+## The simulator
 
-If you want to run xxscreeps in Docker, you can do this:
+Screeps is a real-time MMO played by writing JavaScript, and the environment here is
+the server that runs it. [`xxscreeps`](packages/xxscreeps/README.md) is a from-scratch
+rewrite of the Screeps backend by Marcel Laverdet, vendored in this repository and
+driven in process: [`samples/rl/env/server.mjs`](samples/rl/env/server.mjs) advances
+the engine one tick at a time and encodes an observation once the tick's intents have
+been applied. Game rules are the engine's own, so a behaviour the policy learns is a
+behaviour a Screeps server produced, not one our summary of the rules produced.
+
+Research needs changed the engine, and those changes live here rather than in a
+wrapper:
+
+- a `runner.deterministicCpu` player realm, so one seed reproduces a run end to end
+- a `game.invaders` switch, so NPC invasion waves stop perturbing an economy experiment
+- exported intent room-set keys, so state capture and restore can name cross-tick
+  intent lists exactly
+- native pathfinder fixes found by running millions of ticks, such as keeping a
+  multi-goal search's goals alive for the whole search
+
+[`docs/architecture.md`](docs/architecture.md) explains how the engine's services fit
+together and [`packages/xxscreeps/README.md`](packages/xxscreeps/README.md) is the
+engine's own documentation. The engine is ISC licensed, copyright Marcel Laverdet
+([LICENSE](LICENSE)); upstream is
+[laverdet/xxscreeps](https://github.com/laverdet/xxscreeps).
+
+## Related work
+
+[Overmind-RL](https://github.com/bencbartlett/Overmind-RL) is the other public
+Screeps RL project. It is a 2020 course environment for official-server micro:
+creeps injected for 300 ticks into empty plains, either 8-dir `move` toward
+each other or `{approach, avoid}` while Overmind scripts combat. No economy,
+spawn, or construction. The policy is stock rllib PPO, or a 4→30→8 MLP in the
+notebook. The paper claims 1,900 room-ticks/s on 64 cores; the committed
+cluster config does not match that, and per-core it is still the official
+server's ~30 Hz. Throughput contrast lives in
+[`samples/rl/docs/PERFORMANCE.md`](samples/rl/docs/PERFORMANCE.md#external-baseline-overmind-rl).
+
+This stack is a colony controller on `xxscreeps`, not a remake of that
+sandbox. Combat is the one skill they demonstrated and this policy has not.
+
+## Repository layout
+
+```text
+samples/rl/               # the RL stack
+  schema.json             # capacities, action ABI, model and PPO configuration
+  env/                    # simulator server, encoder, executor, scripted baseline
+  agent/                  # model, PPO, optimizer, reservoir, training, evaluation
+  tools/                  # showcase recorder
+  docs/                   # architecture, training gates, performance, decisions, roadmap
+  runs/                   # local checkpoints, metrics, videos (gitignored)
+samples/bots/             # hand-written Screeps bots, used as baselines and opponents
+packages/xxscreeps/       # the Screeps engine, used as the environment
+packages/pathfinder/      # native pathfinder the engine calls
+packages/client/          # browser client backend, for watching a policy play
+docs/architecture.md      # engine architecture
 ```
-git clone https://github.com/laverdet/xxscreeps.git
-cd xxscreeps
-docker build . -t xxscreeps
-docker run -t -v .:/data xxscreeps import
-docker run -t -v .:/data xxscreeps start
-```
 
-
-## Contributing
-
-If you've read this far, hopefully you would like to help. Without support from the community
-xxscreeps will definitely fail and die.
-
-If you are a novice developer the best thing you can do is help test and provide feedback. Install
-xxscreeps and get your scripts running and help find inaccuracies in the game engine.
-Troubleshooting is your most valuable contribution! A bug report of "my creeps are getting stuck
-when walking past sources" is not very helpful. A bug report of "`findClosestByPath` returns
-`undefined` instead of `null` when there is no result" or "`transfer` and `withdraw` don't transfer
-any resources when `amount === 0`; these functions should transfer the maximum amount possible in
-this case" is extraordinarily helpful.
-
-If you are a professional developer and you want to help there's still a lot of features that need
-to be developed. The [architecture overview](docs/architecture.md) explains how the major systems
-fit together — start there to build a mental model before diving into the source. Feel free to talk
-to me about the status of the project!
-
-
-## Community
-
-[Join the official Screeps Discord](https://discord.gg/hTyDafdK). You can find me [The General] in
-the #xxscreeps channel.
+| Document | Contents |
+|---|---|
+| [`samples/rl/docs/ARCHITECTURE.md`](samples/rl/docs/ARCHITECTURE.md) | Implemented model and environment contract |
+| [`samples/rl/docs/TRAINING.md`](samples/rl/docs/TRAINING.md) | Executable training, qualification and evaluation gates |
+| [`samples/rl/docs/PERFORMANCE.md`](samples/rl/docs/PERFORMANCE.md) | Measured bottlenecks, transport, compilation |
+| [`samples/rl/docs/DECISIONS.md`](samples/rl/docs/DECISIONS.md) | Conclusions that should outlive individual experiments |
+| [`samples/rl/docs/ROADMAP.md`](samples/rl/docs/ROADMAP.md) | Open blockers and unresolved experiments |

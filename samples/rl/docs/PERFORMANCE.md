@@ -90,7 +90,7 @@ omitted; the shipped trainer defaults to approach with combat commented out.
 The only explicit network is a 4→30→8 REINFORCE MLP. Production scripts call
 stock rllib PPO. This stack runs a live RCL1–RCL2 economy with held-out
 harvest-plus-progress of 13.1–18.5 per tick; combat intents exist in the ABI
-and have not been trained. See [`../README.md`](../README.md#related-work).
+and have not been trained. See the [project README](../../../README.md#related-work).
 
 ## Optimizer batch and compilation
 
