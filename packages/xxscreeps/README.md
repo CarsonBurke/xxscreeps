@@ -219,6 +219,11 @@ to be developed. The [architecture overview](../../docs/architecture.md) explain
 systems fit together — start there to build a mental model before diving into the source. Feel free
 to talk to me about the status of the project!
 
+Two investigations from running this fork under load are written up alongside it:
+[tick pipeline performance](../../docs/tick-pipeline-performance.md) profiles the engine
+threads at uncapped TPS, and [intent-handoff stalls](../../docs/intent-stall-investigation.md)
+records a lost-wakeup race in the processor's idle transition and its fix.
+
 
 ## Community
 
