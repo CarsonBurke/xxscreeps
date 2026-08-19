@@ -51,13 +51,28 @@ def _own(tensor: Tensor) -> Tensor:
 def _mean_actor_then_transition(values: Tensor, live: Tensor) -> Tensor:
     """Equal-weight team states regardless of their current population.
 
-    A shared team advantage is one sample per transition. Averaging every actor
-    globally would make a 64-creep colony count 64 times more than a bootstrap
-    state with one creep.
+    Retained for the ratio diagnostics (KL, clip fraction), which answer "how
+    far has this policy moved per team state" and stay comparable across runs.
+    The objective itself uses `_actor_level_mean`.
     """
     live_f = live.to(values.dtype)
     per_state = (values * live_f).sum(dim=-1) / live_f.sum(dim=-1).clamp_min(1.0)
     return per_state.mean()
+
+
+def _actor_level_mean(values: Tensor, live: Tensor) -> Tensor:
+    """DAPO/VAPO token-level reduction: every live actor decision weighs equally.
+
+    One "token" here is one masked macro action by one live creep, spawn, or
+    tower. VAPO eq. 6 averages within a sample and then across samples, which in
+    our setting means a 4-creep tick and a 40-creep tick move the policy by the
+    same amount; eq. 7 replaces both averages with one sum over every decision
+    in the minibatch divided by their total count. The states that carry most of
+    the colony's decisions then carry most of the gradient, so a mistake made by
+    forty creeps is suppressed forty times rather than once.
+    """
+    live_f = live.to(values.dtype)
+    return (values * live_f).sum() / live_f.sum().clamp_min(1.0)
 
 
 def _masked_latent_loss(prediction: Tensor, target: Tensor, valid: Tensor) -> Tensor:
@@ -97,6 +112,9 @@ class RolloutBatch:
     critic_logits: Tensor | None = None  # [B,K], frozen pre-update value teacher
     next_indices: Tensor | None = None  # [B], time-major next-state row
     nextlat_valid: Tensor | None = None  # [B], excludes reset/terminal/last rows
+    # [B] bool — transitions from the rollout's top-return environments, the
+    # positive set of the self-imitation NLL term (VAPO eq. 9).
+    self_imitation: Tensor | None = None
     batch_size: int = 0
 
 
@@ -112,6 +130,7 @@ class PPOTrainer:
         clip: float | None = None,
         clip_high: float | None = None,
         entropy_coef: float | None = None,
+        self_imitation_coef: float | None = None,
         value_coef: float | None = None,
         max_grad_norm: float | None = None,
         epochs: int | None = None,
@@ -179,6 +198,10 @@ class PPOTrainer:
             clip_high if clip_high is not None else float(self.cfg.get("clipHigh", self.clip))
         )
         self.entropy_coef = entropy_coef if entropy_coef is not None else float(self.cfg["entropyCoef"])
+        self.self_imitation_coef = (
+            self_imitation_coef if self_imitation_coef is not None
+            else float(self.cfg["selfImitationCoef"])
+        )
         self.value_coef = value_coef if value_coef is not None else float(self.cfg["valueCoef"])
         self.max_grad_norm = max_grad_norm if max_grad_norm is not None else float(self.cfg["maxGradNorm"])
         self.critic_max_grad_norm = float(VALUE_CFG["criticMaxGradNorm"])
@@ -525,6 +548,10 @@ class PPOTrainer:
             "nextlat_actor_state_rms": 0.0,
             "nextlat_critic_delta_rms": 0.0,
             "nextlat_critic_state_rms": 0.0,
+            "self_imitation_nll": 0.0,
+            "self_imitation_transitions": 0.0,
+            "self_imitation_fraction": 0.0,
+            "self_imitation_rollout_transitions": 0.0,
         }
         n_updates = 0
         perf_detail = os.environ.get("RL_PERF_DETAIL") == "1"
@@ -608,6 +635,16 @@ class PPOTrainer:
             rollout.nextlat_valid.reshape(B).bool()
             if rollout.nextlat_valid is not None else torch.zeros(B, dtype=torch.bool)
         )
+        self_imitation_all = (
+            rollout.self_imitation.reshape(B).bool()
+            if rollout.self_imitation is not None else torch.zeros(B, dtype=torch.bool)
+        )
+        if self_imitation_all.numel() != B:
+            raise RuntimeError("self-imitation mask must have exactly B rows")
+        stats["self_imitation_fraction"] = float(self_imitation_all.float().mean())
+        # Exact rollout-wide count; `self_imitation_transitions` below is the
+        # per-minibatch mean the accumulator produces.
+        stats["self_imitation_rollout_transitions"] = float(self_imitation_all.sum())
         if next_indices_all.numel() != B or nextlat_valid_all.numel() != B:
             raise RuntimeError("NextLat rollout pairing must have exactly B rows")
         if next_indices_all.numel() and (
@@ -654,6 +691,9 @@ class PPOTrainer:
             self.device, non_blocking=self.device.type == "cuda",
         )
         nextlat_valid_device = nextlat_valid_all.to(
+            self.device, non_blocking=self.device.type == "cuda",
+        )
+        self_imitation_device = self_imitation_all.to(
             self.device, non_blocking=self.device.type == "cuda",
         )
 
@@ -739,10 +779,12 @@ class PPOTrainer:
                 ret = ret_device.index_select(0, inds_device)
                 next_inds_device = next_indices_device.index_select(0, inds_device)
                 nextlat_valid = nextlat_valid_device.index_select(0, inds_device)
+                self_imitation = self_imitation_device.index_select(0, inds_device)
 
                 if n_real < inds.numel():
                     adv[n_real:] = 0
                     nextlat_valid[n_real:] = False
+                    self_imitation[n_real:] = False
 
                 next_actor_latent = target_actor_all.index_select(0, next_inds_device)
                 next_critic_latent = target_critic_all.index_select(0, next_inds_device)
@@ -762,6 +804,8 @@ class PPOTrainer:
                 nextlat_actor_mse = torch.zeros((), device=self.device)
                 nextlat_actor_delta_rms = torch.zeros((), device=self.device)
                 nextlat_actor_state_rms = torch.zeros((), device=self.device)
+                self_imitation_nll = torch.zeros((), device=self.device)
+                self_imitation_rows = torch.zeros((), device=self.device)
 
                 # --- Actor update (activations freed before critic) ---
                 if not critic_only:
@@ -788,8 +832,34 @@ class PPOTrainer:
                     actor_adv = adv_r.unsqueeze(-1).expand_as(ratio)
                     surr1 = ratio * actor_adv
                     surr2 = torch.clamp(ratio, ratio_lo, ratio_hi) * actor_adv
-                    policy_loss = -_mean_actor_then_transition(torch.min(surr1, surr2), live)
+                    policy_loss = -_actor_level_mean(torch.min(surr1, surr2), live)
+
                     entropy = _mean_actor_then_transition(actor_ent, live)
+
+                    # VAPO eq. 9: NLL of the actions actually taken in the
+                    # rollout's top-return segments, over the same live-actor
+                    # mask as the surrogate. Averaging an actor's active
+                    # argument factors before weighting actors equally is the
+                    # repo's established imitation-NLL convention
+                    # (`safe_bc_nll`, `_actor_balanced_factor_nll`): a spawn
+                    # decision activates up to 22 factors against a creep
+                    # macro's one to four, so summing them would make this term
+                    # mostly a body-composition cloning loss and would leave
+                    # `selfImitationCoef` incomparable to every other NLL
+                    # coefficient here.
+                    factor_active = _real(out.factor_active)
+                    factor_lp = _real(out.factor_logprob.float())
+                    active_f = factor_active.to(factor_lp.dtype)
+                    per_actor_nll = -(factor_lp * active_f).sum(dim=-1) / (
+                        active_f.sum(dim=-1).clamp_min(1.0)
+                    )
+                    positive = live * _real(self_imitation).unsqueeze(-1).to(live.dtype)
+                    self_imitation_nll = (
+                        (per_actor_nll * positive).sum() / positive.sum().clamp_min(1.0)
+                    )
+                    self_imitation_rows = (
+                        (positive.sum(dim=-1) > 0).to(torch.float32).sum()
+                    )
                     with self._autocast():
                         predicted_actor_latent = self.actor.predict_next_latent(
                             out.state_latent, obs_mb, act_mb,
@@ -806,6 +876,7 @@ class PPOTrainer:
                     (
                         policy_loss
                         - self.entropy_coef * entropy
+                        + self.self_imitation_coef * self_imitation_nll
                         + self.nextlat_actor_mse_coef * nextlat_actor_mse
                     ).backward()
                     gn_a = nn.utils.clip_grad_norm_(
@@ -815,7 +886,9 @@ class PPOTrainer:
                     self.actor_opt.step()
                     actor_timer.__exit__(None, None, None)
                     # Drop actor activations before critic forward (VRAM peak).
-                    del out, new_lp, logratio, ratio, surr1, surr2, adv_r, old_lp_r, actor_adv, actor_ent, live, predicted_actor_latent
+                    del out, new_lp, logratio, ratio, surr1, surr2, adv_r, old_lp_r
+                    del actor_adv, actor_ent, live, predicted_actor_latent, positive
+                    del factor_active, factor_lp, active_f, per_actor_nll
 
                 # --- Critic update ---
                 critic_timer = cuda_event_pair("critic_step")
@@ -865,7 +938,7 @@ class PPOTrainer:
                 # Free mb device tensors before next slice
                 del obs_mb, act_mb, old_lp_mb, adv, ret, ret_r
                 del predicted_critic_latent, next_actor_latent, next_critic_latent
-                del next_critic_logits, nextlat_valid
+                del next_critic_logits, nextlat_valid, self_imitation
 
                 gna_t = gn_a if torch.is_tensor(gn_a) else torch.as_tensor(float(gn_a), device=self.device)
                 gnc_t = gn_c if torch.is_tensor(gn_c) else torch.as_tensor(float(gn_c), device=self.device)
@@ -887,6 +960,8 @@ class PPOTrainer:
                         "nextlat_actor_state_rms": nextlat_actor_state_rms.detach(),
                         "nextlat_critic_delta_rms": nextlat_critic_delta_rms.detach(),
                         "nextlat_critic_state_rms": nextlat_critic_state_rms.detach(),
+                        "self_imitation_nll": self_imitation_nll.detach(),
+                        "self_imitation_transitions": self_imitation_rows.detach(),
                     }
                 else:
                     acc["policy_loss"] = acc["policy_loss"] + policy_loss.detach()
@@ -904,6 +979,8 @@ class PPOTrainer:
                     acc["nextlat_actor_state_rms"] = acc["nextlat_actor_state_rms"] + nextlat_actor_state_rms.detach()
                     acc["nextlat_critic_delta_rms"] = acc["nextlat_critic_delta_rms"] + nextlat_critic_delta_rms.detach()
                     acc["nextlat_critic_state_rms"] = acc["nextlat_critic_state_rms"] + nextlat_critic_state_rms.detach()
+                    acc["self_imitation_nll"] = acc["self_imitation_nll"] + self_imitation_nll.detach()
+                    acc["self_imitation_transitions"] = acc["self_imitation_transitions"] + self_imitation_rows.detach()
                 n_updates += 1
 
                 # KL early-stop still needs a sync for control flow when enabled.
@@ -914,6 +991,7 @@ class PPOTrainer:
                 del nextlat_actor_mse, nextlat_critic_mse, nextlat_critic_kl
                 del nextlat_actor_delta_rms, nextlat_actor_state_rms
                 del nextlat_critic_delta_rms, nextlat_critic_state_rms
+                del self_imitation_nll, self_imitation_rows
 
                 if stop_now:
                     early_stop = True
@@ -928,6 +1006,7 @@ class PPOTrainer:
         stats["batch_size"] = float(B)
         stats["clip"] = float(self.clip)
         stats["clip_high"] = float(self.clip_high)
+        stats["self_imitation_coef"] = float(self.self_imitation_coef)
         stats["early_stop"] = float(early_stop)
         stats["stopped_epoch"] = float(stopped_epoch)
         stats["target_kl"] = float(self.target_kl)

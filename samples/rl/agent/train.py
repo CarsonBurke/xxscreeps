@@ -3,7 +3,8 @@
 Train ViT-PPO on xxscreeps with:
   · 16 parallel rollouts by default
   · one bounded adaptive-horizon extension for competent rollouts
-  · CleanRL-style GAE: one λ for policy advantages and critic returns
+  · VAPO decoupled GAE: length-adaptive λ_policy advantages, λ=1 critic targets
+  · DAPO/VAPO actor-level loss normalization and positive-example self-imitation
   · causal action-conditioned NextLat losses on actor and critic world states
   · discounted-return reward RMS + rollout-level advantage normalization
   · Flash-Attention via SDPA + bf16 autocast
@@ -15,6 +16,7 @@ import argparse
 import os
 import random
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from datetime import datetime
@@ -43,9 +45,14 @@ try:
         source_signature,
         validate_artifact,
     )
-    from samples.rl.agent.constants import PPO_CFG, SCHEMA
+    from samples.rl.agent.constants import MAX_ROOMS, PPO_CFG, SCHEMA
     from samples.rl.agent.env_client import stack_batches
-    from samples.rl.agent.gae import cleanrl_gae
+    from samples.rl.agent.gae import (
+        decoupled_gae,
+        length_adaptive_lambda,
+        segment_lengths_tn,
+        self_imitation_mask,
+    )
     from samples.rl.agent.metrics_log import MetricsLog
     from samples.rl.agent.model import Agent, count_params
     from samples.rl.agent.muon import (
@@ -55,6 +62,7 @@ try:
     from samples.rl.agent.rollout_buffer import HostRolloutBuffer
     from samples.rl.agent.running_stats import RewardNormalizer
     from samples.rl.agent.state_reservoir import (
+        EnvStartState,
         LANE_FRESH,
         LaneMixture,
         ReservoirConfig,
@@ -75,9 +83,14 @@ except ImportError:
         source_signature,
         validate_artifact,
     )
-    from agent.constants import PPO_CFG, SCHEMA
+    from agent.constants import MAX_ROOMS, PPO_CFG, SCHEMA
     from agent.env_client import stack_batches
-    from agent.gae import cleanrl_gae
+    from agent.gae import (
+        decoupled_gae,
+        length_adaptive_lambda,
+        segment_lengths_tn,
+        self_imitation_mask,
+    )
     from agent.metrics_log import MetricsLog
     from agent.model import Agent, count_params
     from agent.muon import OPTIMIZER_KIND, PPO_MUON_LR, optimizer_parameter_counts
@@ -85,6 +98,7 @@ except ImportError:
     from agent.rollout_buffer import HostRolloutBuffer
     from agent.running_stats import RewardNormalizer
     from agent.state_reservoir import (
+        EnvStartState,
         LANE_FRESH,
         LaneMixture,
         ReservoirConfig,
@@ -283,6 +297,158 @@ def _start_mixture(args: argparse.Namespace) -> LaneMixture:
     remaining = num_envs - fresh
     teacher = remaining // 3 if args.teacher_start_states is not None else 0
     return LaneMixture(fresh=fresh, policy=remaining - teacher, teacher=teacher)
+
+
+def _available_host_bytes() -> int:
+    """Host memory a large allocation can actually claim, or 0 if unknown.
+
+    `MemAvailable` is the kernel's own estimate and counts reclaimable page
+    cache; `SC_AVPHYS_PAGES` counts only free pages, so on any host with a warm
+    cache it under-reports by tens of GiB and would raise a false alarm on a
+    rollout that fits comfortably.
+    """
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, AttributeError):
+        return 0
+
+
+class GroupedStartProvider:
+    """Serve one drawn start state to `k` environments (VAPO §4.3 Group-Sampling).
+
+    `StartStateController.start_path` draws independently per environment, so a
+    rollout holds at most one trajectory per world and every advantage is judged
+    only against the critic's estimate of it. Handing the same record to `k`
+    environments produces `k` trajectories that diverge from an identical state,
+    which is the contrastive signal group sampling contributes in GRPO and VAPO,
+    and it costs no extra collection: the same fleet covers fewer worlds.
+
+    The grouping lives here rather than in the reservoir because the controller's
+    public surface already expresses it — draw once, replay the per-environment
+    bookkeeping onto the group — and `agent/state_reservoir.py` is owned
+    elsewhere.
+
+    Groups never straddle lanes. A fresh-lane environment must run an untouched
+    full lifecycle (`books_full_lifecycle` reads its lane, and a restored world
+    would book a fragment as a completed episode) and has no record to share, so
+    fresh environments pass straight through.
+    """
+
+    def __init__(self, controller: StartStateController, *, group_size: int):
+        group_size = int(group_size)
+        if group_size < 1:
+            raise ValueError(f"groupStartsPerState must be at least 1, got {group_size}")
+        self.controller = controller
+        self.group_size = group_size
+        self.group_of: dict[int, int] = {}
+        self.members: dict[int, tuple[int, ...]] = {}
+        for lane in dict.fromkeys(controller.lanes):
+            if lane == LANE_FRESH:
+                continue
+            lane_indices = [
+                index for index, assigned in enumerate(controller.lanes)
+                if assigned == lane
+            ]
+            ungrouped: list[int] = []
+            for start in range(0, len(lane_indices), group_size):
+                block = tuple(lane_indices[start : start + group_size])
+                if len(block) < 2:
+                    # A lone remainder has nobody to contrast against.
+                    ungrouped.extend(block)
+                    continue
+                group = len(self.members)
+                self.members[group] = block
+                for index in block:
+                    self.group_of[index] = group
+            if ungrouped:
+                print(
+                    f"[train] group starts: {lane} lane leaves env(s) "
+                    f"{ungrouped} ungrouped — {len(lane_indices)} environments "
+                    f"do not divide into groups of {group_size}",
+                    flush=True,
+                )
+        # group → (path, leader bookkeeping, environments still owed the state)
+        self._shared: dict[int, tuple[str, dict, set[int]]] = {}
+        # Restarts are issued from the environment worker threads.
+        self._lock = threading.Lock()
+        self.drawn = 0
+        self.shared_starts = 0
+        self.unpaired = 0
+
+    @property
+    def grouped_envs(self) -> int:
+        return len(self.group_of)
+
+    def begin_rollout(self) -> None:
+        """Reset per-rollout pairing and counters.
+
+        Group sampling only buys contrast if the paired trajectories land in the
+        same optimizer batch, so a pairing does not survive the rollout that
+        opened it. Members of one lane share `segment_ticks` and come due on the
+        same step, so this discards a pending pairing only when a leader
+        restarted on the rollout's final steps; `unpaired` counts those so the
+        loss is visible rather than inferred from a gap between the counters.
+        """
+        with self._lock:
+            self.unpaired = sum(len(owed) for _p, _b, owed in self._shared.values())
+            self._shared.clear()
+            self.drawn = 0
+            self.shared_starts = 0
+
+    def __call__(self, index: int) -> str | None:
+        group = self.group_of.get(index)
+        if group is None:
+            return self.controller.start_path(index)
+        with self._lock:
+            shared = self._shared.get(group)
+            if shared is not None:
+                path, bookkeeping, owed = shared
+                if index in owed and Path(path).is_file():
+                    owed.discard(index)
+                    if not owed:
+                        del self._shared[group]
+                    # Replaying the leader's record leaves the capture floor and
+                    # the productivity estimate consistent with the world this
+                    # environment is actually resuming.
+                    self.controller.envs[index] = EnvStartState.from_json(bookkeeping)
+                    self.shared_starts += 1
+                    return path
+                # Either the record was evicted from its stratum and its file
+                # deleted, or this member already consumed it. Reservoir paths
+                # carry a monotone sequence number and are never reused, so
+                # falling through to an independent draw cannot restore the wrong
+                # world — the group simply loses its contrast this rollout.
+                self.unpaired += len(owed)
+                del self._shared[group]
+            path = self.controller.start_path(index)
+            self.drawn += 1
+            if path is None:
+                # An empty lane fell back to a fresh world; there is nothing to
+                # share, and the next member draws again in case one arrives.
+                return None
+            owed = set(self.members[group]) - {index}
+            if owed:
+                self._shared[group] = (
+                    path, self.controller.envs[index].to_json(), owed,
+                )
+            return path
+
+    def metrics(self) -> dict[str, float]:
+        """Per-rollout group-sampling counters (reset by `begin_rollout`)."""
+        return {
+            "start_group_size": float(self.group_size),
+            "start_group_envs": float(self.grouped_envs),
+            "start_group_draws": float(self.drawn),
+            "start_group_shared": float(self.shared_starts),
+            "start_group_unpaired": float(self.unpaired),
+        }
 
 
 def collect_rollout(
@@ -570,15 +736,33 @@ def collect_rollout(
     splice = has_term & trunc_b
     next_values_tn = torch.where(splice, term_v, next_values_tn)
 
-    adv, ret, gae_info = cleanrl_gae(
+    # VAPO eq. 5: λ_policy from the length of the segment each transition
+    # actually sits in, not the nominal T. Environments truncate on the episode
+    # horizon and restart from reservoir start states at different steps, so one
+    # rollout holds segments of very different lengths, and a per-environment
+    # mean would drag the long segment holding almost all of an environment's
+    # transitions toward its short ones.
+    policy_segment_lengths = segment_lengths_tn(dones_tn, trunc_tn)
+    lambda_policy = length_adaptive_lambda(
+        policy_segment_lengths, float(PPO_CFG["gaeLambdaPolicyAlpha"]),
+    )
+    adv, ret, gae_info = decoupled_gae(
         rewards_tn,
         values_tn,
         dones_tn,
         gamma=float(PPO_CFG["gamma"]),
-        gae_lambda=float(PPO_CFG["gaeLambda"]),
+        lambda_policy=lambda_policy,
+        lambda_critic=float(PPO_CFG["gaeLambdaCritic"]),
         next_value=bootstrap,
         truncations=trunc_tn,
         next_values_tn=next_values_tn,
+    )
+    # Raw rewards rank the environments: the normalizer's running RMS moves
+    # within a rollout, so normalized sums would compare early transitions
+    # against a different scale than late ones.
+    self_imitation_tn = self_imitation_mask(
+        rewards_raw, dones_tn, trunc_tn,
+        quantile=float(PPO_CFG["selfImitationQuantile"]),
     )
 
     types_tn = buf.tn("types")
@@ -619,6 +803,7 @@ def collect_rollout(
         critic_logits=critic_logits_flat,
         next_indices=next_indices_tn.reshape(T * N),
         nextlat_valid=nextlat_valid_tn.reshape(T * N),
+        self_imitation=self_imitation_tn.reshape(T * N),
         batch_size=T * N,
     )
 
@@ -650,6 +835,11 @@ def collect_rollout(
         "perf_deferred_critic_seconds": float(deferred_critic_seconds),
         "perf_postprocess_seconds": float(time.perf_counter() - postprocess_started),
         **gae_info,
+        "policy_segment_length_mean": float(policy_segment_lengths.mean().item()),
+        "policy_segment_length_min": float(policy_segment_lengths.min().item()),
+        "self_imitation_env_fraction": float(
+            self_imitation_tn[0].float().mean().item()
+        ),
         "snapshots_captured": float(snapshots_captured),
         "segment_boundaries": float(len(segment_returns)),
         "segment_return_mean": float(
@@ -711,8 +901,13 @@ def _ppo_checkpoint(
             reward=SCHEMA["reward"],
             normalize_reward=reward_normalizer is not None,
             gamma=float(PPO_CFG["gamma"]),
-            gae_lambda=float(PPO_CFG["gaeLambda"]),
-            critic_target="gae_return",
+            gae_lambda_critic=float(PPO_CFG["gaeLambdaCritic"]),
+            gae_lambda_policy_alpha=float(PPO_CFG["gaeLambdaPolicyAlpha"]),
+            self_imitation_coef=float(PPO_CFG["selfImitationCoef"]),
+            self_imitation_quantile=float(PPO_CFG["selfImitationQuantile"]),
+            group_starts_per_state=int(PPO_CFG["groupStartsPerState"]),
+            policy_loss_reduction="actor_level",
+            critic_target="lambda1_return",
             optimizer=OPTIMIZER_KIND,
             muon_orthogonalization="polar_express_5",
             muon_variance_reduction="normuon_low_rank_beta2",
@@ -729,11 +924,20 @@ def _ppo_checkpoint(
     if controller is not None:
         # The reservoir index is the population; the controller state is the
         # per-env segment bookkeeping. A resume needs both or it silently
-        # restarts the whole start-state distribution from tick zero.
-        index_path = controller.reservoir.save()
+        # restarts the whole start-state distribution from tick zero. The index
+        # file itself is written by `_persist_start_state` *after* the checkpoint
+        # lands, so an interrupted save can only leave a population behind the
+        # checkpoint, never one it never trained on.
         payload["start_state"] = controller.state_dict()
-        payload["start_state_index"] = str(index_path)
+        payload["start_state_index"] = str(controller.reservoir.index_path())
     return payload
+
+
+def _persist_start_state(controller: Any | None) -> None:
+    """Write the reservoir index that the just-saved checkpoint refers to."""
+    if controller is None:
+        return
+    controller.reservoir.save()
 
 
 def main() -> int:
@@ -918,6 +1122,7 @@ def main() -> int:
     )
 
     controller: StartStateController | None = None
+    start_provider: GroupedStartProvider | None = None
     env_seeds = tuple(int(args.seed) + index for index in range(args.num_envs))
     if args.reservoir is not None:
         mixture = _start_mixture(args)
@@ -968,11 +1173,16 @@ def main() -> int:
             num_envs=args.num_envs,
             max_episode=args.max_episode,
         )
-        envs.start_provider = controller.start_path
+        start_provider = GroupedStartProvider(
+            controller, group_size=int(PPO_CFG["groupStartsPerState"]),
+        )
+        envs.start_provider = start_provider
         print(
             f"[train] start-state reservoir {args.reservoir} records={reservoir.size} "
             f"mix=fresh:{mixture.fresh}/policy:{mixture.policy}/teacher:{mixture.teacher} "
-            f"segment_ticks={config.segment_ticks} per_stratum={config.per_stratum}",
+            f"segment_ticks={config.segment_ticks} per_stratum={config.per_stratum} "
+            f"group_starts={start_provider.group_size} "
+            f"grouped_envs={start_provider.grouped_envs}",
             flush=True,
         )
     elif any(
@@ -1137,14 +1347,45 @@ def main() -> int:
     # Host-side metrics (polars parquet when available) — never on act hot path
     metrics: MetricsLog | None = MetricsLog(args.logdir / "metrics.jsonl", flush_every=5)
 
+    # Project the footprint before allocating any of it: the failure mode is an
+    # OOM kill several thousand ticks into an update, with the whole rollout
+    # lost, and a 4096-step rollout is eight times the 512-step footprint.
+    projected_min = HostRolloutBuffer.projected_bytes(
+        args.max_rollout_steps, args.num_envs, rooms=1,
+    )
+    projected_max = HostRolloutBuffer.projected_bytes(
+        args.max_rollout_steps, args.num_envs, rooms=MAX_ROOMS,
+    )
+    available = _available_host_bytes()
+    print(
+        f"[train] host rollout buffer T_initial={args.steps} N={args.num_envs} "
+        f"(lazy growth to cap={args.max_rollout_steps}) "
+        f"projected={projected_min / 2**30:.1f}-{projected_max / 2**30:.1f}GiB "
+        f"host RAM at one to {MAX_ROOMS} live rooms"
+        + (f", {available / 2**30:.1f}GiB available" if available else ""),
+        flush=True,
+    )
+    if available and projected_max > available:
+        rooms_fit = max(
+            (
+                rooms for rooms in range(1, MAX_ROOMS + 1)
+                if HostRolloutBuffer.projected_bytes(
+                    args.max_rollout_steps, args.num_envs, rooms=rooms,
+                ) <= available
+            ),
+            default=0,
+        )
+        print(
+            f"[train] WARNING rollout cap {args.max_rollout_steps}×{args.num_envs} "
+            f"projects up to {projected_max / 2**30:.1f}GiB of host RAM against "
+            f"{available / 2**30:.1f}GiB available; only {rooms_fit} of "
+            f"{MAX_ROOMS} live rooms fits. Lower --max-rollout-steps or "
+            f"--num-envs if the fleet expands past that",
+            flush=True,
+        )
     # Allocate the normal horizon and grow only when competence actually triggers
     # adaptive extension. Preallocating the old 20k cap consumed tens of GiB.
     rollout_buf = HostRolloutBuffer(args.steps, args.num_envs)
-    print(
-        f"[train] host rollout buffer T_initial={args.steps} N={args.num_envs} "
-        f"(lazy growth to cap={args.max_rollout_steps})",
-        flush=True,
-    )
 
     value_warmup = int(PPO_CFG.get("valueWarmupUpdates", 0))
     # Skip warmup when resuming past the warmup window (avoid re-freezing a trained actor).
@@ -1174,6 +1415,8 @@ def main() -> int:
             _perf_phase(f"update_{update}_collect_start")
             if controller is not None:
                 controller.update = update
+            if start_provider is not None:
+                start_provider.begin_rollout()
             rollout, obs, meta, T = collect_rollout(
                 envs,
                 trainer,
@@ -1193,6 +1436,8 @@ def main() -> int:
             )
             collect_seconds = time.perf_counter() - t0
             _perf_phase(f"update_{update}_collect_end")
+            if start_provider is not None:
+                meta.update(start_provider.metrics())
             collect_peak_alloc = 0.0
             collect_peak_reserved = 0.0
             if device.type == "cuda":
@@ -1427,9 +1672,56 @@ def main() -> int:
                 )
 
                 writer.add_scalar("gae/gamma", meta["gamma"], global_step)
-                writer.add_scalar("gae/lambda", meta["gae_lambda"], global_step)
-                writer.add_scalar("gae/decay", meta["gae_decay"], global_step)
-                writer.add_scalar("gae/effective_horizon", meta["effective_horizon"], global_step)
+                writer.add_scalar(
+                    "gae/lambda_policy", meta["gae_lambda_policy_mean"], global_step,
+                )
+                writer.add_scalar(
+                    "gae/lambda_policy_min", meta["gae_lambda_policy_min"], global_step,
+                )
+                writer.add_scalar(
+                    "gae/lambda_critic", meta["gae_lambda_critic"], global_step,
+                )
+                writer.add_scalar(
+                    "gae/lambda_policy_max", meta["gae_lambda_policy_max"], global_step,
+                )
+                writer.add_scalar(
+                    "gae/policy_decay", meta["gae_policy_decay"], global_step,
+                )
+                writer.add_scalar(
+                    "gae/policy_effective_horizon",
+                    meta["policy_effective_horizon"], global_step,
+                )
+                writer.add_scalar(
+                    "gae/policy_effective_horizon_min",
+                    meta["policy_effective_horizon_min"], global_step,
+                )
+                writer.add_scalar(
+                    "gae/critic_effective_horizon",
+                    meta["critic_effective_horizon"], global_step,
+                )
+                writer.add_scalar(
+                    "gae/policy_segment_length", meta["policy_segment_length_mean"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    "gae/policy_segment_length_min",
+                    meta["policy_segment_length_min"], global_step,
+                )
+                writer.add_scalar(
+                    "losses/self_imitation_nll", stats["self_imitation_nll"], global_step,
+                )
+                writer.add_scalar(
+                    "losses/self_imitation_transitions",
+                    stats["self_imitation_transitions"], global_step,
+                )
+                writer.add_scalar(
+                    "losses/self_imitation_fraction",
+                    stats["self_imitation_fraction"], global_step,
+                )
+                writer.add_scalar(
+                    "losses/self_imitation_rollout_transitions",
+                    stats["self_imitation_rollout_transitions"], global_step,
+                )
                 # Flush every 5 updates — per-update flush stalls the train loop
                 if (update + 1) % 5 == 0:
                     writer.flush()
@@ -1471,7 +1763,15 @@ def main() -> int:
                     if key.startswith((
                         "reservoir_", "start_", "train_phase_fraction_",
                         "snapshots_", "segment_",
+                        # The three new objective terms: without these the
+                        # durable log records nothing about decoupled GAE,
+                        # length-adaptive λ, or self-imitation.
+                        "gae_", "policy_", "self_imitation_",
                     ))
+                },
+                **{
+                    key: value for key, value in stats.items()
+                    if key.startswith("self_imitation_")
                 },
             )
 
@@ -1488,6 +1788,7 @@ def main() -> int:
                     controller=controller,
                 )
                 atomic_torch_save(ckpt, args.save)
+                _persist_start_state(controller)
                 print(f"[train] saved {args.save}", flush=True)
 
             completed_update = update
@@ -1512,6 +1813,7 @@ def main() -> int:
             controller=controller,
         )
         atomic_torch_save(final, args.save)
+        _persist_start_state(controller)
         elapsed = time.time() - start_time
         print(f"[train] done → {args.save}  global_step={global_step} elapsed={elapsed:.1f}s", flush=True)
         return 0

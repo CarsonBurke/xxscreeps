@@ -172,8 +172,9 @@
     "_comment": "HL-Gauss categorical critic on a signed-log support. The 409 bins center exactly on zero and +/-1e9 expected-return anchors, with four tail-margin bins per side. The margin makes the hard representable target bound approximately +/-1.594e9; targets beyond it fail instead of clamping. Critic gradients clip at 0.5 and values are never clipped."
   },
   "ppo": {
-    "gamma": 0.995,
-    "gaeLambda": 0.95,
+    "gamma": 0.9995,
+    "gaeLambdaCritic": 1.0,
+    "gaeLambdaPolicyAlpha": 0.5,
     "clip": 0.2,
     "clipHigh": 0.28,
     "entropyCoef": 0.005,
@@ -181,16 +182,22 @@
     "maxGradNorm": 0.5,
     "lr": 1e-4,
     "epochs": 3,
-    "minibatch": 1536,
-    "rolloutSteps": 512,
+    "minibatch": 1024,
+    "rolloutSteps": 2048,
     "numEnvs": 24,
-    "maxRolloutSteps": 512,
+    "maxRolloutSteps": 2048,
     "extendSteps": 256,
     "extendRateThreshold": 5.0,
     "normalizeReward": true,
     "rewardNormClip": 10.0,
     "targetKl": 0.0,
     "valueWarmupUpdates": 0,
-    "_targetKlNote": "KL is diagnostic only. PPO always completes the configured three epochs; clipping, not a KL anchor, defines the policy update."
+    "selfImitationCoef": 0.1,
+    "selfImitationQuantile": 0.8,
+    "groupStartsPerState": 2,
+    "_targetKlNote": "KL is diagnostic only. PPO always completes the configured three epochs; clipping, not a KL anchor, defines the policy update.",
+    "_vapoNote": "VAPO (arXiv 2504.05118). Decoupled GAE: the critic target uses gaeLambdaCritic=1 (the discounted Monte-Carlo return over the segment), while policy advantages use a per-transition lambda = 1 - 1/(gaeLambdaPolicyAlpha * l) from eq. 5, with l the length of the segment that transition sits in. At l=2048 that is lambda=0.99902, a credit window of about 677 ticks against 18 under the previous single lambda=0.95. selfImitationCoef weights the eq. 9 positive-example NLL over the top 1-selfImitationQuantile of each rollout's per-environment segment returns, selected by rank so ties cannot invert the set. groupStartsPerState environments per lane share one drawn start state.",
+    "_extendNote": "rolloutSteps equals maxRolloutSteps, so extendSteps and extendRateThreshold are inert: the adaptive one-shot extension only fires when the base horizon is below the cap. They stay configured for runs that set a shorter --steps.",
+    "_budgetNote": "minibatch and rolloutSteps are measured ceilings on this host, not preferences. A complete update at observation-ABI capacity (4 live rooms, 100 actor rows, 128 candidates) peaks at 16.5 GiB allocated for minibatch 1024 and OOMs at 1536 on a 31.4 GiB device; HostRolloutBuffer needs 15.8 GiB for 24x2048 at four live rooms and 31.5 GiB at 24x4096, which this host does not have free. Raise either only with a fresh measurement."
   }
 }

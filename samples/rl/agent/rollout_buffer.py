@@ -46,6 +46,31 @@ _HOST_R = MAX_ROOMS
 _LATENT_DIM = int(MODEL_CFG["dModel"])
 _ROOM_BUCKETS = (1, 2, MAX_ROOMS)
 
+# Page-store granularity. Every minibatch gather runs one Python-level
+# `index_copy_` per chunk its rows touch, so a fixed chunk size makes that loop
+# grow with the rollout: 256-page chunks are ~100 iterations at 512×24 and ~800
+# at 4096×24. Size chunks from the rollout instead, holding the chunk count
+# roughly constant, with a floor for the tiny buffers the tests build and a
+# ceiling so the partially filled last chunk cannot waste much.
+_PAGE_CHUNK_TARGET = 64
+_PAGE_CHUNK_MIN_PAGES = 256
+_PAGE_CHUNK_MAX_PAGES = 2048
+# Room pages are addressed by int32 ids in `patch_refs`; a wider store would
+# wrap silently into another transition's rooms.
+_MAX_PAGES = 2**31 - 1
+
+
+def _pages_per_chunk(t_max: int, n_envs: int) -> int:
+    """Chunk size that keeps the gather loop bounded for a `t_max`×`n_envs` rollout.
+
+    Sized on two active rooms, the common case: one room is the early economy
+    and four is a remote-mining fleet that only some runs reach.
+    """
+    expected_pages = max(1, int(t_max) * int(n_envs) * 2)
+    chunk = -(-expected_pages // _PAGE_CHUNK_TARGET)
+    return max(_PAGE_CHUNK_MIN_PAGES, min(_PAGE_CHUNK_MAX_PAGES, chunk))
+
+
 # Host dtypes: float feats / uint8 masks (promote on H2D only).
 _OBS_SPEC: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
     "patches": ((_HOST_R, PATCHES_PER_ROOM, PATCH_FLAT), torch.uint8),
@@ -80,7 +105,7 @@ def _tensor_nbytes(tensor: Tensor) -> int:
 class _PatchPageStore:
     """Append-only, reusable chunks of active uint8 room patches."""
 
-    def __init__(self, pages_per_chunk: int = 256):
+    def __init__(self, pages_per_chunk: int = _PAGE_CHUNK_MIN_PAGES):
         if pages_per_chunk < 1:
             raise ValueError("pages_per_chunk must be positive")
         self.pages_per_chunk = int(pages_per_chunk)
@@ -116,6 +141,13 @@ class _PatchPageStore:
         ids = torch.arange(self.count, self.count + n_pages, dtype=torch.int64)
         if n_pages == 0:
             return ids
+        # Ids run count .. count+n_pages-1, so it is the largest of those that
+        # has to stay representable.
+        if self.count + n_pages - 1 > _MAX_PAGES:
+            raise RuntimeError(
+                f"patch page store would exceed the int32 reference range: "
+                f"last id {self.count + n_pages - 1} > {_MAX_PAGES}"
+            )
         self._ensure_chunks(self.count + n_pages)
         src = 0
         while src < n_pages:
@@ -210,7 +242,7 @@ class HostRolloutBuffer:
         self.patch_refs = torch.full(
             (self.t_max, self.n, _HOST_R), -1, dtype=torch.int32,
         )
-        self.patch_pages = _PatchPageStore()
+        self.patch_pages = _PatchPageStore(_pages_per_chunk(self.t_max, self.n))
 
         # Device-side action/value rows stay on GPU during collect; we only
         # preallocate host copies if needed. Here we keep device lists out —
@@ -268,6 +300,11 @@ class HostRolloutBuffer:
         refs = torch.full((new_cap, self.n, _HOST_R), -1, dtype=torch.int32)
         refs[: self.t].copy_(self.patch_refs[: self.t])
         self.patch_refs = refs
+        if self.patch_pages.count == 0:
+            # Growth before a rollout starts can still right-size the chunking;
+            # mid-rollout it cannot, because live page ids are addressed modulo
+            # the current chunk size.
+            self.patch_pages = _PatchPageStore(_pages_per_chunk(new_cap, self.n))
         for name in _AUX_BUFFER_NAMES:
             setattr(self, name, grow(getattr(self, name)))
         self.t_max = new_cap
@@ -429,9 +466,8 @@ class HostRolloutBuffer:
         return dense + spatial
 
     @staticmethod
-    def dense_storage_bytes(t_max: int, n_envs: int) -> int:
-        """Bytes the previous dense-four-room implementation allocated."""
-        t_max, n_envs = int(t_max), int(n_envs)
+    def _per_transition_bytes() -> int:
+        """Dense host bytes one transition occupies, excluding room pages."""
         per_transition = 0
         for key, (shape, dtype) in _OBS_SPEC.items():
             if key == "patches":
@@ -451,10 +487,33 @@ class HostRolloutBuffer:
         # value, reward, done, trunc, next_value, term_value + has_term
         per_transition += 6 * torch.empty((), dtype=torch.float32).element_size()
         per_transition += torch.empty((), dtype=torch.bool).element_size()
+        return per_transition
+
+    @staticmethod
+    def dense_storage_bytes(t_max: int, n_envs: int) -> int:
+        """Bytes the previous dense-four-room implementation allocated."""
+        t_max, n_envs = int(t_max), int(n_envs)
         dense_patches = (
             t_max * n_envs * _HOST_R * PATCHES_PER_ROOM * PATCH_FLAT
         )
-        return t_max * n_envs * per_transition + dense_patches
+        return t_max * n_envs * HostRolloutBuffer._per_transition_bytes() + dense_patches
+
+    @staticmethod
+    def projected_bytes(t_max: int, n_envs: int, *, rooms: int = 1) -> int:
+        """Host bytes a filled rollout needs with `rooms` live rooms per transition.
+
+        Scaling the horizon scales this linearly, and a 4096-step rollout across
+        24 environments is 98,304 transitions: the dense tables alone are close
+        to 6 GiB and the pages add that again per live room. Worth printing
+        before allocating rather than discovering as an OOM mid-rollout.
+        """
+        if not 1 <= int(rooms) <= _HOST_R:
+            raise ValueError(f"rooms must be in [1, {_HOST_R}], got {rooms}")
+        t_max, n_envs = int(t_max), int(n_envs)
+        per_transition = HostRolloutBuffer._per_transition_bytes()
+        per_transition += _HOST_R * torch.empty((), dtype=torch.int32).element_size()
+        per_transition += int(rooms) * PATCHES_PER_ROOM * PATCH_FLAT
+        return t_max * n_envs * per_transition
 
     def tn(self, name: str) -> Tensor:
         """[T, N] or [T, N, ...] slice for filled steps."""

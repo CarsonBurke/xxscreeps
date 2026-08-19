@@ -44,7 +44,14 @@ from samples.rl.agent.constants import (
     SCHEMA_PATH,
     TARGET_FEAT,
 )
-from samples.rl.agent.gae import cleanrl_gae, compute_gae_tn
+from samples.rl.agent.gae import (
+    compute_gae_tn,
+    decoupled_gae,
+    length_adaptive_lambda,
+    segment_lengths_tn,
+    segment_returns_per_env,
+    self_imitation_mask,
+)
 from samples.rl.agent.hl_gauss import HLGaussSupport
 from samples.rl.agent.model import ActionConditionedDynamics, Actor, Agent, Critic
 from samples.rl.agent.muon import (
@@ -402,8 +409,8 @@ def test_gae_cuts_chain_on_truncation_without_done():
     assert float(adv[2, 0]) > 90.0, adv
 
 
-def test_cleanrl_gae_shares_actor_advantage_and_critic_return():
-    """Match an independent CleanRL recurrence, including episode boundaries."""
+def test_decoupled_gae_pairs_policy_lambda_advantages_with_lambda_one_targets():
+    """One pass, two estimators: independent recurrence for each λ."""
     generator = torch.Generator().manual_seed(17)
     T, N = 37, 5
     rewards = torch.randn(T, N, generator=generator)
@@ -415,31 +422,46 @@ def test_cleanrl_gae_shares_actor_advantage_and_critic_return():
     # Segment boundaries truncate without ending the episode.
     trunc[20, 1] = trunc[5, 3] = 1
     next_values = torch.randn(T, N, generator=generator)
-    gae_lambda = 0.95
-    gamma = 0.995
+    lambda_policy = torch.tensor([0.95, 0.5, 0.99, 0.0, 0.8])
+    gamma = 0.9995
 
-    expected_adv = torch.zeros_like(rewards)
-    last_gae = torch.zeros(N)
-    for t in reversed(range(T)):
-        terminated = dones[t] * (1.0 - trunc[t])
-        delta = rewards[t] + gamma * next_values[t] * (1.0 - terminated) - values[t]
-        cut = torch.clamp(dones[t] + trunc[t], max=1.0)
-        last_gae = delta + gamma * gae_lambda * (1.0 - cut) * last_gae
-        expected_adv[t] = last_gae
-    actual_adv, actual_ret, info = cleanrl_gae(
-        rewards, values, dones, gamma=gamma, gae_lambda=gae_lambda,
+    def recurrence(lam: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros_like(rewards)
+        last_gae = torch.zeros(N)
+        for t in reversed(range(T)):
+            terminated = dones[t] * (1.0 - trunc[t])
+            delta = rewards[t] + gamma * next_values[t] * (1.0 - terminated) - values[t]
+            cut = torch.clamp(dones[t] + trunc[t], max=1.0)
+            last_gae = delta + gamma * lam * (1.0 - cut) * last_gae
+            out[t] = last_gae
+        return out
+
+    expected_adv = recurrence(lambda_policy)
+    expected_lambda_one = recurrence(torch.ones(N))
+    actual_adv, actual_ret, info = decoupled_gae(
+        rewards, values, dones, gamma=gamma, lambda_policy=lambda_policy,
         truncations=trunc, next_values_tn=next_values,
     )
     assert torch.equal(actual_adv, expected_adv)
-    assert torch.equal(actual_ret, actual_adv + values)
-    _, lambda_one_return = compute_gae_tn(
-        rewards, values, dones, gamma, 1.0,
-        truncations=trunc, next_values_tn=next_values,
-    )
-    assert not torch.equal(actual_ret, lambda_one_return)
+    # The critic target is the λ=1 return, not `policy advantage + value`.
+    assert torch.equal(actual_ret, expected_lambda_one + values)
+    assert not torch.equal(actual_ret, actual_adv + values)
     assert info["gamma"] == gamma
-    assert info["gae_lambda"] == gae_lambda
-    assert abs(info["effective_horizon"] - 1 / (1 - gamma * gae_lambda)) < 1e-9
+    assert info["gae_lambda_critic"] == 1.0
+    assert abs(info["gae_lambda_policy_mean"] - float(lambda_policy.mean())) < 1e-9
+    assert info["gae_lambda_policy_min"] == 0.0
+    assert abs(
+        info["critic_effective_horizon"] - 1 / (1 - gamma)
+    ) < 1e-6
+    # The reported policy horizon is the mean of the per-λ windows, not the
+    # window of the mean λ; the two differ by Jensen once λ varies, and the
+    # former is what the rollout's transitions actually got.
+    per_lambda = 1.0 / (1.0 - gamma * lambda_policy)
+    assert abs(info["policy_effective_horizon"] - float(per_lambda.mean())) < 1e-4
+    assert abs(info["policy_effective_horizon_min"] - float(per_lambda.min())) < 1e-4
+    assert info["policy_effective_horizon"] > 1 / (
+        1 - gamma * float(lambda_policy.mean())
+    )
 
 
 def test_type_gated_logprob_none_low_entropy():
@@ -567,14 +589,22 @@ def test_value_contract_has_no_clipping_and_fixed_critic_grad_clip():
     assert SCHEMA["value"]["loss"] == "hlGauss"
     assert SCHEMA["value"]["transform"] == "symlog"
     assert int(SCHEMA["artifact"]["learningAbi"]) >= 12
-    assert float(SCHEMA["ppo"]["gamma"]) == 0.995
-    assert float(SCHEMA["ppo"]["gaeLambda"]) == 0.95
+    assert float(SCHEMA["ppo"]["gamma"]) == 0.9995
+    assert "gaeLambda" not in SCHEMA["ppo"]
+    assert float(SCHEMA["ppo"]["gaeLambdaCritic"]) == 1.0
+    assert float(SCHEMA["ppo"]["gaeLambdaPolicyAlpha"]) == 0.5
+    assert float(SCHEMA["ppo"]["selfImitationCoef"]) == 0.1
+    assert float(SCHEMA["ppo"]["selfImitationQuantile"]) == 0.8
+    assert int(SCHEMA["ppo"]["groupStartsPerState"]) == 2
     assert int(SCHEMA["ppo"]["numEnvs"]) == 24
-    assert int(SCHEMA["ppo"]["rolloutSteps"]) == 512
-    assert int(SCHEMA["ppo"]["maxRolloutSteps"]) == 512
-    assert int(SCHEMA["ppo"]["minibatch"]) == 1536
+    # Launch budget is a measured ceiling, not taste: minibatch 1536 OOMs and
+    # 24x4096 exceeds host RAM once environments hold four live rooms
+    # (docs/PERFORMANCE.md#the-measured-ceiling-is-at-capacity-not-at-typical-occupancy).
+    assert int(SCHEMA["ppo"]["rolloutSteps"]) == 2048
+    assert int(SCHEMA["ppo"]["maxRolloutSteps"]) == 2048
+    assert int(SCHEMA["ppo"]["minibatch"]) == 1024
     assert int(SCHEMA["ppo"]["epochs"]) == 3
-    assert 512 * 24 // 1536 == 8
+    assert 2048 * 24 // 1024 == 48
     assert int(SCHEMA["nextLat"]["horizon"]) == 1
 
 
@@ -1459,7 +1489,8 @@ def test_nextlat_action_context_gradients_are_finite_and_mask_none_exactly():
         assert torch.isfinite(parameter.grad).all(), name
 
 
-def test_ppo_population_does_not_reweight_transitions():
+def test_ratio_diagnostics_equal_weight_team_states():
+    """The KL and clip-fraction diagnostics stay per team state, not per actor."""
     from samples.rl.agent.ppo import _mean_actor_then_transition
 
     values = torch.zeros(2, MAX_ACTORS)
@@ -3072,6 +3103,460 @@ def test_server_neutrality_avoids_fragile_reservation_username_getter():
     assert "!room.controller.owner" not in server_source
 
 
+def test_segment_lengths_are_per_transition_not_a_per_env_mean():
+    """VAPO's `l` is the length of the segment the transition itself sits in."""
+    T, N = 8, 3
+    dones = torch.zeros(T, N)
+    trunc = torch.zeros(T, N)
+    trunc[3, 0] = 1  # env 0: two segments of four
+    dones[7, 1] = 1  # env 1: a cut on the last step ends the only segment
+    trunc[1, 2] = trunc[5, 2] = 1  # env 2: segments of two, four and two
+    lengths = segment_lengths_tn(dones, trunc)
+    assert lengths.shape == (T, N)
+    assert lengths[:, 0].tolist() == [4.0] * 8
+    assert lengths[:, 1].tolist() == [8.0] * 8
+    assert lengths[:, 2].tolist() == [2, 2, 4, 4, 4, 4, 2, 2]
+    # Without a cut every transition sits in one segment of the full rollout.
+    assert bool((segment_lengths_tn(torch.zeros(T, N)) == float(T)).all())
+    # A cut on step 0 opens a new segment from step 1.
+    head = torch.zeros(4, 1)
+    head[0, 0] = 1
+    assert segment_lengths_tn(head)[:, 0].tolist() == [1.0, 3.0, 3.0, 3.0]
+    # The transition-weighted mean is what the estimator effectively applies; a
+    # segment-count mean would report 8/3 for env 2 instead of 3.
+    assert torch.allclose(
+        lengths.mean(dim=0), torch.tensor([4.0, 8.0, 3.0]),
+    ), lengths.mean(dim=0)
+
+
+def test_length_adaptive_lambda_matches_vapo_equation_five_and_clamps():
+    """λ_policy = 1 - 1/(alpha*l), clamped into [0, 1)."""
+    lengths = torch.tensor([4096.0, 100.0, 2.0, 1.0, 0.0])
+    lam = length_adaptive_lambda(lengths, 0.5)
+    assert float(lam[0]) == 1.0 - 1.0 / 2048.0
+    assert abs(float(lam[1]) - (1.0 - 1.0 / 50.0)) < 1e-6
+    assert float(lam[2]) == 0.0  # alpha*l == 1 → one-step TD
+    assert float(lam[3]) == 0.0  # alpha*l < 1 would be negative
+    assert float(lam[4]) == 0.0  # a zero-length segment cannot bootstrap
+    # The upper clamp stays strictly below one for any length.
+    huge = float(length_adaptive_lambda(torch.tensor([1e30]), 0.5)[0])
+    assert 0.0 < huge < 1.0, huge
+    for bad in (0.0, -1.0, float("nan")):
+        try:
+            length_adaptive_lambda(lengths, bad)
+        except ValueError:
+            pass
+        else:  # pragma: no cover - contract violation
+            raise AssertionError(f"alpha={bad} must be rejected")
+    # A NaN length passes a `< 0` guard and clamp propagates it into every
+    # advantage, so it has to be rejected outright.
+    for bad_lengths in (
+        torch.tensor([4.0, float("nan")]),
+        torch.tensor([4.0, float("inf")]),
+        torch.tensor([4.0, -1.0]),
+    ):
+        try:
+            length_adaptive_lambda(bad_lengths, 0.5)
+        except ValueError:
+            pass
+        else:  # pragma: no cover - contract violation
+            raise AssertionError(f"lengths={bad_lengths.tolist()} must be rejected")
+    # The credit window the configured schema actually buys at a full rollout.
+    # The horizon is the largest one host RAM allows at four live rooms, so this
+    # is the real window, not the one a 4096-step rollout would have bought.
+    gamma = float(SCHEMA["ppo"]["gamma"])
+    alpha = float(SCHEMA["ppo"]["gaeLambdaPolicyAlpha"])
+    steps = int(SCHEMA["ppo"]["rolloutSteps"])
+    configured = float(length_adaptive_lambda(torch.tensor([float(steps)]), alpha)[0])
+    horizon = 1.0 / (1.0 - gamma * configured)
+    assert 600.0 < horizon < 800.0, horizon
+
+
+def test_decoupled_gae_consumes_the_per_transition_length_adaptive_lambda():
+    """The exact per-segment λ tensor reaches the policy pass unchanged."""
+    T, N = 6, 2
+    rewards = torch.ones(T, N)
+    values = torch.zeros(T, N)
+    dones = torch.zeros(T, N)
+    trunc = torch.zeros(T, N)
+    trunc[2, 1] = 1  # env 1 restarted mid-rollout: shorter segments, smaller λ
+    lengths = segment_lengths_tn(dones, trunc)
+    assert lengths[:, 0].tolist() == [6.0] * 6
+    assert lengths[:, 1].tolist() == [3.0] * 6
+    lam = length_adaptive_lambda(lengths, 0.5)
+    assert lam.shape == (T, N)
+    lam0, lam1 = float(lam[0, 0]), float(lam[0, 1])
+    assert abs(lam0 - (1.0 - 1.0 / 3.0)) < 1e-6
+    assert abs(lam1 - (1.0 - 2.0 / 3.0)) < 1e-6
+    gamma = 0.99
+    adv, ret, info = decoupled_gae(
+        rewards, values, dones, gamma=gamma, lambda_policy=lam,
+        next_value=torch.zeros(N), truncations=trunc,
+        next_values_tn=torch.zeros(T, N),
+    )
+    assert info["gae_lambda_policy_min"] == float(lam.min())
+    assert info["gae_lambda_policy_max"] == float(lam.max())
+    # Zero values make every TD error exactly the reward, so the λ=1 target is
+    # the discounted reward-to-go of the environment's own segment.
+    assert abs(float(ret[0, 0]) - sum(gamma ** k for k in range(6))) < 1e-5
+    assert abs(float(ret[0, 1]) - sum(gamma ** k for k in range(3))) < 1e-5
+    # The policy pass weights the same TD errors by each segment's own λ.
+    assert abs(float(adv[0, 0]) - sum((gamma * lam0) ** k for k in range(6))) < 1e-5
+    assert abs(float(adv[0, 1]) - sum((gamma * lam1) ** k for k in range(3))) < 1e-5
+    assert float(adv[0, 0]) > float(adv[0, 1]) > 0.0
+    # Reported horizons average the per-transition windows, not the mean λ.
+    expected = float((1.0 / (1.0 - gamma * lam)).mean())
+    assert abs(info["policy_effective_horizon"] - expected) < 1e-4
+    assert info["critic_effective_horizon"] == 1.0 / (1.0 - gamma)
+    # A λ outside [0, 1) diverges the chain and must be refused.
+    for bad in (1.0, 1.5, -0.1, float("nan")):
+        try:
+            decoupled_gae(
+                rewards, values, dones, gamma=gamma, lambda_policy=bad,
+                next_value=torch.zeros(N), truncations=trunc,
+            )
+        except ValueError:
+            pass
+        else:  # pragma: no cover - contract violation
+            raise AssertionError(f"lambda_policy={bad} must be rejected")
+
+
+def test_actor_level_reduction_weights_every_decision_once():
+    """DAPO/VAPO eq. 7 against the eq. 6 team mean it replaces."""
+    from samples.rl.agent.ppo import _actor_level_mean, _mean_actor_then_transition
+
+    # A one-actor state beside a three-actor state: four decisions in total.
+    values = torch.tensor([[0.5, 0.0, 0.0], [1.0, 2.0, 3.0]], requires_grad=True)
+    live = torch.tensor([[1.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
+    actor_level = _actor_level_mean(values, live)
+    team_mean = _mean_actor_then_transition(values, live)
+    assert torch.allclose(actor_level, torch.tensor((0.5 + 1.0 + 2.0 + 3.0) / 4.0))
+    assert torch.allclose(team_mean, torch.tensor((0.5 + 6.0 / 3.0) / 2.0))
+    assert not torch.allclose(actor_level, team_mean)
+    actor_grad = torch.autograd.grad(actor_level, values, retain_graph=True)[0]
+    team_grad = torch.autograd.grad(team_mean, values)[0]
+    assert not torch.allclose(actor_grad, team_grad)
+    # Uniform per decision, and nothing leaks into the masked slots.
+    assert torch.allclose(actor_grad[live > 0], torch.full((4,), 0.25))
+    assert float(actor_grad[0, 1]) == 0.0
+    # The team mean gave the lone actor 0.5 and each of the three 1/6.
+    assert abs(float(team_grad[0, 0]) - 0.5) < 1e-7
+    assert abs(float(team_grad[1, 0]) - 1.0 / 6.0) < 1e-7
+
+
+def test_self_imitation_quantile_selects_top_return_environments():
+    """The positive set is the rollout's own upper slice of segment returns."""
+    T, N = 4, 5
+    rewards = torch.zeros(T, N)
+    rewards[:, 0] = 1.0  # segment return 4
+    rewards[:, 1] = 0.0  # 0
+    rewards[:, 2] = 2.0  # 8
+    rewards[:, 3] = -1.0  # -4
+    rewards[:, 4] = 0.5  # 2
+    dones = torch.zeros(T, N)
+    assert torch.allclose(
+        segment_returns_per_env(rewards, dones),
+        torch.tensor([4.0, 0.0, 8.0, -4.0, 2.0]),
+    )
+    top = self_imitation_mask(rewards, dones, quantile=0.8)
+    assert top.shape == (T, N)
+    # Rank cut of ceil((1-q)*N) = 1 environment, which on distinct returns is
+    # exactly the set at or above the interpolated 0.8 quantile (4.8 here).
+    assert top[0].tolist() == [False, False, True, False, False]
+    # The mask is a property of the environment, so it is constant along time.
+    assert bool((top == top[0]).all())
+    median = self_imitation_mask(rewards, dones, quantile=0.5)
+    assert median[0].tolist() == [True, False, True, False, True]
+    # Everything qualifies at quantile 0, nothing but the best at quantile 1.
+    assert bool(self_imitation_mask(rewards, dones, quantile=0.0).all())
+    assert self_imitation_mask(rewards, dones, quantile=1.0)[0].tolist() == [
+        False, False, True, False, False,
+    ]
+    # Restarting three times must not rank an environment above an equally
+    # productive one that ran a single segment.
+    split = torch.zeros(T, N)
+    split[1, 0] = 1
+    doubled = rewards.clone()
+    doubled[:, 0] *= 2
+    assert abs(
+        float(segment_returns_per_env(doubled, torch.zeros(T, N), split)[0])
+        - float(segment_returns_per_env(rewards, dones)[0])
+    ) < 1e-6
+
+    # Ties must not invert the positive set. Reward is `0.1*harvest +
+    # 1.0*control`, so early in training most colonies score exactly 0.0, and a
+    # `>= quantile` rule would then admit every one of them.
+    tied = torch.zeros(T, 24)
+    tied[:, 20] = 1.0
+    tied[:, 21] = 2.0
+    tied[:, 22] = 3.0
+    tied[:, 23] = 4.0
+    zeros = torch.zeros(T, 24)
+    threshold = float(torch.quantile(segment_returns_per_env(tied, zeros), 0.8))
+    assert threshold == 0.0  # the naive rule would select all 24
+    selected = self_imitation_mask(tied, zeros, quantile=0.8)
+    assert int(selected[0].sum()) == 5  # ceil(0.2 * 24)
+    assert selected[0, 20:].tolist() == [True] * 4  # every earner is in
+    # Self-imitation needs a strictly better slice to imitate. A rollout where
+    # every environment scored identically has none, and cloning an arbitrary
+    # five of them is cloning the current policy's failures, so the positive set
+    # is empty rather than the intended size.
+    flat = torch.ones(T, 24)
+    assert int(self_imitation_mask(flat, zeros, quantile=0.8)[0].sum()) == 0
+    assert int(self_imitation_mask(zeros, zeros, quantile=0.8)[0].sum()) == 0
+
+
+def test_self_imitation_term_enters_the_policy_loss():
+    """Eq. 10 weighting: the NLL is reported and it moves the actor."""
+    import copy
+
+    from samples.rl.agent.ppo import PPOTrainer, RolloutBatch
+
+    torch.manual_seed(29)
+    batch_size = 4
+    obs = _dummy_obs_batch(batch_size)
+    obs["actor_mask"][:, :3] = 1
+    obs["intent_mask"][:, :3, :, INTENT_TYPES.index("none")] = 1
+    obs["intent_mask"][:, :3, :, INTENT_TYPES.index("move")] = 1
+    obs["amount_mask"][..., 0] = 1
+    agent = Agent()
+    with torch.no_grad():
+        out = agent.actor(obs)
+        critic_logits, critic_latent = agent.critic.value_logits_and_latent(obs)
+        values = agent.critic.support.to_expected_scalar(critic_logits)
+    positive = torch.tensor([True, False, True, False])
+
+    def build() -> RolloutBatch:
+        return RolloutBatch(
+            obs=obs,
+            actions={
+                "types": out.types,
+                "dirs": out.dirs,
+                "targets": out.targets,
+                "amounts": out.amounts,
+            },
+            logprob=out.actor_logprob,
+            value=values,
+            reward=torch.ones(batch_size),
+            done=torch.zeros(batch_size),
+            advantage=torch.tensor([1.0, -0.5, 0.25, 2.0]),
+            ret=torch.tensor([1.0, 0.5, 1.5, 2.0]),
+            actor_latent=out.state_latent,
+            critic_latent=critic_latent,
+            critic_logits=critic_logits,
+            self_imitation=positive,
+            batch_size=batch_size,
+        )
+
+    def run(coefficient: float) -> tuple[dict, torch.Tensor]:
+        torch.manual_seed(31)
+        trainer = PPOTrainer(
+            copy.deepcopy(agent),
+            device="cpu",
+            compile_model=False,
+            epochs=1,
+            minibatch=batch_size,
+            self_imitation_coef=coefficient,
+        )
+        stats = trainer.update(build())
+        flat = torch.cat(
+            [p.detach().reshape(-1) for p in trainer.actor.parameters()]
+        )
+        return stats, flat
+
+    off_stats, off_params = run(0.0)
+    on_stats, on_params = run(1.0)
+    assert off_stats["self_imitation_coef"] == 0.0
+    assert on_stats["self_imitation_coef"] == 1.0
+    # Two of four transitions contribute, and the reported term is a real NLL.
+    assert on_stats["self_imitation_transitions"] == 2.0
+    assert on_stats["self_imitation_fraction"] == 0.5
+    assert on_stats["self_imitation_nll"] > 0.0
+    # The term is reported independently of its weight.
+    assert abs(on_stats["self_imitation_nll"] - off_stats["self_imitation_nll"]) < 1e-6
+    # A weighted term that changes no parameter is not in the loss.
+    assert not torch.allclose(off_params, on_params)
+    # An empty positive set contributes nothing rather than a spurious zero mean.
+    torch.manual_seed(31)
+    empty = PPOTrainer(
+        copy.deepcopy(agent), device="cpu", compile_model=False,
+        epochs=1, minibatch=batch_size, self_imitation_coef=1.0,
+    )
+    empty_rollout = build()
+    empty_rollout.self_imitation = torch.zeros(batch_size, dtype=torch.bool)
+    empty_stats = empty.update(empty_rollout)
+    assert empty_stats["self_imitation_nll"] == 0.0
+    assert empty_stats["self_imitation_transitions"] == 0.0
+
+
+def _group_controller(num_envs: int, policy_envs: int, work: str):
+    from samples.rl.agent.state_reservoir import (
+        LaneMixture,
+        ReservoirConfig,
+        StartStateController,
+        StartStateReservoir,
+    )
+
+    import random as _random
+
+    reservoir = StartStateReservoir(
+        work, config=ReservoirConfig(), rng=_random.Random(7),
+    )
+    for index in range(8):
+        destination = reservoir.destination(
+            lane="policy", event="pre_spawn", phase="mid", outcome="success",
+            tick=1000 * (index + 1), env=index,
+        )
+        destination.write_bytes(b"snapshot")
+        reservoir.admit(_snapshot_record(destination, tick=1000 * (index + 1)))
+    return StartStateController(
+        reservoir,
+        mixture=LaneMixture(
+            fresh=num_envs - policy_envs, policy=policy_envs, teacher=0,
+        ),
+        num_envs=num_envs,
+        max_episode=20_000,
+    )
+
+
+def _snapshot_record(destination: Path, *, tick: int):
+    from samples.rl.agent.state_reservoir import SnapshotRecord
+
+    return SnapshotRecord(
+        path=str(destination),
+        lane="policy",
+        event="pre_spawn",
+        phase="mid",
+        tick=tick,
+        step=tick - 1,
+        outcome="success",
+        curriculum="seed_outpost",
+        bytes=8,
+        creeps=12,
+        owned_rooms=1,
+        remote_staffed=1,
+        skill_rate=6.0,
+        update=3,
+        env=0,
+        seed=3,
+        events=("pre_spawn",),
+        created=0.0,
+    )
+
+
+def test_group_starts_serve_k_environments_one_state():
+    """VAPO §4.3 group sampling: k environments diverge from an identical world."""
+    from samples.rl.agent.train import GroupedStartProvider
+
+    with tempfile.TemporaryDirectory() as work:
+        controller = _group_controller(6, 4, work)
+        assert controller.lanes == (
+            "fresh", "fresh", "policy", "policy", "policy", "policy",
+        )
+        provider = GroupedStartProvider(controller, group_size=2)
+        assert provider.grouped_envs == 4
+        assert provider.members == {0: (2, 3), 1: (4, 5)}
+        # A fresh-lane environment is never grouped and never restored.
+        assert provider(0) is None
+        assert provider(1) is None
+        first = provider(2)
+        assert first is not None
+        assert provider(3) == first
+        second = provider(4)
+        assert provider(5) == second
+        # Two records were drawn to start four grouped environments; the fresh
+        # lane bypasses the provider's bookkeeping entirely.
+        assert provider.drawn == 2
+        assert provider.shared_starts == 2
+        # The follower's bookkeeping describes the world it actually resumed.
+        assert controller.envs[3].origin_path == controller.envs[2].origin_path
+        assert controller.envs[3].origin_tick == controller.envs[2].origin_tick
+        assert controller.envs[3].last_capture_step == (
+            controller.envs[2].last_capture_step
+        )
+        # Sharing does not persist across rollouts: the record may be evicted.
+        provider.begin_rollout()
+        before = provider.drawn
+        provider(3)
+        assert provider.drawn == before + 1
+
+
+def test_group_start_size_is_configurable_and_one_disables_grouping():
+    from samples.rl.agent.train import GroupedStartProvider
+
+    with tempfile.TemporaryDirectory() as work:
+        controller = _group_controller(6, 4, work)
+        whole_lane = GroupedStartProvider(controller, group_size=4)
+        paths = {whole_lane(index) for index in (2, 3, 4, 5)}
+        assert len(paths) == 1 and None not in paths
+        assert whole_lane.drawn == 1 and whole_lane.shared_starts == 3
+
+        ungrouped = GroupedStartProvider(controller, group_size=1)
+        assert ungrouped.grouped_envs == 0
+        assert ungrouped.members == {}
+        for index in (2, 3, 4, 5):
+            assert ungrouped(index) is not None
+        assert ungrouped.shared_starts == 0
+        try:
+            GroupedStartProvider(controller, group_size=0)
+        except ValueError:
+            pass
+        else:  # pragma: no cover - contract violation
+            raise AssertionError("group_size=0 must be rejected")
+
+
+def test_rollout_page_chunking_scales_with_the_configured_horizon():
+    """A 4096-step rollout must not multiply the per-minibatch gather loop."""
+    from samples.rl.agent.rollout_buffer import (
+        _PAGE_CHUNK_MAX_PAGES,
+        _pages_per_chunk,
+        HostRolloutBuffer,
+    )
+
+    envs = int(SCHEMA["ppo"]["numEnvs"])
+    short = _pages_per_chunk(512, envs)
+    long = _pages_per_chunk(int(SCHEMA["ppo"]["maxRolloutSteps"]), envs)
+    assert long > short
+    assert long <= _PAGE_CHUNK_MAX_PAGES
+    # Chunk count, not chunk size, is what the gather loop pays for.
+    def chunks(steps: int) -> int:
+        pages = steps * envs  # one live room, the common early-economy case
+        return -(-pages // _pages_per_chunk(steps, envs))
+    assert chunks(4096) <= 2 * chunks(512)
+    small = HostRolloutBuffer(4, 2)
+    assert small.patch_pages.pages_per_chunk == _pages_per_chunk(4, 2)
+    # Page ids are int32 in `patch_refs`; the store refuses to outgrow them.
+    # `count` is how many pages are already stored, so ids run `0..count-1` and
+    # the next id is `count` itself. `_MAX_PAGES` is the largest representable
+    # id, so the first append that must be refused is the one at `count ==
+    # _MAX_PAGES + 1`. Fabricating `_MAX_PAGES` instead asks for a legal id and
+    # lets the store try to materialize 8.4M chunks of 17.9 MB before failing,
+    # which OOM-kills the host rather than testing the guard.
+    small.patch_pages.count = 2**31
+    try:
+        small.patch_pages.append(
+            torch.zeros(1, *small.patch_pages.chunks[0].shape[1:], dtype=torch.uint8)
+            if small.patch_pages.chunks
+            else torch.zeros(1, PATCHES_PER_ROOM, PATCH_FLAT, dtype=torch.uint8)
+        )
+    except RuntimeError as error:
+        assert "int32" in str(error)
+    else:  # pragma: no cover - contract violation
+        raise AssertionError("page ids must stay inside the int32 reference range")
+
+
+def test_rollout_footprint_projection_tracks_the_horizon():
+    from samples.rl.agent.rollout_buffer import HostRolloutBuffer
+
+    envs = int(SCHEMA["ppo"]["numEnvs"])
+    one = HostRolloutBuffer.projected_bytes(512, envs, rooms=1)
+    eight = HostRolloutBuffer.projected_bytes(4096, envs, rooms=1)
+    assert eight == 8 * one
+    assert HostRolloutBuffer.projected_bytes(4096, envs, rooms=4) > eight
+    # Sparse projection must stay under the dense four-room equivalent.
+    assert eight < HostRolloutBuffer.dense_storage_bytes(4096, envs)
+
+
 def main() -> int:
     tests = [
         test_muon_partition_covers_hidden_matrices_only,
@@ -3087,7 +3572,7 @@ def main() -> int:
         test_gae_truncation_bootstraps,
         test_gae_cuts_chain_on_done,
         test_gae_cuts_chain_on_truncation_without_done,
-        test_cleanrl_gae_shares_actor_advantage_and_critic_return,
+        test_decoupled_gae_pairs_policy_lambda_advantages_with_lambda_one_targets,
         test_type_gated_logprob_none_low_entropy,
         test_hl_gauss_support,
         test_hl_gauss_symlog_high_return_geometry_and_decode,
@@ -3120,7 +3605,7 @@ def main() -> int:
         test_nextlat_none_actions_have_zero_context_and_ignore_idle_state,
         test_nextlat_issued_actions_are_sensitive_and_permutation_invariant,
         test_nextlat_action_context_gradients_are_finite_and_mask_none_exactly,
-        test_ppo_population_does_not_reweight_transitions,
+        test_ratio_diagnostics_equal_weight_team_states,
         test_room_pack_keeps_expansion_capacity,
         test_entity_capacity_buckets_preserve_live_policy_and_value,
         test_rollout_zero_pads_compact_action_prefix,
@@ -3154,6 +3639,16 @@ def main() -> int:
         test_ti_interleaved_spawn_supervises_counts_but_not_grouped_order,
         test_closed_loop_late_window_uses_current_not_peak_activity,
         test_server_neutrality_avoids_fragile_reservation_username_getter,
+        test_segment_lengths_are_per_transition_not_a_per_env_mean,
+        test_length_adaptive_lambda_matches_vapo_equation_five_and_clamps,
+        test_decoupled_gae_consumes_the_per_transition_length_adaptive_lambda,
+        test_actor_level_reduction_weights_every_decision_once,
+        test_self_imitation_quantile_selects_top_return_environments,
+        test_self_imitation_term_enters_the_policy_loss,
+        test_group_starts_serve_k_environments_one_state,
+        test_group_start_size_is_configurable_and_one_disables_grouping,
+        test_rollout_page_chunking_scales_with_the_configured_horizon,
+        test_rollout_footprint_projection_tracks_the_horizon,
     ]
     failed = 0
     for t in tests:
