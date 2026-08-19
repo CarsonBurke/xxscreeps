@@ -138,10 +138,65 @@ function makeRoom(roomName, roomIndex, creepsPerRoom) {
 	return { room, creeps, sites };
 }
 
-export function makeEncodeFixture({ roomCount = 4, creepsPerRoom = 24 } = {}) {
-	const roomNames = [ 'W7N3', 'W7N4', 'W8N3', 'W8N4' ].slice(0, roomCount);
-	const built = roomNames.map((name, index) => makeRoom(name, index, creepsPerRoom));
+/**
+ * A visible room the player holds nothing in: scouted terrain and sources, an
+ * unowned controller, no structures of mine, and no creeps. Room slots are a
+ * budget, so these rooms are exactly what must lose a slot first.
+ */
+function makeNeutralRoom(roomName, roomIndex) {
+	const controller = {
+		id: `${roomName}:controller`,
+		structureType: C.STRUCTURE_CONTROLLER,
+		pos: position(roomName, 25, 25),
+		hits: 1,
+		hitsMax: 1,
+		my: false,
+		owner: undefined,
+		level: 0,
+		progress: 0,
+		progressTotal: 0,
+		room: null,
+	};
+	const sources = [ 0, 1 ].map(index => ({
+		id: `${roomName}:source:${index}`,
+		pos: position(roomName, 12 + index * 24, 14 + index * 20),
+		energy: 3000,
+		energyCapacity: 3000,
+		ticksToRegeneration: 0,
+	}));
+	const terrain = {
+		get(x, y) {
+			if (x === 0 || y === 0 || x === 49 || y === 49) return C.TERRAIN_MASK_WALL;
+			if ((x + y + roomIndex) % 19 === 0) return C.TERRAIN_MASK_SWAMP;
+			return 0;
+		},
+	};
+	const room = {
+		name: roomName,
+		controller,
+		energyAvailable: 0,
+		energyCapacityAvailable: 0,
+		getTerrain: () => terrain,
+		lookForAt: () => [],
+		find(type) {
+			if (type === C.FIND_SOURCES) return sources;
+			if (type === C.FIND_STRUCTURES) return [ controller ];
+			return [];
+		},
+	};
+	controller.room = room;
+	return room;
+}
+
+export function makeEncodeFixture({
+	roomCount = 4, creepsPerRoom = 24, neutralRooms = [],
+} = {}) {
+	const ownedNames = [ 'W7N3', 'W7N4', 'W8N3', 'W8N4' ].slice(0, roomCount);
+	const built = ownedNames.map((name, index) => makeRoom(name, index, creepsPerRoom));
 	const rooms = Object.fromEntries(built.map(({ room }) => [ room.name, room ]));
+	for (const [ index, name ] of neutralRooms.entries()) {
+		rooms[name] = makeNeutralRoom(name, ownedNames.length + index);
+	}
 	const creeps = Object.fromEntries(built.flatMap(item => item.creeps).map(creep => [ creep.name, creep ]));
 	const constructionSites = Object.fromEntries(
 		built.flatMap(item => item.sites).map(site => [ site.id, site ]),
@@ -155,6 +210,8 @@ export function makeEncodeFixture({ roomCount = 4, creepsPerRoom = 24 } = {}) {
 			gcl: { level: 3 },
 			cpu: { bucket: 9876 },
 		},
-		roomNames,
+		roomNames: [ ...ownedNames, ...neutralRooms ],
+		ownedNames,
+		neutralRooms: [ ...neutralRooms ],
 	};
 }

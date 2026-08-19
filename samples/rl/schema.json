@@ -3,7 +3,7 @@
   "artifact": {
     "formatVersion": 1,
     "modelAbi": 9,
-    "observationAbi": 8,
+    "observationAbi": 9,
     "actionAbi": 11,
     "rewardAbi": 3,
     "teacherAbi": 20,

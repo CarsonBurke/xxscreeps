@@ -67,3 +67,52 @@ test('zero visible rooms emit the required empty one-room patch payload', () => 
 	assert.ok(observation._raw.patches.every(value => value === 0));
 	assert.ok(observation._raw.roomMask.every(value => value === 0));
 });
+
+test('room slots go to rooms the player holds, not to alphabetical order', () => {
+	// Two owned rooms plus three scouted empties whose names all sort before the
+	// second owned room. Under a name-ordered rule the staffed room W8N3 loses its
+	// slot and every creep in it silently leaves the action space.
+	const neutral = [ 'W1N1', 'W2N1', 'W3N1' ];
+	const { Game } = makeEncodeFixture({
+		roomCount: 2, creepsPerRoom: 3, neutralRooms: neutral,
+	});
+	const visible = [ 'W7N3', 'W7N4', ...neutral ];
+
+	const observation = encodeObservationFromRooms(Game, '100', visible);
+
+	assert.equal(observation.roomNames[0], 'W7N3');
+	assert.ok(observation.roomNames.includes('W7N4'));
+	assert.equal(observation.roomNames.length, SCHEMA.maxRooms);
+	assert.equal(observation.globals.visibleRooms, visible.length);
+	assert.equal(observation.globals.hiddenCreepActors, 0);
+	assert.equal(observation.globals.droppedStakeRooms, 0);
+	assert.equal(observation.globals.roomOverflow, 0);
+	// Each owned room contributes a room actor, a spawn, and a tower; all six
+	// creeps keep an actor slot.
+	assert.equal(observation.globals.actorCount, 6 + 6);
+	assert.equal(observation.globals.actorOverflow, 0);
+});
+
+test('a dropped room the player staffs is reported as overflow', () => {
+	// Four owned rooms fill every slot, and a scouted room is holding two of my
+	// creeps. Dropping it is not budgeting: those creeps leave the action space.
+	const { Game } = makeEncodeFixture({
+		roomCount: 4, creepsPerRoom: 2, neutralRooms: [ 'W9N9' ],
+	});
+	const moved = Object.values(Game.creeps).slice(0, 2);
+	for (const creep of moved) creep.room = Game.rooms.W9N9;
+
+	const observation = encodeObservationFromRooms(Game, '100', [
+		'W7N3', 'W7N4', 'W8N3', 'W8N4', 'W9N9',
+	]);
+
+	assert.equal(observation.roomNames.length, SCHEMA.maxRooms);
+	assert.ok(!observation.roomNames.includes('W9N9'));
+	assert.equal(observation.globals.droppedStakeRooms, 1);
+	assert.equal(observation.globals.roomOverflow, 1);
+	assert.equal(observation.globals.hiddenCreepActors, moved.length);
+	// The tier says what the slot cost: a scout room, not production.
+	assert.equal(observation.globals.droppedCreepOnlyRooms, 1);
+	assert.equal(observation.globals.droppedOwnedRooms, 0);
+	assert.equal(observation.globals.actorOverflow, 0);
+});

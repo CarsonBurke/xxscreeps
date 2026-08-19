@@ -312,23 +312,61 @@ export function encodeObservationFromRooms(Game, userId, roomNames, actorOutcome
 	);
 	const allRoomNames = [ ...new Set(roomNames) ].filter(name => Game.rooms[name]);
 	const visibleRoomCount = allRoomNames.length;
-	let fullStructureActors = 0;
+	const myStructureActorsByRoom = new Map();
 	for (const roomName of allRoomNames) {
 		const room = Game.rooms[roomName];
-		if (room.controller?.my) fullStructureActors += 1;
-		fullStructureActors += room.find(C.FIND_MY_STRUCTURES)
+		let count = room.controller?.my ? 1 : 0;
+		count += room.find(C.FIND_MY_STRUCTURES)
 			.filter(st => st.structureType === C.STRUCTURE_SPAWN || st.structureType === C.STRUCTURE_TOWER)
 			.length;
+		myStructureActorsByRoom.set(roomName, count);
 	}
-	const fullCreepActors = Object.values(Game.creeps)
-		.filter(c => c?.my && allRoomNames.includes(c.room.name)).length;
+	const fullStructureActors = allRoomNames
+		.reduce((total, name) => total + myStructureActorsByRoom.get(name), 0);
+	const myCreepsByRoom = new Map();
+	for (const creep of Object.values(Game.creeps)) {
+		if (!creep?.my) continue;
+		const name = creep.room?.name;
+		if (!name) continue;
+		myCreepsByRoom.set(name, (myCreepsByRoom.get(name) || 0) + 1);
+	}
+	const fullCreepActors = allRoomNames
+		.reduce((total, name) => total + (myCreepsByRoom.get(name) || 0), 0);
 	const fullActorCount = fullStructureActors + fullCreepActors;
+	// Four room slots are a budget, not a view of the world: a mature colony sees
+	// ten to twenty rooms. Rank by the stake the policy holds in a room, because
+	// a creep in a room that lost its slot is invisible and uncontrollable - an
+	// alphabetical rule silently deletes a staffed remote when an empty scouted
+	// room sorts earlier. Rank keys are colony facts (ownership, reservation,
+	// presence), not per-tick positions, so slots stay stable across ticks.
+	const roomStake = name => {
+		if (name === ANCHOR_ROOM) return 0;
+		const room = Game.rooms[name];
+		if (room.controller?.my || myStructureActorsByRoom.get(name)) return 1;
+		if (room.controller && controllerReservation(room.controller)
+			&& room.controller.room?.['#user'] === userId) return 2;
+		if (myCreepsByRoom.get(name)) return 3;
+		return 4;
+	};
+	const stakeByRoom = new Map(allRoomNames.map(name => [ name, roomStake(name) ]));
 	roomNames = allRoomNames
-		.filter(name => Game.rooms[name])
-		// Stable slots are part of the learned representation. Ownership changes
-		// must not permute every room token after a successful claim.
-		.sort((a, b) => (a === ANCHOR_ROOM ? -1 : b === ANCHOR_ROOM ? 1 : a.localeCompare(b)))
-		.slice(0, maxRooms);
+		.slice()
+		.sort((a, b) => (stakeByRoom.get(a) - stakeByRoom.get(b)) || a.localeCompare(b));
+	// Which stake a dropped room held decides whether raising `maxRooms` is worth
+	// its cost: losing an owned or mining room deletes production, while losing a
+	// room holding only a wandering scout costs one idle creep.
+	const droppedStakes = roomNames.slice(maxRooms).map(name => stakeByRoom.get(name));
+	const droppedStakeRooms = droppedStakes.filter(stake => stake < 4).length;
+	const droppedOwnedRooms = droppedStakes.filter(stake => stake <= 2).length;
+	const droppedCreepOnlyRooms = droppedStakes.filter(stake => stake === 3).length;
+	roomNames = roomNames.slice(0, maxRooms);
+	const keptCreepActors = roomNames
+		.reduce((total, name) => total + (myCreepsByRoom.get(name) || 0), 0);
+	const keptStructureActors = roomNames
+		.reduce((total, name) => total + myStructureActorsByRoom.get(name), 0);
+	// Creeps that room truncation removed from the action space entirely. This is
+	// a different failure from the creep cap and must not hide behind it.
+	const hiddenCreepActors = fullCreepActors - keptCreepActors;
 	// Tensor storage is a rotating snapshot pool. Every field is reset before use;
 	// spatial rooms are overwritten from complete packed terrain bases below.
 	const {
@@ -877,15 +915,25 @@ export function encodeObservationFromRooms(Game, userId, roomNames, actorOutcome
 		storedEnergy: stored,
 		controlProgress,
 		creeps: Object.keys(Game.creeps).length,
+		// Metadata only: losing every spawn ends the economy, and no encoded
+		// feature distinguishes that from an idle colony.
+		spawns: Object.keys(Game.spawns ?? {}).length,
 		gcl: Game.gcl?.level ?? 1,
 		bucket: Game.cpu?.bucket ?? 10000,
 		visibleRooms: visibleRoomCount,
 		actorCount: fullActorCount,
 		targetCount: fullTargetCount,
-		roomOverflow: visibleRoomCount > maxRooms ? 1 : 0,
-		actorOverflow: (fullActorCount > maxActors
-			|| fullCreepActors > maxCreepActors
-			|| fullStructureActors > maxStructureActors) ? 1 : 0,
+		droppedStakeRooms,
+		droppedOwnedRooms,
+		droppedCreepOnlyRooms,
+		hiddenCreepActors,
+		// Overflow means the observation could not represent something the policy
+		// holds, not that the world is large. An empty scouted room losing its slot
+		// is correct budgeting; a staffed remote losing its slot is data loss.
+		roomOverflow: droppedStakeRooms > 0 ? 1 : 0,
+		actorOverflow: (keptCreepActors + keptStructureActors > maxActors
+			|| keptCreepActors > maxCreepActors
+			|| keptStructureActors > maxStructureActors) ? 1 : 0,
 		targetOverflow: fullTargetCount > maxTargets ? 1 : 0,
 	};
 
