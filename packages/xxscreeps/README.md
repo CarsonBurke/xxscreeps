@@ -141,7 +141,9 @@ npx xxscreeps manage bot add <name> <dir> --spawn <room>
 or `dist`), not the source tree of a bot that still needs compiling. `--spawn` also places the bot's
 first spawn, whether or not a server is running; drop it to just save the code.
 
-This repo ships **Apex**, a multi-room empire sample (economy, remotes, combat, expansion):
+This repository ships **Apex**, a multi-room empire sample (economy, remotes, combat,
+expansion). Paths in the commands below are relative to the repository root, which is
+where `npx xxscreeps` runs:
 
 ```
 npx xxscreeps manage bot add apex samples/bots/apex --spawn W5N5

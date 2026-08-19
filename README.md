@@ -317,8 +317,8 @@ wrapper:
 - a `game.invaders` switch, so NPC invasion waves stop perturbing an economy experiment
 - exported intent room-set keys, so state capture and restore can name cross-tick
   intent lists exactly
-- native pathfinder fixes found by running millions of ticks, such as keeping a
-  multi-goal search's goals alive for the whole search
+- a native pathfinder fix: a multi-goal search now keeps its goals alive for the whole
+  search
 
 [`docs/architecture.md`](docs/architecture.md) explains how the engine's services fit
 together and [`packages/xxscreeps/README.md`](packages/xxscreeps/README.md) is the

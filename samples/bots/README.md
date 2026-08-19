@@ -41,5 +41,5 @@ tensorboard --logdir samples/bots/apex/runs/latest/tb
 ## Notes
 
 - Use **modern APIs**: `spawnCreep`, `store`, `Game.map.getRoomTerrain` (Apex already does).
-- Open-source bots from npm also work, e.g. `screeps-bot-tooangel` (see root README).
+- Open-source bots from npm also work, e.g. `screeps-bot-tooangel` (see the [engine README](../../packages/xxscreeps/README.md#adding-bots)).
 - `import --overwrite-code <dir>` replaces **all** imported launcher bot code with modules from `<dir>`.
