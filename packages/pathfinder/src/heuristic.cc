@@ -36,19 +36,18 @@ export class heuristic_t {
 		}
 
 		// Extract 1 or N goals from passed runtime array, avoiding `std::vector` allocation in the
-		// common 1 case.
+		// common 1 case. The multi-goal heuristic holds a span, so the goals must outlive both this
+		// call and the search that reads them: the caller owns the storage. A span into a local
+		// vector left every multi-goal search evaluating its heuristic against freed memory, which
+		// reads as "the origin already satisfies a goal" whenever the allocator has reused it.
 		template <class Lock, class Range>
-		static auto make_from_runtime(Lock& lock, Range goals, bool flee) -> heuristic_t {
-			heuristic_t::goal_t one_goal;
-			std::vector<heuristic_t::goal_t> n_goals;
+		static auto make_from_runtime(Lock& lock, Range goals, bool flee, std::vector<goal_t>& storage) -> heuristic_t {
 			if (goals.size() == 1) {
 				auto element = (*util::into_range(goals).begin()).second;
-				one_goal = js::transfer_out<heuristic_t::goal_t>(element, lock);
-				return {one_goal, flee};
-			} else {
-				n_goals = js::transfer_out<std::vector<heuristic_t::goal_t>>(goals, lock);
-				return {std::span{n_goals}, flee};
+				return {js::transfer_out<goal_t>(element, lock), flee};
 			}
+			storage = js::transfer_out<std::vector<goal_t>>(goals, lock);
+			return {std::span{storage}, flee};
 		}
 
 	private:
