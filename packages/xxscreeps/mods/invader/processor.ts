@@ -1,5 +1,6 @@
 import type { ProcessorContext } from 'xxscreeps/engine/processor/room.js';
 import type { StructureTower } from 'xxscreeps/mods/defense/tower.js';
+import { config } from 'xxscreeps/config/index.js';
 import { registerIntentProcessor, registerObjectPreTickProcessor, registerObjectTickProcessor, registerRoomTickProcessor } from 'xxscreeps/engine/processor/index.js';
 import { mappedNumericComparator } from 'xxscreeps/functional/comparator.js';
 import { Fn } from 'xxscreeps/functional/fn.js';
@@ -28,8 +29,14 @@ import { loop } from './loop/index.js';
 // Register invader NPC
 registerNPC('2', loop);
 
-// Register invader generator
+// Register invader generator. `game.invaders: false` keeps invader cores and the
+// NPC itself intact but stops new waves, because an invasion is scheduled by
+// cumulative harvest and a scenario that models economy without defense cannot
+// answer one.
 registerRoomTickProcessor((room, context) => {
+	if (config.game.invaders === false) {
+		return;
+	}
 	const target = room['#invaderEnergyTarget'] || C.INVADERS_ENERGY_GOAL;
 	const totalEnergy = room['#cumulativeEnergyHarvested'];
 	const energy = totalEnergy - room['#invaderEnergyTarget'];

@@ -108,6 +108,14 @@ export interface GameConfig {
 	 * @default 250
 	 */
 	tickSpeed?: number;
+
+	/**
+	 * Set false to stop NPC invasion waves from being generated. Invasions are
+	 * scheduled by a room's cumulative harvest, so a scenario that models
+	 * economy without defense loses its spawn to an adversary it cannot answer.
+	 * @default true
+	 */
+	invaders?: boolean;
 }
 
 export interface LauncherConfig {
@@ -279,6 +287,8 @@ export const defaults = {
 	},
 	game: {
 		respawnTimeout: 0,
+		// Widened so a scenario can turn invasions off without a type error.
+		invaders: true as boolean,
 	},
 	processor: {
 		concurrency: os.cpus().length + 1,

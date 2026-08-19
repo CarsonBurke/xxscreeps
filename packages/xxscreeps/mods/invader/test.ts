@@ -1,6 +1,7 @@
 import type { Shard } from 'xxscreeps/engine/db/index.js';
 import type { GameConstructor } from 'xxscreeps/game/index.js';
 import type { Room } from 'xxscreeps/game/room/index.js';
+import { config } from 'xxscreeps/config/index.js';
 import { pushIntentsForRoomNextTick } from 'xxscreeps/engine/processor/model.js';
 import * as C from 'xxscreeps/game/constants/index.js';
 import { RoomPosition, iterateNeighbors } from 'xxscreeps/game/position.js';
@@ -37,6 +38,23 @@ describe('Invader exit filtering', () => {
 			const invaders = Game.rooms.W7N7!.find(C.FIND_HOSTILE_CREEPS);
 			assert.ok(invaders.length > 0, 'invaders should spawn when all neighbors are uncontrolled');
 		});
+	}));
+
+	test('no invaders when generation is disabled', () => uncontrolled(async ({ player, tick }) => {
+		const previous = config.game.invaders;
+		config.game.invaders = false;
+		try {
+			await player('100', Game => {
+				Game.creeps.dummy?.move(C.TOP);
+			});
+			await tick();
+			await player('100', Game => {
+				const invaders = Game.rooms.W7N7!.find(C.FIND_HOSTILE_CREEPS);
+				assert.equal(invaders.length, 0, 'no wave may spawn while generation is disabled');
+			});
+		} finally {
+			config.game.invaders = previous;
+		}
 	}));
 
 	// All exits lead to owned rooms — no invaders should spawn
