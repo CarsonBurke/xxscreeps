@@ -1,7 +1,7 @@
 [project]
-name = "xxscreeps-rl"
+name = "screeps-rl"
 version = "0.1.0"
-description = "ViT-style PPO agent for xxscreeps"
+description = "Colony-scale PPO agent for Screeps, trained against the xxscreeps engine"
 requires-python = ">=3.10"
 dependencies = [
   "torch>=2.1",
@@ -16,8 +16,8 @@ metrics = ["polars>=0.20", "pyarrow>=14"]
 # exposes the discovered top-level `agent` package through these console scripts.
 
 [project.scripts]
-xxscreeps-rl-train = "agent.train:main"
-xxscreeps-rl-joint-pretrain = "agent.pretrain_joint:main"
+screeps-rl-train = "agent.train:main"
+screeps-rl-joint-pretrain = "agent.pretrain_joint:main"
 
 [build-system]
 requires = ["setuptools>=68"]

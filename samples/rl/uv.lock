@@ -886,6 +886,34 @@ wheels = [
 ]
 
 [[package]]
+name = "screeps-rl"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "tensorboard" },
+    { name = "torch" },
+]
+
+[package.optional-dependencies]
+metrics = [
+    { name = "polars" },
+    { name = "pyarrow" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "numpy", specifier = ">=1.24" },
+    { name = "polars", marker = "extra == 'metrics'", specifier = ">=0.20" },
+    { name = "pyarrow", marker = "extra == 'metrics'", specifier = ">=14" },
+    { name = "tensorboard", specifier = ">=2.14" },
+    { name = "torch", specifier = ">=2.1" },
+]
+provides-extras = ["metrics"]
+
+[[package]]
 name = "setuptools"
 version = "84.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1025,31 +1053,3 @@ sdist = { url = "https://files.pythonhosted.org/packages/dd/b2/381be8cfdee792dd1
 wheels = [
     { url = "https://files.pythonhosted.org/packages/93/8c/2e650f2afeb7ee576912636c23ddb621c91ac6a98e66dc8d29c3c69446e1/werkzeug-3.1.8-py3-none-any.whl", hash = "sha256:63a77fb8892bf28ebc3178683445222aa500e48ebad5ec77b0ad80f8726b1f50", size = 226459, upload-time = "2026-04-02T18:49:12.72Z" },
 ]
-
-[[package]]
-name = "xxscreeps-rl"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
-    { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "tensorboard" },
-    { name = "torch" },
-]
-
-[package.optional-dependencies]
-metrics = [
-    { name = "polars" },
-    { name = "pyarrow" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "numpy", specifier = ">=1.24" },
-    { name = "polars", marker = "extra == 'metrics'", specifier = ">=0.20" },
-    { name = "pyarrow", marker = "extra == 'metrics'", specifier = ">=14" },
-    { name = "tensorboard", specifier = ">=2.14" },
-    { name = "torch", specifier = ">=2.1" },
-]
-provides-extras = ["metrics"]
