@@ -39,8 +39,11 @@ from .constants import (
 _ROOT = Path(__file__).resolve().parents[3]
 
 _COMMAND_MAGIC = b"XAC1"
-_COMMAND_VERSION = 6
+_COMMAND_VERSION = 7
 _RESPONSE_VERSION = 4
+#: Lines of env-server stderr retained for failure reporting. Raise it with
+#: RL_STDERR_WINDOW to read a full episode of a teacher's own logging.
+_STDERR_WINDOW = max(20, int(os.environ.get("RL_STDERR_WINDOW", "80")))
 _COMMAND_HEADER = struct.Struct("<4sBBHIHBB")
 _COMMAND_OPCODES = {
     "reset": 1,
@@ -50,9 +53,8 @@ _COMMAND_OPCODES = {
     "step_expert": 5,
     "schema": 6,
     "close": 7,
-    "step_labeled": 8,
-    "snapshot": 9,
-    "restore": 10,
+    "snapshot": 8,
+    "restore": 9,
 }
 
 
@@ -344,14 +346,33 @@ class ScreepsEnv:
                     env[key] = os.environ[key]
         node_bin = self.node or os.environ.get("RL_NODE", "node")
         server = Path(__file__).resolve().parents[1] / "env" / "server.mjs"
-        cmd = [node_bin, "--import", "xxscreeps/loader", str(server)]
+        # V8 flags cannot travel through NODE_OPTIONS, and reproducibility needs
+        # some of them (a randomized hash seed reorders dictionary-mode object
+        # iteration, which a bot's own loops then follow).
+        node_flags = [
+            flag for flag in os.environ.get("RL_NODE_FLAGS", "").split() if flag
+        ]
+        cmd = [node_bin, *node_flags, "--import", "xxscreeps/loader", str(server)]
         try:
             ver = subprocess.check_output([node_bin, "-v"], text=True).strip().lstrip("v")
             major = int(ver.split(".")[0])
         except Exception:
             major = 0
         if major < 22:
-            cmd = ["mise", "exec", "node@24", "--", "node", "--import", "xxscreeps/loader", str(server)]
+            cmd = [
+                "mise", "exec", "node@24", "--", "node", *node_flags,
+                "--import", "xxscreeps/loader", str(server),
+            ]
+        # An `ulimit -v` sized to bound *our* torch/CUDA host reservations must
+        # not bound the simulator: V8 reserves heap cages and every WebAssembly
+        # instance reserves gigabytes of address space it never makes resident,
+        # and the in-engine teacher loads WASM. Raise the soft limit back to the
+        # hard limit in the child through the shell, which is exec-based and so
+        # safe from a threaded parent (`preexec_fn` is not).
+        cmd = [
+            "sh", "-c",
+            'ulimit -v "$(ulimit -Hv)" 2>/dev/null; exec "$@"', "sh", *cmd,
+        ]
         # Keep both pipes byte-oriented: command and observation formats are
         # independent (for example binary commands with JSON debug responses).
         self.proc = subprocess.Popen(
@@ -386,8 +407,10 @@ class ScreepsEnv:
                 if isinstance(line, bytes):
                     line = line.decode("utf-8", errors="replace")
                 self._stderr_tail.append(line.rstrip())
-                if len(self._stderr_tail) > 80:
-                    self._stderr_tail = self._stderr_tail[-40:]
+                # A stalled teacher is diagnosed from its own log, and the default
+                # window holds only the last few ticks of a chatty bot.
+                if len(self._stderr_tail) > _STDERR_WINDOW:
+                    self._stderr_tail = self._stderr_tail[-(_STDERR_WINDOW // 2):]
         except Exception:
             pass
 
@@ -627,34 +650,6 @@ class ScreepsEnv:
             actions,
         )
 
-    def step_labeled(
-        self,
-        actions: dict[str, torch.Tensor | np.ndarray | list],
-    ) -> tuple[
-        dict[str, torch.Tensor],
-        float,
-        bool,
-        dict[str, Any],
-        dict[str, torch.Tensor],
-    ]:
-        """Apply learner actions and return a scripted label for the pre-state."""
-        if self.expert:
-            raise RuntimeError("step_labeled is for non-expert sessions")
-        data = self._rpc({"cmd": "step_labeled", "actions": actions})
-        self.last_info = data.get("info") or {}
-        if "obs" not in data or "reward" not in data:
-            raise RuntimeError(f"malformed step_labeled response keys={list(data.keys())}")
-        teacher = _teacher_actions_from_response(
-            data, self.last_info, binary=self._bin, command="step_labeled",
-        )
-        return (
-            self._obs_to_batch(data["obs"]),
-            float(data["reward"]),
-            bool(data.get("done", False)),
-            self.last_info,
-            teacher,
-        )
-
     def close(self) -> None:
         try:
             self._rpc({"cmd": "close"})
@@ -860,7 +855,7 @@ def _as_nested_list(x: Any) -> list:
 
 def _json_command(msg: dict[str, Any]) -> dict[str, Any]:
     """Materialize tensor actions only in deliberate JSON debug mode."""
-    if msg.get("cmd") not in {"step", "step_labeled"}:
+    if msg.get("cmd") != "step":
         return msg
     actions = msg.get("actions")
     if not isinstance(actions, dict):
@@ -1022,7 +1017,7 @@ def _encode_binary_command(msg: dict[str, Any]) -> bytes:
     rows = 0
     slots = 0
     payload = b""
-    if cmd in {"step", "step_labeled"}:
+    if cmd == "step":
         actions = msg.get("actions")
         if not isinstance(actions, dict):
             raise ValueError("step actions must be a mapping")

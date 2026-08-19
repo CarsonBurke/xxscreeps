@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Collect immutable, event-stratified teacher start states for the reservoir.
+"""Collect immutable, event-stratified bridge start states for the reservoir.
 
 PPO rollouts that always begin at tick 0 only ever train on the first few
 thousand ticks of a 20,000-tick episode, so the late-game behavior taught by
-behavior cloning decays. This collector runs full teacher lifecycles once and
+behavior cloning decays. This collector runs full driver lifecycles once and
 writes the restorable world states the trainer's teacher lane starts from::
 
     RL_NODE="$(mise exec node@24 -- which node)" \\
@@ -31,8 +31,10 @@ Two admission rules keep the set usable:
   world can exceed the room/actor/target caps, and restoring into a truncated
   observation would train the policy on a world it cannot see.
 
-Evaluation and qualification stay on fresh 20,000-tick worlds; these snapshots
-are a training-start mechanism only.
+A snapshot is a world, not a demonstration: the policy chooses every action from
+it and no label is recorded, so ``--teacher scripted`` selects a world driver
+rather than a second behaviour-cloning teacher. Evaluation and qualification stay
+on fresh 20,000-tick worlds; these snapshots are a training-start mechanism only.
 """
 from __future__ import annotations
 
@@ -66,6 +68,7 @@ try:
     from samples.rl.agent.artifacts import source_signature
     from samples.rl.agent.constants import SCHEMA_SHA256
     from samples.rl.agent.env_client import ScreepsEnv
+    from samples.rl.agent.pretrain_corpus import validate_teacher_configuration
     from samples.rl.agent.state_reservoir import (
         DEFAULT_PHASE_BOUNDS, OUTCOME_TEACHER, PERIODIC_EVENT,
         RESERVOIR_FORMAT_VERSION, StartStateController, phase_for_tick,
@@ -76,6 +79,7 @@ except ImportError:  # direct `python3 samples/rl/agent/teacher_snapshots.py`
     from agent.artifacts import source_signature
     from agent.constants import SCHEMA_SHA256
     from agent.env_client import ScreepsEnv
+    from agent.pretrain_corpus import validate_teacher_configuration
     from agent.state_reservoir import (
         DEFAULT_PHASE_BOUNDS, OUTCOME_TEACHER, PERIODIC_EVENT,
         RESERVOIR_FORMAT_VERSION, StartStateController, phase_for_tick,
@@ -157,6 +161,13 @@ class CollectorConfig:
                 f"--num-envs {self.num_envs} cannot cover {len(self.curricula)} curricula "
                 f"{list(self.curricula)}; raise --num-envs or shorten --curriculum"
             )
+        if self.expert:
+            # A teacher whose colony outgrows the room slots produces worlds the
+            # policy cannot even observe, and the reservoir would restore them.
+            try:
+                validate_teacher_configuration(self.resolved_bot_dir)
+            except (ValueError, FileNotFoundError) as error:
+                raise CollectorError(str(error)) from error
 
     @property
     def expert(self) -> bool:
@@ -819,7 +830,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Collect immutable teacher start states for the PPO reservoir",
     )
-    parser.add_argument("--teacher", choices=TEACHERS, default="ti")
+    parser.add_argument(
+        "--teacher", choices=TEACHERS, default="ti",
+        help="world driver for the bridge lane; supplies start states, never labels",
+    )
     parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--steps", type=int, default=20_000, help="teacher ticks per env")
     parser.add_argument("--max-episode", type=int, default=20_000)

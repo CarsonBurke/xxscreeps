@@ -1793,129 +1793,6 @@ def test_sparse_rollout_memory_accounting_beats_dense_one_room_history():
     assert buf.patch_pages.used_bytes == steps * envs * PATCHES_PER_ROOM * PATCH_FLAT
 
 
-def test_joint_train_chunk_shapes_and_finite():
-    """_train_chunk on synthetic [T,N] data: finite NLL/vloss, no env."""
-    from samples.rl.agent.pretrain_joint import _train_chunk
-    from samples.rl.agent.rollout_buffer import HostRolloutBuffer
-
-    torch.manual_seed(1)
-    T, N = 4, 2
-    device = torch.device("cpu")
-    actor = Actor()
-    critic = Critic()
-    opt_a = torch.optim.AdamW(actor.parameters(), lr=1e-3)
-    opt_c = torch.optim.AdamW(critic.parameters(), lr=1e-3)
-
-    # per-t stacked host obs [N,...]
-    buf_obs = []
-    buf_act = []
-    chunk_buffer = HostRolloutBuffer(T, N)
-    for _ in range(T):
-        o = _dummy_obs_batch(N)
-        # Match the real host contract: quantized spatial data and byte masks.
-        o["patches"] = o["patches"].to(torch.uint8)
-        for key in (
-            "room_mask", "actor_mask", "target_mask", "intent_mask",
-            "dir_mask", "target_select_mask", "amount_mask",
-        ):
-            o[key] = o[key].to(torch.uint8)
-        o["actor_mask"][:, 0] = 1
-        o["intent_mask"][:, 0, :, INTENT_TYPES.index("none")] = 1
-        o["intent_mask"][:, 0, :, INTENT_TYPES.index("move")] = 1
-        o["amount_mask"][..., 0] = 1
-        buf_obs.append(o)
-        buf_act.append({
-            "types": torch.zeros(N, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
-            "dirs": torch.zeros(N, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
-            "targets": torch.zeros(N, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
-            "amounts": torch.zeros(N, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long),
-            "body_counts": torch.zeros(
-                N, MAX_ACTORS, INTENT_SLOTS, N_BODY_PART, dtype=torch.long,
-            ),
-            "body_order": torch.arange(N_BODY_PART).view(
-                1, 1, 1, N_BODY_PART,
-            ).expand(N, MAX_ACTORS, INTENT_SLOTS, -1).clone(),
-            "construction_types": torch.zeros(
-                N, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long,
-            ),
-            "construction_tiles": torch.zeros(
-                N, MAX_ACTORS, INTENT_SLOTS, dtype=torch.long,
-            ),
-        })
-        # legal move on live actor
-        buf_act[-1]["types"][:, 0, 0] = INTENT_TYPES.index("move")
-        chunk_buffer.write_step(
-            host_obs=o,
-            **buf_act[-1],
-            logprob=torch.zeros(N, MAX_ACTORS),
-            value=torch.zeros(N), reward=torch.ones(N), done=torch.zeros(N),
-            trunc=torch.zeros(N),
-        )
-
-    rewards = torch.ones(T, N)
-    dones = torch.zeros(T, N)
-    dones[-1] = 1.0
-    term_rows: list[list] = [[None] * N for _ in range(T)]
-    # last step terminal obs for env 0
-    term = {k: v[0:1].clone() for k, v in buf_obs[-1].items()}
-    term_rows[-1][0] = term
-
-    next_obs = {k: v.clone() for k, v in buf_obs[-1].items()}
-    nll, vloss, ev, gs, hist = _train_chunk(
-        actor, critic, actor, critic, opt_a, opt_c,
-        chunk_buffer, [], rewards, dones,
-        next_obs=next_obs,
-        term_obs_rows=term_rows,
-        gamma=0.99,
-        epochs=1,
-        mb=4,
-        value_coef=1.0,
-        device=device,
-        use_bf16=False,
-        writer=None,
-        global_step=0,
-    )
-    assert nll == nll and vloss == vloss, "NaN losses"
-    assert gs > 0
-    assert isinstance(hist, dict)
-    assert hist["_critic_max_grad_norm"] == 0.5
-    assert hist["_value_target_overflow_fraction"] == 0.0
-
-    class NaNOnTrainCritic(torch.nn.Module):
-        def __init__(self, base):
-            super().__init__()
-            self.base = base
-            self.calls = 0
-
-        def forward(self, batch, *, return_logits=False):
-            self.calls += 1
-            value = self.base(batch, return_logits=return_logits)
-            # Bootstrap and terminal-value calls are valid; corrupt the first
-            # training forward to verify that no partial artifact can proceed.
-            return value if self.calls < 3 else value * float("nan")
-
-    failing_critic = NaNOnTrainCritic(critic)
-    try:
-        _train_chunk(
-            actor, critic, actor, failing_critic, opt_a, opt_c,
-            chunk_buffer, [], rewards, dones,
-            next_obs=next_obs,
-            term_obs_rows=term_rows,
-            gamma=0.99,
-            epochs=1,
-            mb=4,
-            value_coef=1.0,
-            device=device,
-            use_bf16=False,
-            writer=None,
-            global_step=gs,
-        )
-    except FloatingPointError as error:
-        assert "critic loss" in str(error)
-    else:
-        raise AssertionError("non-finite critic batch did not fail closed")
-
-
 def test_spawn_replay_update_is_finite_and_strict():
     from samples.rl.agent.pretrain_joint import _train_spawn_replay
 
@@ -1940,7 +1817,10 @@ def test_spawn_replay_update_is_finite_and_strict():
             "body_counts", "body_order",
         )
     }
-    replay = [("ge650:7_15:0_0_0_0_0_0_0_0", 0, obs, action)]
+    eligible = torch.ones(
+        1, obs["actors"].shape[1], 6 + 2 * N_BODY_PART, dtype=torch.bool,
+    )
+    replay = [("ge650:7_15:0_0_0_0_0_0_0_0", 0, obs, action, eligible)]
     optimizer = torch.optim.Adam(actor.parameters(), lr=1e-4)
     nll, legal, diagnostics = _train_spawn_replay(
         actor, optimizer, replay,
@@ -1954,7 +1834,8 @@ def test_spawn_replay_update_is_finite_and_strict():
 
 def test_spawn_replay_is_bounded_and_mixed_buckets_pad_locally():
     from samples.rl.agent.pretrain_joint import (
-        SPAWN_REPLAY_PER_STRATUM, _append_spawn_replay, _pad_replay_tensors,
+        SPAWN_REPLAY_PER_STRATUM, _append_spawn_replay, _pad_eligible_masks,
+        _pad_replay_tensors,
     )
 
     obs = _dummy_obs_batch(1)
@@ -1985,15 +1866,32 @@ def test_spawn_replay_is_bounded_and_mixed_buckets_pad_locally():
     }
     action["types"][0, 0, 0] = spawn
     action["body_counts"][0, 0, 0, 0] = 1
+    eligible = torch.ones(
+        1, MAX_ACTORS, 6 + 2 * N_BODY_PART, dtype=torch.bool,
+    )
     replay = []
     for _ in range(SPAWN_REPLAY_PER_STRATUM + 9):
-        _append_spawn_replay(replay, obs, action)
+        _append_spawn_replay(replay, obs, action, eligible)
     assert len(replay) == SPAWN_REPLAY_PER_STRATUM
     assert replay[0][2]["actors"].shape[1] == 8
     assert replay[0][2]["targets"].shape[1] == 16
+    # The mask is compacted with its row, exactly like obs and action.
+    assert replay[0][4].shape == (1, 8, 6 + 2 * N_BODY_PART)
+
+    # A body this ABI cannot express exactly teaches nothing, and a wait row
+    # without its intent factor supervises nothing at all: neither is retained.
+    body_masked = eligible.clone()
+    body_masked[0, 0, 6 : 6 + N_BODY_PART] = False
+    bounded = len(replay)
+    _append_spawn_replay(replay, obs, action, body_masked)
+    assert len(replay) == bounded
     wait_action = {key: value.clone() for key, value in action.items()}
     wait_action["types"][0, 0, 0] = INTENT_TYPES.index("none")
-    _append_spawn_replay(replay, obs, wait_action)
+    type_masked = eligible.clone()
+    type_masked[0, 0, 0] = False
+    _append_spawn_replay(replay, obs, wait_action, type_masked)
+    assert len(replay) == bounded
+    _append_spawn_replay(replay, obs, wait_action, eligible)
     assert replay[-1][0].startswith("wait")
 
     larger_obs = _dummy_obs_batch(1)
@@ -2004,11 +1902,17 @@ def test_spawn_replay_is_bounded_and_mixed_buckets_pad_locally():
     larger_obs["room_mask"][0, :2] = 1
     larger_action = {key: value.clone() for key, value in action.items()}
     larger_action["body_counts"][0, 0, 0, 0] = 1
-    _append_spawn_replay(replay, larger_obs, larger_action)
+    _append_spawn_replay(replay, larger_obs, larger_action, eligible)
     small_row, large_row = replay[0][2], replay[-1][2]
     padded = _pad_replay_tensors(
         [small_row, large_row], actor_cap=16, target_cap=32, room_cap=2,
     )
+    padded_eligible = _pad_eligible_masks(
+        [replay[0][4], replay[-1][4]], actor_cap=16,
+    )
+    assert padded_eligible.shape == (2, 16, 6 + 2 * N_BODY_PART)
+    assert bool(padded_eligible[0, :8].all())
+    assert not bool(padded_eligible[0, 8:].any())
     assert padded["actors"].shape == (2, 16, ACTOR_FEAT)
     assert padded["targets"].shape == (2, 32, TARGET_FEAT)
     assert padded["patches"].shape[1] == 2
@@ -2018,8 +1922,8 @@ def test_spawn_replay_is_bounded_and_mixed_buckets_pad_locally():
 def test_global_lifecycle_reservoir_and_joint_epoch_are_finite():
     from samples.rl.agent.pretrain_joint import (
         LifecycleSample,
-        SCRIPTED_REPLAY_PER_STRATUM,
-        _append_scripted_lifecycle_replay,
+        TEACHER_REPLAY_PER_STRATUM,
+        _append_teacher_lifecycle_replay,
         _evaluate_global_lifecycle,
         _train_global_lifecycle_epoch,
     )
@@ -2048,17 +1952,24 @@ def test_global_lifecycle_reservoir_and_joint_epoch_are_finite():
     import numpy as np
 
     rng = np.random.default_rng(7)
+    eligible = torch.ones(
+        1, MAX_ACTORS, 6 + 2 * N_BODY_PART, dtype=torch.bool,
+    )
     reservoir: list[LifecycleSample] = []
     seen: dict[str, int] = {}
     retained: dict[str, list[int]] = {}
     for timestep in range(100):
-        _append_scripted_lifecycle_replay(
-            reservoir, seen, retained, rng, obs, action,
+        _append_teacher_lifecycle_replay(
+            reservoir, seen, retained, rng, obs, action, eligible,
             [{"curriculum": "empty"}], timestep=timestep,
         )
-    assert len(reservoir) == SCRIPTED_REPLAY_PER_STRATUM
+    assert len(reservoir) == TEACHER_REPLAY_PER_STRATUM
     assert next(iter(seen.values())) == 100
-    assert max(sample.timestep for sample in reservoir) > SCRIPTED_REPLAY_PER_STRATUM
+    assert max(sample.timestep for sample in reservoir) > TEACHER_REPLAY_PER_STRATUM
+    assert all(bool(sample.eligible.any()) for sample in reservoir)
+    assert reservoir[0].eligible.shape == (
+        1, reservoir[0].obs["actors"].shape[1], 6 + 2 * N_BODY_PART,
+    )
 
     replay = [
         LifecycleSample(
@@ -2067,6 +1978,7 @@ def test_global_lifecycle_reservoir_and_joint_epoch_are_finite():
             env_index=0,
             obs={key: value.clone() for key, value in obs.items()},
             action={key: value.clone() for key, value in action.items()},
+            eligible=eligible.clone(),
         )
         for index in range(8)
     ]
@@ -2090,6 +2002,86 @@ def test_global_lifecycle_reservoir_and_joint_epoch_are_finite():
     assert metrics["legal_frac"] == 1.0
     assert metrics["stage_empty_count"] == 1.0
     assert metrics["stage_seed_full_count"] == 1.0
+
+
+def test_lifecycle_eligibility_gates_factor_losses_and_tick_retention():
+    """A teacher mask is authoritative: unlabelled factors and ticks stay out."""
+    import numpy as np
+
+    from samples.rl.agent.pretrain_joint import (
+        LifecycleSample,
+        _append_teacher_lifecycle_replay,
+        _train_global_lifecycle_epoch,
+    )
+
+    obs = _dummy_obs_batch(1)
+    obs["actor_mask"][0, 0] = 1
+    obs["intent_mask"][0, 0, 0, INTENT_TYPES.index("move")] = 1
+    reference, reference_critic = Actor(), Critic()
+    with torch.no_grad():
+        out = reference(obs, deterministic=True)
+    action = {
+        key: getattr(out, key).detach().clone()
+        for key in (
+            "types", "dirs", "targets", "amounts",
+            "construction_types", "construction_tiles",
+            "body_counts", "body_order",
+        )
+    }
+    # The direction factor is genuinely part of this label, so only the teacher
+    # mask can keep it out of the loss.
+    assert bool(out.factor_active[0, 0, 1])
+
+    factors = 6 + 2 * N_BODY_PART
+    actor_count = obs["actors"].shape[1]
+    type_only = torch.zeros(1, actor_count, factors, dtype=torch.bool)
+    type_only[0, 0, 0] = True
+    with_dir = type_only.clone()
+    with_dir[0, 0, 1] = True
+    returns = torch.zeros(1, 1)
+
+    def direction_gradient(mask: torch.Tensor) -> float:
+        actor, critic = Actor(), Critic()
+        actor.load_state_dict(reference.state_dict())
+        critic.load_state_dict(reference_critic.state_dict())
+        _train_global_lifecycle_epoch(
+            actor, critic,
+            torch.optim.SGD(actor.parameters(), lr=0.0),
+            torch.optim.SGD(critic.parameters(), lr=0.0),
+            [LifecycleSample(
+                stratum="empty:r1:p0_3:none", timestep=0, env_index=0,
+                obs={key: value.clone() for key, value in obs.items()},
+                action={key: value.clone() for key, value in action.items()},
+                eligible=mask.clone(),
+            )],
+            returns,
+            device=torch.device("cpu"), use_bf16=False, minibatch=1,
+        )
+        grad = actor.dir_head.weight.grad
+        return 0.0 if grad is None else float(grad.abs().sum())
+
+    assert direction_gradient(type_only) == 0.0
+    assert direction_gradient(with_dir) > 0.0
+
+    reservoir: list[LifecycleSample] = []
+    seen: dict[str, int] = {}
+    retained: dict[str, list[int]] = {}
+    rng = np.random.default_rng(11)
+    unlabelled = torch.zeros(1, actor_count, factors, dtype=torch.bool)
+    for timestep in range(16):
+        _append_teacher_lifecycle_replay(
+            reservoir, seen, retained, rng, obs, action, unlabelled,
+            [{"curriculum": "empty"}], timestep=timestep,
+        )
+    assert reservoir == [] and seen == {}
+
+    _append_teacher_lifecycle_replay(
+        reservoir, seen, retained, rng, obs, action, with_dir,
+        [{"curriculum": "empty"}], timestep=3, env_labels=[5],
+    )
+    assert len(reservoir) == 1
+    assert reservoir[0].env_index == 5
+    assert bool(reservoir[0].eligible[0, 0, 1])
 
 
 def test_rare_intent_lane_balances_actors_and_scores_semantic_factors():
@@ -2157,15 +2149,23 @@ def test_rare_intent_lane_balances_actors_and_scores_semantic_factors():
         claim_out = teacher(claim_obs, deterministic=True)
     site_action = {name: getattr(site_out, name).clone() for name in action_fields}
     claim_action = {name: getattr(claim_out, name).clone() for name in action_fields}
+    factor_count = int(site_out.factor_logprob.shape[-1])
+    site_eligible = torch.zeros(
+        1, site_obs["actors"].shape[1], factor_count, dtype=torch.bool,
+    )
+    claim_eligible = torch.zeros_like(site_eligible)
+    site_eligible[0, 0, [0, 4, 5]] = True
+    claim_eligible[0, 0, [0, 2]] = True
     replay = [
         LifecycleSample(
             stratum="empty:r3:p12p:construction", timestep=0, env_index=0,
-            obs=site_obs, action=site_action,
+            obs=site_obs, action=site_action, eligible=site_eligible,
         ),
         *[
             LifecycleSample(
                 stratum="seed_claimer:r1:p0_3:control", timestep=index,
                 env_index=0, obs=claim_obs, action=claim_action,
+                eligible=claim_eligible,
             )
             for index in range(1, 4)
         ],
@@ -2173,12 +2173,15 @@ def test_rare_intent_lane_balances_actors_and_scores_semantic_factors():
     refs = _rare_intent_actor_refs(replay)
     assert len(refs["createConstructionSite"]) == 1
     assert len(refs["claimController"]) == 3
+    # A row naming the intent while supervising none of the lane's semantic
+    # factors carries no rare demonstration, so it must not be indexed.
+    type_only = torch.zeros_like(site_eligible)
+    type_only[0, 0, 0] = True
+    assert _rare_intent_actor_refs([LifecycleSample(
+        stratum="empty:r3:p12p:construction", timestep=0, env_index=0,
+        obs=site_obs, action=site_action, eligible=type_only,
+    )]) == {"createConstructionSite": [], "claimController": []}
 
-    factor_count = int(site_out.factor_logprob.shape[-1])
-    site_eligible = torch.zeros(1, site_obs["actors"].shape[1], factor_count, dtype=torch.bool)
-    claim_eligible = torch.zeros_like(site_eligible)
-    site_eligible[0, 0, [0, 4]] = True
-    claim_eligible[0, 0, [0, 2]] = True
     ti_samples, ti_refs = _ti_rare_intent_samples([
         {"timestep": 11, "obs": site_obs, "action": site_action, "eligible": site_eligible},
         {"timestep": 12, "obs": claim_obs, "action": claim_action, "eligible": claim_eligible},
@@ -2206,7 +2209,7 @@ def test_rare_intent_lane_balances_actors_and_scores_semantic_factors():
     )
     mismatched_replay = [LifecycleSample(
         stratum="empty:r3:p12p:construction", timestep=0, env_index=0,
-        obs=site_obs, action=mismatched_site_action,
+        obs=site_obs, action=mismatched_site_action, eligible=site_eligible,
     )]
     mismatched_refs = _rare_intent_actor_refs(mismatched_replay)
     mismatched_metrics = _evaluate_rare_intent_actors(
@@ -2214,10 +2217,10 @@ def test_rare_intent_lane_balances_actors_and_scores_semantic_factors():
         device=torch.device("cpu"), minibatch=1,
     )
     assert mismatched_metrics["createConstructionSite_type_accuracy"] == 1.0
-    # Legal tile preference is not a teacher-imitation target. The model owns
-    # placement quality; rare BC only preserves intent and structure type.
-    assert mismatched_metrics["createConstructionSite_factor_accuracy"] == 1.0
-    assert mismatched_metrics["createConstructionSite_accuracy"] == 1.0
+    # A construction demonstration is a structure type at a position, so a
+    # different legal tile is a different demonstration and must not score.
+    assert mismatched_metrics["createConstructionSite_factor_accuracy"] < 1.0
+    assert mismatched_metrics["createConstructionSite_accuracy"] == 0.0
 
     mismatched_type_action = {
         name: value.clone() for name, value in site_action.items()
@@ -2228,7 +2231,7 @@ def test_rare_intent_lane_balances_actors_and_scores_semantic_factors():
     )
     type_replay = [LifecycleSample(
         stratum="empty:r3:p12p:construction", timestep=0, env_index=0,
-        obs=site_obs, action=mismatched_type_action,
+        obs=site_obs, action=mismatched_type_action, eligible=site_eligible,
     )]
     type_metrics = _evaluate_rare_intent_actors(
         teacher, type_replay, _rare_intent_actor_refs(type_replay),
@@ -2286,77 +2289,6 @@ def test_ti_critic_epoch_consumes_full_balanced_order():
     assert trained == 6
     assert optimizer.step_count == 3
     assert torch.isfinite(torch.tensor(loss))
-
-
-def test_dagger_actor_lane_trains_exact_semantics_without_site_tile_imitation():
-    from samples.rl.agent.pretrain_joint import (
-        DaggerSample,
-        _evaluate_dagger_actor,
-        _train_dagger_actor_epoch,
-    )
-
-    actor = Actor()
-    site_obs = _dummy_obs_batch(1)
-    site_obs["actor_mask"][0, 0] = 1
-    site_obs["actors"][0, 0, _AF["isNonCreep"]] = 1
-    site_obs["actors"][0, 0, _AF["isRoom"]] = 1
-    site = INTENT_TYPES.index("createConstructionSite")
-    site_obs["intent_mask"][0, 0, 0, site] = 1
-    for tile in (17 * 50 + 23, 17 * 50 + 24):
-        site_obs["construction_mask"][0, 0, 1, tile // 8] |= 1 << (tile % 8)
-
-    claim_obs = _dummy_obs_batch(1)
-    claim_obs["actor_mask"][0, 0] = 1
-    claim = INTENT_TYPES.index("claimController")
-    claim_obs["intent_mask"][0, 0, 0, claim] = 1
-    claim_obs["target_mask"][0, 0] = 1
-    claim_obs["target_select_mask"][0, claim, 0] = 1
-
-    fields = (
-        "types", "dirs", "targets", "amounts", "construction_types",
-        "construction_tiles", "body_counts", "body_order",
-    )
-    with torch.no_grad():
-        site_out = actor(site_obs, deterministic=True)
-        claim_out = actor(claim_obs, deterministic=True)
-    site_action = {name: getattr(site_out, name).clone() for name in fields}
-    claim_action = {name: getattr(claim_out, name).clone() for name in fields}
-    # A different legal tile remains semantically exact: placement preference
-    # belongs to the learned policy, not the correction teacher.
-    predicted_tile = int(site_action["construction_tiles"][0, 0, 0])
-    site_action["construction_tiles"][0, 0, 0] = (
-        17 * 50 + 24 if predicted_tile == 17 * 50 + 23 else 17 * 50 + 23
-    )
-    replay = [
-        DaggerSample(
-            kind="exact_intent", stratum="createConstructionSite:r2",
-            actor_index=0, obs=site_obs, action=site_action,
-        ),
-        *[
-            DaggerSample(
-                kind="exact_intent", stratum="claimController:r1",
-                actor_index=0, obs=claim_obs, action=claim_action,
-            )
-            for index in range(1, 4)
-        ],
-    ]
-
-    before = _evaluate_dagger_actor(
-        actor, replay, device=torch.device("cpu"), minibatch=2,
-    )
-    assert before["legal_frac"] == 1.0
-    assert before["intent_createConstructionSite_accuracy"] == 1.0
-    optimizer = torch.optim.AdamW(actor.parameters(), lr=1e-4)
-    nll, legal, after = _train_dagger_actor_epoch(
-        actor, optimizer, replay,
-        device=torch.device("cpu"), use_bf16=False, minibatch=2,
-        shuffle_generator=torch.Generator().manual_seed(17),
-    )
-    assert torch.isfinite(torch.tensor(nll))
-    assert legal == 1.0
-    assert after["legal_frac"] == 1.0
-    assert after["intent_createConstructionSite_count"] == 1.0
-    assert after["intent_claimController_count"] == 3.0
 
 
 def test_joint_ckpt_meta_contract():
@@ -2474,7 +2406,6 @@ def test_artifact_source_override_is_explicit_and_narrow():
 
 def test_spawn_replay_coverage_uses_tensors_and_eval_seeds_are_disjoint():
     from samples.rl.agent.pretrain_joint import (
-        _auxiliary_seed_overlap,
         _evaluation_seed_overlap,
         _spawn_replay_coverage,
     )
@@ -2488,7 +2419,9 @@ def test_spawn_replay_coverage_uses_tensors_and_eval_seeds_are_disjoint():
             "types": torch.tensor([[[INTENT_TYPES.index("spawnCreep")]]]),
             "body_counts": torch.tensor(counts).view(1, 1, 1, N_BODY_PART),
         }
-        return stratum, 0, {"actors": actors}, action
+        eligible = torch.zeros(1, 1, 6 + 2 * N_BODY_PART, dtype=torch.bool)
+        eligible[0, 0, 6:] = True
+        return stratum, 0, {"actors": actors}, action, eligible
 
     coverage = _spawn_replay_coverage([
         row("spawn:contract:spawn_flexible_300", 300, [1, 1, 1, 0, 0, 0, 0, 0]),
@@ -2501,6 +2434,24 @@ def test_spawn_replay_coverage_uses_tensors_and_eval_seeds_are_disjoint():
     assert coverage["length_7_15"] == 1
     assert coverage["length_ge16"] == 1
 
+    # One bucketing convention decides the replay strata, the teacher coverage
+    # totals, and the standalone contract, so its boundaries are load bearing.
+    from samples.rl.agent.pretrain_joint import (
+        SPAWN_LENGTH_REQUIRED_BUCKETS,
+        SPAWN_LENGTH_UNREACHED_BUCKETS,
+        _spawn_budget_bucket,
+        _spawn_length_bucket,
+    )
+
+    assert [_spawn_budget_bucket(value) for value in (0, 300, 301, 549, 550, 649, 650)] == [
+        "le300", "le300", "301_549", "301_549", "550_649", "550_649", "ge650",
+    ]
+    assert [_spawn_length_bucket(value) for value in (1, 6, 7, 15, 16, 50)] == [
+        "le6", "le6", "7_15", "7_15", "ge16", "ge16",
+    ]
+    assert SPAWN_LENGTH_UNREACHED_BUCKETS == ("ge16",)
+    assert SPAWN_LENGTH_REQUIRED_BUCKETS == ("le6", "7_15")
+
     meta = {
         "seed": 3,
         "train_env_map": [{"seed": 3 + index} for index in range(32)],
@@ -2509,8 +2460,6 @@ def test_spawn_replay_coverage_uses_tensors_and_eval_seeds_are_disjoint():
     assert _evaluation_seed_overlap(meta, offset=1, num_envs=32)
     assert _evaluation_seed_overlap(meta, offset=10_000, num_envs=32)
     assert not _evaluation_seed_overlap(meta, offset=20_000, num_envs=32)
-    assert _auxiliary_seed_overlap(meta, {20, 30_003}) == {20}
-    assert not _auxiliary_seed_overlap(meta, {20_003, 30_003})
 
 
 def test_closed_loop_late_window_uses_current_not_peak_activity():
@@ -2572,10 +2521,36 @@ def test_closed_loop_late_window_uses_current_not_peak_activity():
     assert stage["late_spawn_success"] == 1.0
 
 
+def _spawn_contract_row(stage: str, raw_parts: list[int]):
+    """Build one corpus spawn-contract row the way the TI collector labels it."""
+    from samples.rl.agent.pretrain_joint import (
+        _body_label_factor_mask, _parts_to_count_order,
+    )
+
+    counts, order, order_exact = _parts_to_count_order(raw_parts)
+    action = {
+        "types": torch.full(
+            (1, 1, 1), INTENT_TYPES.index("spawnCreep"), dtype=torch.long,
+        ),
+        "body_counts": counts.view(1, 1, 1, N_BODY_PART),
+        "body_order": order.view(1, 1, 1, N_BODY_PART),
+    }
+    eligible = torch.zeros(1, 1, 6 + 2 * N_BODY_PART, dtype=torch.bool)
+    eligible[0, 0, 0] = True
+    eligible[0, 0] |= _body_label_factor_mask(counts, order_exact)
+    obs = {"actors": torch.zeros(1, 1, ACTOR_FEAT)}
+    return f"spawn:contract:{stage}", 0, obs, action, eligible
+
+
 def test_joint_qualification_requires_critic_expansion_and_scale():
     from types import SimpleNamespace
 
-    from samples.rl.agent.pretrain_joint import SPAWN_CURRICULA, _qualification_failures
+    from samples.rl.agent.pretrain_joint import (
+        SPAWN_CURRICULA,
+        _qualification_failures,
+        _teacher_contract_bodies,
+        _teacher_spawn_coverage,
+    )
 
     args = SimpleNamespace(
         curriculum="empty,seed_creep,seed_full,seed_claimer",
@@ -2614,6 +2589,15 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
         "nextlat_holdout_counterfactual_rows": 256.0,
         "lifecycle_after_joint_train_nll": 0.5,
         "lifecycle_final_train_nll": 0.5,
+        # Every joint epoch persists fused-lane geometry; the capacity gate
+        # rejects an artifact that lacks it.
+        "nextlat_train_optimizer_steps": 100.0,
+        "nextlat_train_rare_batches": 4.0,
+        "nextlat_train_spawn_batches": 10.0,
+        "nextlat_train_auxiliary_batches": 14.0,
+        "nextlat_train_auxiliary_minibatch": 32.0,
+        "nextlat_train_rare_exposures": 100.0,
+        "nextlat_train_spawn_exposures": 320.0,
     }
     for stage in args.curriculum.split(","):
         validation[f"lifecycle_holdout_stage_{stage}_ev"] = 0.2
@@ -2691,20 +2675,25 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
             },
         },
     }
-    expected_spawn = {
-        "spawn_flexible_300": [1, 2, 0],
-        "spawn_miner_450": [1, 1, 1, 1, 0],
-        "spawn_hauler_3000": [2, 0] * 25,
-        "spawn_builder_650": [1, 2, 2, 0, 0] * 2,
-        "spawn_upgrader_550": [1, 1, 2, 0, 1, 1, 2],
-        "spawn_claimer_650": [6, 0],
-    }
-    expected_spawn = {
-        stage: [part for part in dict.fromkeys(parts) for _ in range(parts.count(part))]
-        for stage, parts in expected_spawn.items()
-    }
+    # Synthetic *corpus* spawn-contract rows. The reference body for a world is
+    # whatever the teacher was labelled doing in it, so the gate's expectation is
+    # derived from these rows rather than from a table of scripted archetypes.
+    # `spawn_hauler_3000` interleaves its part types the way The International
+    # does, which leaves its order factors unsupervised, so only its composition
+    # is comparable.
+    spawn_replay_rows = [
+        _spawn_contract_row("spawn_flexible_300", [1, 1, 2, 0]),
+        _spawn_contract_row("spawn_miner_450", [1, 1, 1, 2, 0]),
+        _spawn_contract_row("spawn_hauler_3000", [1, 2, 1, 0, 1, 2, 1, 0, 1, 0]),
+        _spawn_contract_row("spawn_builder_650", [1, 1, 1, 1, 1, 2, 0]),
+        _spawn_contract_row("spawn_upgrader_550", [1, 1, 1, 1, 1, 0]),
+        _spawn_contract_row("spawn_claimer_650", [1, 1, 1, 1, 1, 2, 0]),
+    ]
+    teacher_spawn_bodies = _teacher_contract_bodies(spawn_replay_rows)
+    assert not teacher_spawn_bodies["spawn_hauler_3000"]["order_supervised"]
+    assert teacher_spawn_bodies["spawn_flexible_300"]["order_supervised"]
     for stage in SPAWN_CURRICULA:
-        spawn_parts = expected_spawn[stage]
+        spawn_parts = list(teacher_spawn_bodies[stage]["parts"])
         closed_loop["closed_loop_by_curriculum"][stage] = {
             "spawn_success": 1.0,
             "spawn_body_length": float(len(spawn_parts)),
@@ -2719,16 +2708,16 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
             "build": 5.0,
             "claims": 1.0,
             "max_creeps": 8.0,
-            "issued": 100.0,
-            "invalid": 0.0,
             "spawn_labels": 12.0,
-            "spawn_budget_le_300": 1.0,
+            "spawn_budget_le300": 1.0,
             "spawn_budget_301_549": 1.0,
             "spawn_budget_550_649": 1.0,
-            "spawn_budget_ge_650": 1.0,
-            "spawn_length_le_6": 1.0,
+            "spawn_budget_ge650": 1.0,
+            "spawn_length_le6": 1.0,
             "spawn_length_7_15": 1.0,
-            "spawn_length_ge_16": 1.0,
+            # This economy cannot fund a 16-part body; the bucket is recorded as
+            # a coverage gap, never required.
+            "spawn_length_ge16": 0.0,
         },
         "seed_outpost": {
             "transitions": 6000.0,
@@ -2744,8 +2733,6 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
             "late_remote_staffed_ticks": 600.0,
             "late_remote_productive_ticks": 600.0,
             "claims": 0.0,
-            "issued": 100.0,
-            "invalid": 0.0,
         },
     }
     common = dict(
@@ -2769,7 +2756,8 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
             "_spawn_replay_budget_ge650": 1.0,
             "_spawn_replay_length_le6": 1.0,
             "_spawn_replay_length_7_15": 1.0,
-            "_spawn_replay_length_ge16": 1.0,
+            # Unreachable at this economy's RCL: recorded, never required.
+            "_spawn_replay_length_ge16": 0.0,
             "_lifecycle_replay_size": 5.0,
             "_lifecycle_holdout_size": 2.0,
             "_lifecycle_replay_nll": 0.5,
@@ -2787,6 +2775,7 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
         total_claims=1,
         max_creeps=8,
         teacher_by_curriculum=teacher_by_curriculum,
+        teacher_spawn_bodies=teacher_spawn_bodies,
         validation=validation,
         closed_loop=closed_loop,
     )
@@ -2844,13 +2833,33 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
     validation["ti_critic_holdout_value_ev"] = 0.2
 
     flexible = closed_loop["closed_loop_by_curriculum"]["spawn_flexible_300"]
-    flexible["spawn_body_parts"] = [3, 3, 3, 7]  # same length/cost, useless role body
+    teacher_flexible = list(teacher_spawn_bodies["spawn_flexible_300"]["parts"])
+    flexible["spawn_body_parts"] = [3, 3, 3, 7]  # same length, useless bootstrap body
     assert "closed_loop_spawn_scenarios" in _qualification_failures(args, **common)
-    flexible["spawn_body_parts"] = expected_spawn["spawn_flexible_300"]
+    # A permutation is a different body wherever the teacher's order was exact.
+    flexible["spawn_body_parts"] = list(reversed(teacher_flexible))
+    assert "closed_loop_spawn_scenarios" in _qualification_failures(args, **common)
+    flexible["spawn_body_parts"] = teacher_flexible
+    assert _qualification_failures(args, **common) == []
 
-    flexible["spawn_body_parts_all"].append([3, 3, 3, 7])
+    # The reference is the corpus row, not a constant: relabel the teacher and the
+    # very same policy body stops qualifying.
+    relabelled = dict(common)
+    relabelled["teacher_spawn_bodies"] = _teacher_contract_bodies([
+        _spawn_contract_row("spawn_flexible_300", [1, 1, 1, 0]),
+        *spawn_replay_rows[1:],
+    ])
+    assert "closed_loop_spawn_scenarios" in _qualification_failures(args, **relabelled)
+
+    # An interleaved teacher body supervises composition only, so the policy's
+    # grouped order cannot be demanded there.
+    hauler = closed_loop["closed_loop_by_curriculum"]["spawn_hauler_3000"]
+    teacher_hauler = list(teacher_spawn_bodies["spawn_hauler_3000"]["parts"])
+    hauler["spawn_body_parts"] = list(reversed(teacher_hauler))
+    assert _qualification_failures(args, **common) == []
+    hauler["spawn_body_parts"] = teacher_hauler[:-1]
     assert "closed_loop_spawn_scenarios" in _qualification_failures(args, **common)
-    flexible["spawn_body_parts_all"].pop()
+    hauler["spawn_body_parts"] = teacher_hauler
 
     common["corpus_hist"]["_spawn_replay_budget_ge650"] = 0.0
     assert "spawn_replay_semantics" in _qualification_failures(args, **common)
@@ -2864,9 +2873,14 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
     assert "empty_closed_loop_population" in _qualification_failures(args, **common)
     empty_closed["max_creeps"] = 8.0
 
-    teacher_by_curriculum["empty"]["spawn_length_ge_16"] = 0.0
+    teacher_by_curriculum["empty"]["spawn_length_7_15"] = 0.0
     assert "teacher_spawn_body_coverage" in _qualification_failures(args, **common)
-    teacher_by_curriculum["empty"]["spawn_length_ge_16"] = 1.0
+    teacher_by_curriculum["empty"]["spawn_length_7_15"] = 1.0
+    # The unreached bucket is recorded, not required.
+    assert _qualification_failures(args, **common) == []
+    coverage = _teacher_spawn_coverage(teacher_by_curriculum)
+    assert coverage["teacher_spawn_length_unreached_ge16"] == 0.0
+    assert coverage["teacher_spawn_length_le6"] > 0
 
     validation["lifecycle_holdout_value_ev"] = -0.1
     failures = _qualification_failures(args, **common)
@@ -2896,12 +2910,10 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
         "build": 0.0,
         "claims": 0.0,
         "max_creeps": 1.0,
-        "issued": 100.0,
-        "invalid": 1.0,
     }
+    # Teacher engine legality is no longer gated: `stepExpert` reports no intent
+    # summary, so a degraded teacher shows up in its economic metrics instead.
     failures = _qualification_failures(args, **common)
-    assert "teacher_engine_legality" in failures
-    assert "empty_teacher_engine_legality" in failures
     assert "empty_closed_loop_delivery" in failures
     assert "empty_closed_loop_build" in failures
     assert "empty_closed_loop_control" in failures
@@ -2924,6 +2936,45 @@ def test_joint_qualification_requires_critic_expansion_and_scale():
     ] = 100.0
     closed_loop["closed_loop_by_curriculum"]["seed_claimer"]["claims"] = 0.0
     assert "seed_claimer_closed_loop_claim" in _qualification_failures(args, **common)
+
+
+def test_spawn_body_expectations_are_measured_never_frozen():
+    """No module may carry a table of expected spawn bodies.
+
+    The International ignores a world's archetype tag and sizes its bootstrap
+    body to the budget it sees, so every spawn-body expectation has exactly two
+    admissible sources: a corpus row it was labelled into, or a live measurement
+    of the teacher in that same world.  A module-level curriculum-to-body table
+    would silently reintroduce the scripted planner's archetypes.
+    """
+    from samples.rl.agent import eval_spawn_contract
+    from samples.rl.agent import pretrain_joint
+    from samples.rl.agent.pretrain_joint import (
+        SPAWN_CURRICULA, _spawn_body_matches, _teacher_contract_bodies,
+    )
+
+    for module in (pretrain_joint, eval_spawn_contract):
+        assert not hasattr(module, "EXPECTED_BODIES"), module.__name__
+        frozen = {
+            name: value
+            for name, value in vars(module).items()
+            if isinstance(value, dict)
+            and any(stage in value for stage in SPAWN_CURRICULA)
+        }
+        assert not frozen, f"{module.__name__} froze spawn bodies: {sorted(frozen)}"
+
+    # The gate's reference tracks the corpus row it reads, which a frozen table
+    # by construction cannot do.
+    body = [1, 1, 2, 0]
+    measured = _teacher_contract_bodies([
+        _spawn_contract_row("spawn_flexible_300", body),
+    ])["spawn_flexible_300"]
+    assert _spawn_body_matches(measured["parts"], measured)
+    relabelled = _teacher_contract_bodies([
+        _spawn_contract_row("spawn_flexible_300", [*body, 2]),
+    ])["spawn_flexible_300"]
+    assert not _spawn_body_matches(measured["parts"], relabelled)
+    assert _spawn_body_matches(relabelled["parts"], relabelled)
 
 
 def test_artifact_rejects_partial_actor_state():
@@ -3083,19 +3134,19 @@ def main() -> int:
         test_sparse_rollout_gather_uses_room_capacity_buckets,
         test_sparse_rollout_reset_reuses_pages_without_stale_rooms,
         test_sparse_rollout_memory_accounting_beats_dense_one_room_history,
-        test_joint_train_chunk_shapes_and_finite,
         test_spawn_replay_update_is_finite_and_strict,
         test_spawn_replay_is_bounded_and_mixed_buckets_pad_locally,
         test_global_lifecycle_reservoir_and_joint_epoch_are_finite,
+        test_lifecycle_eligibility_gates_factor_losses_and_tick_retention,
         test_rare_intent_lane_balances_actors_and_scores_semantic_factors,
         test_ti_critic_epoch_consumes_full_balanced_order,
-        test_dagger_actor_lane_trains_exact_semantics_without_site_tile_imitation,
         test_joint_ckpt_meta_contract,
         test_joint_cli_requires_corpus_and_exposes_no_collection_overrides,
         test_artifact_rejects_pre_hl_gauss_learning_abi,
         test_artifact_source_override_is_explicit_and_narrow,
         test_spawn_replay_coverage_uses_tensors_and_eval_seeds_are_disjoint,
         test_joint_qualification_requires_critic_expansion_and_scale,
+        test_spawn_body_expectations_are_measured_never_frozen,
         test_artifact_rejects_partial_actor_state,
         test_pack_field_order_documented,
         test_spawn_order_canonicalizes_zero_aliases_and_rejects_bad_wire_order,

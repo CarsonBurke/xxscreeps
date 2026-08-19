@@ -235,10 +235,16 @@ class VecScreepsEnv:
         no_open: bool = False,
         curriculum: str | list[str] | tuple[str, ...] | None = None,
         lean_meta: bool | None = None,
+        expert: bool = False,
+        bot_dir: str | None = None,
+        capture_expert_intents: bool = False,
         seed: int = 0,
     ):
         self.n = n
         self.device = torch.device(device)
+        self.expert = bool(expert)
+        self.bot_dir = bot_dir
+        self.capture_expert_intents = bool(capture_expert_intents)
         # Host-side obs from workers (thread-safe); one bulk .to(device) after join.
         # Headful only on env 0 (single Screeps client on :21025).
         if isinstance(curriculum, str):
@@ -260,6 +266,9 @@ class VecScreepsEnv:
                 no_open=no_open,
                 curriculum=self.curricula[i % len(self.curricula)],
                 lean_meta=lean_meta,
+                expert=self.expert,
+                bot_dir=bot_dir,
+                capture_expert_intents=self.capture_expert_intents,
                 seed=int(seed) + i,
             )
             for i in range(n)
@@ -490,6 +499,11 @@ class VecScreepsEnv:
         All N Node sims run concurrently; returns stacked obs on self.device.
         Also updates `self.host_obs` for zero-D2H rollout buffering.
         """
+        if self.expert:
+            raise RuntimeError(
+                "step(actions) drives the learner policy; an expert VecScreepsEnv "
+                "must call step_expert() so the teacher owns the intents"
+            )
         # Slice on host once so worker threads never touch CUDA tensors.
         acts_cpu = self._actions_to_host(actions)
         self.last_host_actions = acts_cpu
@@ -504,113 +518,32 @@ class VecScreepsEnv:
         results = [f.result() for f in futs]
         return self._finish_step(results)
 
-    def step_scripted(
+    def step_expert(
         self,
-    ) -> tuple[
-        dict[str, torch.Tensor],
-        torch.Tensor,
-        torch.Tensor,
-        list[dict[str, Any]],
-        dict[str, torch.Tensor],
-    ]:
-        """Vectorized scripted teacher step (same expert for BC + critic).
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        """Vectorized teacher step: the bot in the engine chooses every intent.
 
-        Returns (obs_dev, rewards, dones, infos, actions_tn) where actions_tn is
-        padded action tensors for every factor in the shared spawn/action contract.
-        Pre-step decision state is the previous `host_obs` (caller must buffer it).
+        Every `ScreepsEnv` here was built with `expert=True`, so its `step()`
+        dispatches `step_expert` and returns the engine's own decisions in `info`
+        (`expertIntents`, `expertActorMeta`, `expertTargetMeta`,
+        `expertRoomNames`). Those keys are passed back untouched for corpus
+        labelling; obs go through the same reused host stacks as `step_scripted`,
+        so callers must buffer the pre-step `host_obs` themselves.
         """
-        from .actions_util import pad_actions
-        from .constants import INTENT_SLOTS, MAX_ACTORS
+        if not self.expert:
+            raise RuntimeError(
+                "step_expert requires VecScreepsEnv(expert=True); this fleet runs "
+                "learner sessions, use step()/step_scripted()"
+            )
 
-        def _one(i: int) -> tuple[
-            dict[str, torch.Tensor], float, bool, dict[str, Any], dict[str, torch.Tensor]
-        ]:
-            try:
-                o, r, d, info, actions = self.envs[i].step_scripted()
-                o, info = self._handle_done(i, self.envs[i], o, info or {}, bool(d))
-                return o, float(r), bool(d), info, pad_actions(actions)
-            except Exception as err:  # noqa: BLE001
-                # Keep fleet alive: hard-reset dead worker; mark done so MC chain cuts.
-                # invalid_demo: joint collector must not BC on empty actions.
-                print(f"[vec_env] step_scripted env={i} failed ({err!s:.120}); hard_reset", flush=True)
-                try:
-                    o = self.envs[i].hard_reset()
-                except Exception as err2:  # noqa: BLE001
-                    print(f"[vec_env] hard_reset env={i} failed ({err2!s:.120})", flush=True)
-                    raise
-                info = {
-                    "episode_done": True,
-                    "truncated": True,
-                    "recovered": True,
-                    "invalid_demo": True,
-                    "harvestDelta": 0,
-                    "controlDelta": 0,
-                }
-                empty = {
-                    k: torch.zeros(MAX_ACTORS, INTENT_SLOTS, dtype=torch.long)
-                    for k in (
-                        "types", "dirs", "targets", "amounts",
-                        "construction_types", "construction_tiles",
-                    )
-                }
-                empty["body_counts"] = torch.zeros(
-                    MAX_ACTORS, INTENT_SLOTS, N_BODY_PART, dtype=torch.long,
-                )
-                empty["body_order"] = torch.arange(N_BODY_PART).view(
-                    1, 1, N_BODY_PART,
-                ).expand(
-                    MAX_ACTORS, INTENT_SLOTS, N_BODY_PART,
-                ).clone()
-                return o, 0.0, True, info, empty
+        def _one(i: int) -> tuple[dict[str, torch.Tensor], float, bool, dict[str, Any]]:
+            o, r, d, info = self.envs[i].step()
+            o, info = self._handle_done(i, self.envs[i], o, info or {}, bool(d))
+            return o, float(r), bool(d), info
 
         futs = [self._pool.submit(_one, i) for i in range(self.n)]
         results = [f.result() for f in futs]
-        base = [(r[0], r[1], r[2], r[3]) for r in results]
-        obs, rew, done, infos = self._finish_step(base)
-        acts = {
-            k: torch.stack([r[4][k] for r in results], dim=0)
-            for k in (
-                "types", "dirs", "targets", "amounts",
-                "body_counts", "body_order", "construction_types", "construction_tiles",
-            )
-        }
-        return obs, rew, done, infos, acts
-
-    def step_labeled(
-        self, actions: dict[str, torch.Tensor],
-    ) -> tuple[
-        dict[str, torch.Tensor],
-        torch.Tensor,
-        torch.Tensor,
-        list[dict[str, Any]],
-        dict[str, torch.Tensor],
-    ]:
-        """Apply batched learner actions and return pre-state scripted labels."""
-        from .actions_util import pad_actions
-
-        acts_cpu = self._actions_to_host(actions)
-        self.last_host_actions = acts_cpu
-
-        def _one(i: int) -> tuple[
-            dict[str, torch.Tensor], float, bool, dict[str, Any], dict[str, torch.Tensor]
-        ]:
-            act_i = {key: value[i : i + 1] for key, value in acts_cpu.items()}
-            obs, reward, done, info, teacher = self.envs[i].step_labeled(act_i)
-            obs, info = self._handle_done(i, self.envs[i], obs, info, bool(done))
-            return obs, float(reward), bool(done), info, pad_actions(teacher)
-
-        futures = [self._pool.submit(_one, i) for i in range(self.n)]
-        results = [future.result() for future in futures]
-        base = [(row[0], row[1], row[2], row[3]) for row in results]
-        obs, rewards, dones, infos = self._finish_step(base)
-        teacher = {
-            key: torch.stack([row[4][key] for row in results], dim=0)
-            for key in (
-                "types", "dirs", "targets", "amounts",
-                "body_counts", "body_order", "construction_types", "construction_tiles",
-            )
-        }
-        return obs, rewards, dones, infos, teacher
+        return self._finish_step(results)
 
     def close(self) -> None:
         try:

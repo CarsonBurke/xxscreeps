@@ -15,16 +15,19 @@ state and is safe to reuse across optimizer experiments.
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import inspect
 import json
 import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -81,21 +84,24 @@ _FORMAT_SPEC = {
     "version": CORPUS_SCHEMA_VERSION,
     "directory": ["manifest.json", "shards/<sha256>.pt"],
     "splits": ["train", "holdout", "ti_train", "ti_holdout"],
-    "scripted_split": [
+    "teacher_split": [
         "lifecycle_replay", "temporal_replay", "temporal_sampling",
-        "rewards_tn", "dones_tn", "returns_tn",
+        "rewards_tn", "dones_tn", "returns_tn", "label_counts", "liveness",
     ],
     "ti_split": ["critic_replay", "rewards_tn", "dones_tn", "returns_tn"],
-    "lifecycle_row": ["stratum", "timestep", "env_index", "return_target", "obs", "action"],
+    "lifecycle_row": [
+        "stratum", "timestep", "env_index", "return_target", "obs", "action",
+        "eligible",
+    ],
     "temporal_row": [
         "stratum", "timestep", "env_index", "terminated", "truncated",
-        "obs", "action", "counterfactual_action", "next_obs",
+        "obs", "action", "eligible", "counterfactual_action", "next_obs",
     ],
     "temporal_counterfactual": (
         "same_state_one_live_issued_command_replaced_with_canonical_none"
     ),
     "critic_row": ["stratum", "timestep", "env_index", "return_target", "obs"],
-    "spawn_row": ["stratum", "actor_index", "obs", "action"],
+    "spawn_row": ["stratum", "actor_index", "obs", "action", "eligible"],
     "ti_factor_row": ["timestep", "obs", "action", "eligible"],
     "shard": "tensor-only stacked exact-shape group",
 }
@@ -130,6 +136,10 @@ class CorpusConfig:
     ti_replay_capacity: int = 20_000
     ti_critic_replay_per_stratum: int = TI_CRITIC_RESERVOIR_CAPACITY
     temporal_replay_per_stratum: int = TEMPORAL_REPLAY_PER_STRATUM
+    # A macro action spans the walk to its target, so an expert move tick en
+    # route to an action it then performs is that macro action. The window
+    # bounds how far back a completed action may claim its own approach.
+    ti_en_route_window: int = 50
     ti_bot_dir: str | None = None
     node: str | None = None
 
@@ -174,6 +184,7 @@ class CorpusConfig:
             raise ValueError(f"train and holdout environment seeds overlap: {sorted(overlap)}")
         if self.seed in {self.holdout_seed, self.holdout_seed + 1}:
             raise ValueError("TI train/holdout seeds overlap")
+        validate_teacher_configuration(self.resolved_ti_bot_dir)
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -213,7 +224,7 @@ def _collection_source_signature() -> str:
         )
     ] + [
         _RL_ROOT / "env" / name for name in (
-            "actions.mjs", "encode.mjs", "scripted_baseline.mjs", "server.mjs",
+            "actions.mjs", "encode.mjs", "server.mjs",
         )
     ]
     engine = _REPOSITORY / "packages" / "xxscreeps"
@@ -224,13 +235,15 @@ def _collection_source_signature() -> str:
     )
     digest = hashlib.sha256(_hash_path_set(iter(paths), _REPOSITORY).encode())
     for function in (
-        _record_teacher_step, _lifecycle_sampling, _scripted_split, _ti_stratum,
+        _record_teacher_step, _record_teacher_labels, _lifecycle_sampling,
+        _lifecycle_split, _ti_stratum,
         _temporal_stratum, _same_state_counterfactual_action,
         _replace_command_with_none,
-        _invalid_scripted_intent_details,
         _late_window_size,
         _append_temporal_replay, _temporal_sampling,
         _reservoir_add, _empty_ti_actions, _ti_split,
+        _factor_is_legal, _has_engine_intent, _ti_en_route_backfill,
+        TiLabeller, TiLivenessGate,
     ):
         source = inspect.getsource(function).encode("utf-8")
         digest.update(function.__name__.encode("ascii") + b"\0")
@@ -241,8 +254,9 @@ def _collection_source_signature() -> str:
     except ImportError:
         from agent import pretrain_joint
     for name in (
-        "_append_scripted_lifecycle_replay", "_append_spawn_replay",
+        "_append_teacher_lifecycle_replay", "_append_spawn_replay",
         "_record_spawn_labels", "_collect_spawn_contract_replay",
+        "_ti_spawn_contract_label",
         "_parts_to_count_order", "_body_label_factor_mask",
     ):
         source = inspect.getsource(getattr(pretrain_joint, name)).encode("utf-8")
@@ -252,9 +266,12 @@ def _collection_source_signature() -> str:
     digest.update(_canonical_json({
         "spawn_curricula": list(pretrain_joint.SPAWN_CURRICULA),
         "spawn_replay_per_stratum": pretrain_joint.SPAWN_REPLAY_PER_STRATUM,
-        "scripted_replay_per_stratum": pretrain_joint.SCRIPTED_REPLAY_PER_STRATUM,
+        "teacher_replay_per_stratum": pretrain_joint.TEACHER_REPLAY_PER_STRATUM,
         "ti_critic_replay_default_per_stratum": TI_CRITIC_RESERVOIR_CAPACITY,
-        "non_invalid_intent_codes": sorted(_NON_INVALID_INTENT_CODES),
+        "ti_liveness_gate": [
+            TI_LIVENESS_WARMUP, TI_LIVENESS_MAX_SILENCE,
+            TI_LIVENESS_MIN_ACTIVE_FRACTION,
+        ],
         "outpost_late_window_steps": OUTPOST_LATE_WINDOW_STEPS,
     }))
     return digest.hexdigest()
@@ -279,6 +296,61 @@ def _ti_runtime_signature(directory: Path) -> str | None:
     return digest.hexdigest()
 
 
+def _ti_constant_re(name: str) -> re.Pattern[str]:
+    return re.compile(rf"\b{name}\s*=\s*(\d+)", re.MULTILINE)
+
+
+def ti_room_radii(directory: Path) -> dict[str, int]:
+    """Read the teacher bundle's room-radius constants, the ABI's binding ones.
+
+    The observation holds `maxRooms` room slots. The International's stock radii
+    (remotes 5, unbounded scouting) grow a colony well past that, and every tick
+    beyond it labels creeps in rooms the observation dropped, so the corpus would
+    teach actions whose subject is invisible. The bundle keeps each constant as a
+    single assignment, so the executed teacher - not its source tree - is read.
+    """
+    bundle = directory / "main.js"
+    if not bundle.is_file():
+        raise FileNotFoundError(f"teacher bundle missing: {bundle}")
+    text = bundle.read_text(encoding="utf-8")
+    radii = {}
+    for name in sorted(k for k in SCHEMA["teacher"] if not k.startswith("_")):
+        matches = _ti_constant_re(name).findall(text)
+        if len(matches) != 1:
+            raise ValueError(
+                f"teacher bundle {bundle} declares {name} {len(matches)} times; "
+                "expected exactly one assignment",
+            )
+        radii[name] = int(matches[0])
+    return radii
+
+
+def validate_teacher_configuration(directory: Path) -> dict[str, int]:
+    """Fail collection when the teacher outgrows the observation it labels."""
+    actual = ti_room_radii(directory)
+    declared = {
+        name: int(value) for name, value in SCHEMA["teacher"].items()
+        if not name.startswith("_")
+    }
+    if actual != declared:
+        raise ValueError(
+            f"teacher {directory} runs {actual}, but this observation ABI "
+            f"({SCHEMA['maxRooms']} room slots, {SCHEMA['maxCreepActors']} creep "
+            f"slots) requires {declared}. Rebuild the teacher with the configured "
+            "constants, or raise the room and actor caps and bump teacherAbi.",
+        )
+    return actual
+
+
+def _command_protocol_version() -> int:
+    """Read the wire version from the client that will run the collection."""
+    try:
+        from samples.rl.agent.env_client import _COMMAND_VERSION
+    except ImportError:
+        from agent.env_client import _COMMAND_VERSION
+    return int(_COMMAND_VERSION)
+
+
 def _runtime_provenance(config: CorpusConfig) -> dict[str, Any]:
     node = config.node or os.environ.get("RL_NODE", "node")
     try:
@@ -298,12 +370,17 @@ def _runtime_provenance(config: CorpusConfig) -> dict[str, Any]:
         "node_version": node_version,
         "observation_format": os.environ.get("RL_OBS_FMT", "bin"),
         "command_format": os.environ.get("RL_CMD_FMT", "bin"),
-        "command_protocol_version": 5,
+        "command_protocol_version": _command_protocol_version(),
         "observation_protocol": "XRL1",
         "command_protocol": "XAC1",
         "lean_meta": False,
         "source_count": os.environ.get("RL_SOURCE_COUNT"),
         "expansion_room": os.environ.get("RL_EXPANSION_ROOM"),
+        # World dynamics, not a wire setting: with invasion waves on, a room's
+        # cumulative harvest schedules an adversary this ABI cannot answer, and
+        # a late-game corpus becomes a record of colony collapse. Two corpora
+        # that differ only in this knob are not comparable.
+        "invaders": os.environ.get("RL_INVADERS") == "1",
         "dependency_lock_sha256": _sha256_file(lock) if lock.is_file() else None,
     }
 
@@ -333,18 +410,17 @@ def _new_stage_metrics() -> dict[str, Any]:
 def _record_teacher_step(
     totals: dict[str, Any],
     by_curriculum: dict[str, dict[str, Any]],
-    obs: dict[str, torch.Tensor],
-    actions: dict[str, torch.Tensor],
     infos: list[dict],
-    record_spawn_labels,
     *,
     late_window: bool = False,
 ) -> None:
-    live = obs["actor_mask"] > 0
-    chosen = actions["types"][:, :, 0][live]
-    histogram = torch.bincount(chosen.long(), minlength=len(INTENT_TYPES))
-    for index, name in enumerate(INTENT_TYPES):
-        totals["action_type_hist"][name] += int(histogram[index])
+    """Accumulate what the engine reported for one stepped tick.
+
+    Every quantity here is a post-tick engine outcome, so it is recorded as the
+    tick happens. What the teacher *chose* is recorded separately by
+    `_record_teacher_labels`, because a label is only attributable once no later
+    action can claim it.
+    """
     for env_index, raw in enumerate(infos):
         info = raw or {}
         metrics = by_curriculum.setdefault(
@@ -403,7 +479,32 @@ def _record_teacher_step(
             )
             aggregate["issued"] += int(counts.get("issued") or 0)
             aggregate["invalid"] += int(counts.get("invalid") or 0)
-        record_spawn_labels(metrics, actions, obs, env_index)
+
+
+def _record_teacher_labels(
+    totals: dict[str, Any],
+    by_curriculum: dict[str, dict[str, Any]],
+    obs: dict[str, torch.Tensor],
+    actions: dict[str, torch.Tensor],
+    eligible: torch.Tensor,
+    info: Mapping[str, Any],
+    record_spawn_labels,
+) -> None:
+    """Histogram what the teacher chose, counting only supervised factors.
+
+    Unsupervised actors carry intent index 0 as filler, so counting every actor
+    would report the teacher issuing `none` on most of its colony. The intent
+    factor's own eligibility column decides which choices exist as labels.
+    """
+    live = (obs["actor_mask"] > 0) & eligible[:, :, 0]
+    chosen = actions["types"][:, :, 0][live]
+    histogram = torch.bincount(chosen.long(), minlength=len(INTENT_TYPES))
+    for index, name in enumerate(INTENT_TYPES):
+        totals["action_type_hist"][name] += int(histogram[index])
+    metrics = by_curriculum.setdefault(
+        str(info.get("curriculum") or "unknown"), _new_stage_metrics(),
+    )
+    record_spawn_labels(metrics, actions, obs, 0)
 
 
 def _lifecycle_sampling(seed: int, seen: Mapping[str, int], rows: list[dict]) -> dict[str, Any]:
@@ -430,7 +531,7 @@ def _temporal_stratum(
 
     The action signature is computed directly from the complete joint action at
     this tick.  In particular, temporal pairs are never reconstructed by
-    sorting or joining independently sampled lifecycle, TI, or DAgger rows.
+    sorting or joining independently sampled lifecycle or critic rows.
     """
     selected = {
         INTENT_TYPES[int(value)]
@@ -506,6 +607,8 @@ def _append_temporal_replay(
     *,
     timestep: int,
     capacity_per_stratum: int,
+    eligible: torch.Tensor,
+    env_labels: list[int],
 ) -> None:
     """Reservoir-sample genuine ``(s_t, a_t, s_{t+1})`` transitions.
 
@@ -513,6 +616,12 @@ def _append_temporal_replay(
     already reset those workers in ``next_obs``.  This prevents a reset state
     from ever becoming a false dynamics target.  The exclusion counters retain
     the terminal-versus-time-limit provenance in the immutable artifact.
+
+    ``eligible`` marks which action factors the teacher actually supervised, so
+    the latent dynamics target is conditioned on a real decision rather than on
+    filler indices. ``env_labels`` records the true fleet index when the caller
+    passes single-environment slices, which the teacher lane must do because its
+    labels are finalized per environment and out of lockstep.
     """
     for env_index, raw_info in enumerate(infos):
         info = raw_info or {}
@@ -551,7 +660,7 @@ def _append_temporal_replay(
         row = {
             "stratum": stratum,
             "timestep": int(timestep),
-            "env_index": int(env_index),
+            "env_index": int(env_labels[env_index]),
             "terminated": bool(terminated),
             "truncated": bool(truncated),
             "obs": {
@@ -561,6 +670,7 @@ def _append_temporal_replay(
                 key: value[env_index : env_index + 1, :actor_cap].clone()
                 for key, value in actions.items()
             },
+            "eligible": eligible[env_index : env_index + 1, :actor_cap].clone(),
             "counterfactual_action": counterfactual,
             "next_obs": {
                 key: compact_next_obs[key].clone() for key in TEMPORAL_OBS_KEYS
@@ -600,52 +710,30 @@ def _temporal_sampling(
     }
 
 
-_NON_INVALID_INTENT_CODES = frozenset((0, -2, -4, -11))
+def _lifecycle_split(
+    config: CorpusConfig, *, seed: int, sampling_seed: int,
+) -> tuple[dict, list, dict, dict]:
+    """Collect the full-lifecycle behaviour-cloning corpus from the expert bot.
 
+    The expert owns every intent, so supervision is partial by construction:
+    `TiLabeller` decides which factors of each tick this ABI can express and
+    validates them against that tick's candidate masks, and the loss supervises
+    only those. A tick therefore contributes a row and a mask, never a complete
+    action, and unlabelled factors stay free for PPO to shape.
 
-def _invalid_scripted_intent_details(
-    infos: list[dict[str, Any]], env_map: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Return stable, actionable provenance for every invalid teacher intent."""
-    details: list[dict[str, Any]] = []
-    for env_index, raw in enumerate(infos):
-        info = raw or {}
-        if not int(info.get("intentInvalid") or 0):
-            continue
-        invalid_results = [
-            {
-                key: result.get(key)
-                for key in (
-                    "actor", "type", "code", "err", "executed", "targetKind",
-                    "targetId", "targetStructureType",
-                )
-                if key in result
-            }
-            for result in (info.get("intentResults") or ())
-            if int(result.get("code", -999)) not in _NON_INVALID_INTENT_CODES
-        ]
-        provenance = env_map[env_index]
-        details.append({
-            "env_index": env_index,
-            "seed": int(provenance["seed"]),
-            "curriculum": str(info.get("curriculum") or provenance["curriculum"]),
-            "intent_invalid": int(info.get("intentInvalid") or 0),
-            "intent_by_type": info.get("intentByType") or {},
-            "results": invalid_results,
-        })
-    return details
-
-
-def _scripted_split(config: CorpusConfig, *, seed: int, sampling_seed: int) -> tuple[dict, list, dict, dict]:
+    Labels are finalized late. An approach walked over several ticks is only
+    attributable once the action it served completes, so each environment keeps
+    its own `TiLabeller` window and rows leave it through `drain`.
+    """
     try:
         from samples.rl.agent.pretrain_joint import (
-            _append_scripted_lifecycle_replay, _append_spawn_replay,
+            _append_spawn_replay, _append_teacher_lifecycle_replay,
             _record_spawn_labels,
         )
         from samples.rl.agent.vec_env import VecScreepsEnv
     except ImportError:
         from agent.pretrain_joint import (
-            _append_scripted_lifecycle_replay, _append_spawn_replay,
+            _append_spawn_replay, _append_teacher_lifecycle_replay,
             _record_spawn_labels,
         )
         from agent.vec_env import VecScreepsEnv
@@ -664,49 +752,125 @@ def _scripted_split(config: CorpusConfig, *, seed: int, sampling_seed: int) -> t
     dones: list[torch.Tensor] = []
     totals = _new_totals()
     by_stage: dict[str, dict[str, Any]] = {}
+    label_counts: dict[str, int] = {}
+    liveness = {
+        "episodes_graded": 0, "acting_ticks": 0, "graded_ticks": 0,
+        "worst_silent_run": 0,
+    }
     envs = VecScreepsEnv(
         config.num_envs, node=config.node, room=config.room, seed=seed,
         max_episode=config.max_episode, device="cpu", curriculum=config.curriculum,
-        lean_meta=False,
+        lean_meta=False, expert=True, bot_dir=str(config.resolved_ti_bot_dir),
+        capture_expert_intents=True,
     )
-    env_map = config.env_map(seed)
+    labellers = [
+        TiLabeller(window=config.ti_en_route_window, counts=label_counts)
+        for _ in range(config.num_envs)
+    ]
+    gates = [
+        TiLivenessGate(label=f"teacher seed={seed} env={index}")
+        for index in range(config.num_envs)
+    ]
+
+    def _grade(env_index: int) -> None:
+        """Close one episode's liveness accounting and start the next."""
+        metrics = gates[env_index].finish()
+        liveness["episodes_graded"] += 1
+        liveness["acting_ticks"] += int(metrics["acting_ticks"])
+        liveness["graded_ticks"] += int(metrics["graded_ticks"])
+        liveness["worst_silent_run"] = max(
+            liveness["worst_silent_run"], int(metrics["worst_silent_run"]),
+        )
+        gates[env_index] = TiLivenessGate(
+            label=f"teacher seed={seed} env={env_index}",
+        )
+
+    def _commit(env_index: int, entry: dict) -> None:
+        info = entry["extra"]["info"]
+        cap = entry["actor_cap"]
+        actions = {key: value[:, :cap] for key, value in entry["actions"].items()}
+        eligible = entry["eligible"][:, :cap]
+        if not bool(eligible.any()):
+            return
+        _append_teacher_lifecycle_replay(
+            rows, seen, retained, rng, entry["obs"], actions, eligible, [info],
+            timestep=entry["timestep"], env_labels=[env_index],
+        )
+        post = entry["extra"].get("post")
+        if post is not None:
+            _append_temporal_replay(
+                temporal_rows, temporal_seen, temporal_retained,
+                temporal_excluded, temporal_rng, entry["obs"], actions, post,
+                entry["extra"]["done"], [info], timestep=entry["timestep"],
+                capacity_per_stratum=config.temporal_replay_per_stratum,
+                env_labels=[env_index], eligible=eligible,
+            )
+        _append_spawn_replay(spawn, entry["obs"], actions, eligible)
+        _record_teacher_labels(
+            totals, by_stage, entry["obs"], actions, eligible, info,
+            _record_spawn_labels,
+        )
+
     try:
         envs.reset()
         for timestep in range(config.steps):
             assert envs.host_obs is not None
             pre = envs.host_obs
-            _next, reward, done, infos, actions = envs.step_scripted()
+            _next, reward, done, infos = envs.step_expert()
             assert envs.host_obs is not None
             post = envs.host_obs
-            if any((info or {}).get("recovered") or (info or {}).get("invalid_demo") for info in infos):
-                raise RuntimeError(f"scripted teacher recovered at step={timestep + 1}")
-            invalid_details = _invalid_scripted_intent_details(infos, env_map)
-            if invalid_details:
-                raise RuntimeError(
-                    "scripted teacher emitted invalid intent "
-                    f"at step={timestep + 1}: "
-                    f"{json.dumps(invalid_details, sort_keys=True, separators=(',', ':'))}"
-                )
             rewards.append(reward.detach().cpu().float())
             dones.append(done.detach().cpu().float())
-            _append_spawn_replay(spawn, pre, actions)
-            _append_scripted_lifecycle_replay(
-                rows, seen, retained, rng, pre, actions, infos, timestep=timestep,
-            )
-            _append_temporal_replay(
-                temporal_rows, temporal_seen, temporal_retained,
-                temporal_excluded, temporal_rng, pre, actions, post, done, infos,
-                timestep=timestep,
-                capacity_per_stratum=config.temporal_replay_per_stratum,
-            )
             _record_teacher_step(
-                totals, by_stage, pre, actions, infos, _record_spawn_labels,
+                totals, by_stage, infos,
                 late_window=(
                     timestep >= config.steps - _late_window_size(config.steps)
                 ),
             )
+            for env_index, labeller in enumerate(labellers):
+                info = infos[env_index] or {}
+                single_pre = _compact_entity_prefixes({
+                    key: value[env_index : env_index + 1] for key, value in pre.items()
+                })
+                acted = labeller.observe(
+                    single_pre, info, timestep,
+                    extra={
+                        "info": info,
+                        "done": done[env_index : env_index + 1].detach().cpu(),
+                        "post": {
+                            key: value[env_index : env_index + 1].clone()
+                            for key, value in post.items()
+                        },
+                    },
+                )
+                try:
+                    gates[env_index].observe(
+                        timestep, acted=acted, world=info.get("globals") or {},
+                    )
+                except TiTeacherStalled as error:
+                    # A stalled teacher is almost always an exception inside the
+                    # bot: The International aborts its whole tick, so the only
+                    # symptom that reaches this loop is silence. Its own console
+                    # is the evidence, so fail with it attached.
+                    raise TiTeacherStalled(
+                        f"{error.args[0]}\n"
+                        + _env_stderr_diagnosis(envs.envs[env_index]),
+                        error.metrics,
+                    ) from None
+                for entry in labeller.drain():
+                    _commit(env_index, entry)
+                if bool(info.get("episode_done")) or bool(done[env_index]):
+                    # A reset breaks creep identity, so nothing pending can still
+                    # be claimed and the next episode is graded on its own.
+                    for entry in labeller.drain(flush=True):
+                        _commit(env_index, entry)
+                    _grade(env_index)
             if (timestep + 1) % 250 == 0 or timestep + 1 == config.steps:
-                print(f"[corpus] scripted seed={seed} {timestep + 1}/{config.steps}", flush=True)
+                print(f"[corpus] teacher seed={seed} {timestep + 1}/{config.steps}", flush=True)
+        for env_index, labeller in enumerate(labellers):
+            for entry in labeller.drain(flush=True):
+                _commit(env_index, entry)
+            _grade(env_index)
     finally:
         envs.close()
     rewards_tn, dones_tn = torch.stack(rewards), torch.stack(dones)
@@ -718,7 +882,7 @@ def _scripted_split(config: CorpusConfig, *, seed: int, sampling_seed: int) -> t
         "stratum": sample.stratum, "timestep": int(sample.timestep),
         "env_index": int(sample.env_index),
         "return_target": returns_tn[sample.timestep, sample.env_index].clone(),
-        "obs": sample.obs, "action": sample.action,
+        "obs": sample.obs, "action": sample.action, "eligible": sample.eligible,
     } for sample in rows]
     return ({
         "lifecycle_replay": logical_rows,
@@ -730,6 +894,8 @@ def _scripted_split(config: CorpusConfig, *, seed: int, sampling_seed: int) -> t
         "rewards_tn": rewards_tn,
         "dones_tn": dones_tn, "returns_tn": returns_tn,
         "sampling": _lifecycle_sampling(sampling_seed, seen, logical_rows),
+        "label_counts": dict(sorted(label_counts.items())),
+        "liveness": dict(liveness),
     }, spawn, totals, by_stage)
 
 
@@ -776,18 +942,436 @@ def _empty_ti_actions(actor_cap: int) -> tuple[dict[str, torch.Tensor], torch.Te
     return actions, torch.zeros(1, actor_cap, 6 + 2 * N_BODY_PART, dtype=torch.bool)
 
 
+def _ti_en_route_backfill(
+    window: "deque[dict]",
+    *,
+    object_id: str,
+    intent: str,
+    intent_index: int,
+    target_id: str | None,
+    amount_index: int | None,
+) -> int:
+    """Label an expert's approach ticks with the macro action it completed.
+
+    `runCreepIntent` executes a macro action through `approachOr`: out of range it
+    steps toward the target, in range it acts. A creep that only moved on earlier
+    ticks and then acted on `target_id` was therefore executing this one macro
+    action the whole time, so those ticks carry it as their label. Walking stops
+    at the first tick that breaks the chain: another action, a gone target, a
+    reindexed actor, or a mask that would make the label illegal at that tick.
+    Nothing here is inferred from geometry or guessed.
+    """
+    if target_id is None:
+        return 0
+    filled = 0
+    for entry in reversed(window):
+        if not entry["en_route"].get(object_id):
+            break
+        actor_index = entry["actor_by_id"].get(object_id)
+        target_index = entry["target_by_id"].get(target_id)
+        if actor_index is None or target_index is None:
+            break
+        if actor_index >= entry["actor_cap"] or target_index >= entry["target_cap"]:
+            break
+        obs = entry["obs"]
+        legal = (
+            bool(obs["intent_mask"][0, actor_index, 0, intent_index])
+            and bool(obs["target_select_mask"][0, intent_index, target_index])
+            and bool(obs["target_mask"][0, target_index])
+        )
+        if legal and amount_index is not None:
+            legal = bool(
+                obs["amount_mask"][0, actor_index, 0, intent_index, amount_index],
+            )
+        if not legal:
+            break
+        if bool(entry["eligible"][0, actor_index, 0]):
+            break
+        entry["actions"]["types"][0, actor_index, 0] = intent_index
+        entry["actions"]["targets"][0, actor_index, 0] = target_index
+        entry["eligible"][0, actor_index, 0] = True
+        entry["eligible"][0, actor_index, 2] = True
+        if amount_index is not None:
+            entry["actions"]["amounts"][0, actor_index, 0] = amount_index
+            entry["eligible"][0, actor_index, 3] = True
+        entry["en_route"][object_id] = False
+        entry["backfilled"] = entry.get("backfilled", 0) + 1
+        filled += 1
+    return filled
+
+
+def _factor_is_legal(
+    obs: dict[str, torch.Tensor],
+    *,
+    actor_index: int,
+    intent_index: int,
+    target_index: int | None = None,
+    amount_index: int | None = None,
+    construction_type: int | None = None,
+    construction_tile: int | None = None,
+) -> str | None:
+    """Name the first factor the tick's masks forbid, or `None` when all pass.
+
+    `safe_bc_nll(..., strict=True)` raises when an eligible factor is masked, so a
+    label the engine accepted but our candidate encoding cannot express has to be
+    dropped here rather than widening a mask to admit it. The teacher's intent is
+    evidence about the world, not about what this ABI can represent.
+    """
+    if actor_index >= obs["intent_mask"].shape[1]:
+        return "actor_truncated"
+    if not bool(obs["intent_mask"][0, actor_index, 0, intent_index]):
+        return "intent"
+    if target_index is not None:
+        if target_index >= obs["target_mask"].shape[1]:
+            return "target_truncated"
+        if not bool(obs["target_mask"][0, target_index]):
+            return "target"
+        if not bool(obs["target_select_mask"][0, intent_index, target_index]):
+            return "target_select"
+    if amount_index is not None:
+        if not bool(obs["amount_mask"][0, actor_index, 0, intent_index, amount_index]):
+            return "amount"
+    if construction_type is not None and construction_tile is not None:
+        mask = obs["construction_mask"]
+        room_index = 0
+        base = (room_index * N_CONSTRUCTION_TYPE + construction_type) * CONSTRUCTION_MASK_BYTES
+        byte = base + (construction_tile >> 3)
+        if byte >= mask.shape[1]:
+            return "construction_truncated"
+        if not bool(int(mask[0, byte]) & (1 << (construction_tile & 7))):
+            return "construction"
+    return None
+
+
+class TiLabeller:
+    """Turn one environment's expert ticks into validated macro-action labels.
+
+    The teacher issues raw engine intents; `translate_ti_intents` converts the
+    exactly representable ones, this class decides which factors of each label
+    are legal in the tick that produced them, and `_ti_en_route_backfill`
+    attributes an approach to the macro action it completed. A label is finalized
+    only once no later action can still claim it, so ticks leave here through
+    `drain`, not as they arrive.
+
+    One instance owns one environment: the en-route window is per creep-history
+    and mixing two worlds inside it would attribute one colony's approach to
+    another's action.
+    """
+
+    def __init__(self, *, window: int, counts: dict[str, int] | None = None) -> None:
+        if window < 1:
+            raise ValueError(f"en-route window must be at least one tick, got {window}")
+        self.window = int(window)
+        self.counts: dict[str, int] = counts if counts is not None else {}
+        self._pending: deque[dict] = deque()
+        self._ready: list[dict] = []
+
+    def _bump(self, key: str, amount: int = 1) -> None:
+        self.counts[key] = self.counts.get(key, 0) + amount
+
+    def observe(
+        self,
+        pre: dict[str, torch.Tensor],
+        info: dict,
+        timestep: int,
+        *,
+        extra: dict[str, Any] | None = None,
+    ) -> bool:
+        """Label the decision the teacher made in `pre`, whose result `info` reports.
+
+        Returns whether the teacher issued any engine intent, which is what
+        `TiLivenessGate` grades: a tick can be live yet contribute no label,
+        because most of what the expert does is not representable here.
+        """
+        try:
+            from samples.rl.agent.pretrain_joint import (
+                _body_label_factor_mask, _parts_to_count_order,
+            )
+            from samples.rl.agent.ti_intents import translate_ti_intents
+        except ImportError:
+            from agent.pretrain_joint import _body_label_factor_mask, _parts_to_count_order
+            from agent.ti_intents import translate_ti_intents
+        expert_actor_meta = info.get("expertActorMeta") or []
+        expert_target_meta = info.get("expertTargetMeta") or []
+        raw_intents = info.get("expertIntents")
+        acted = _has_engine_intent(raw_intents)
+        labels = translate_ti_intents(
+            raw_intents, expert_actor_meta, expert_target_meta,
+            info.get("expertRoomNames") or [],
+        )
+        actor_cap = pre["actors"].shape[1]
+        actions, eligible = _empty_ti_actions(actor_cap)
+        entry = {
+            "timestep": timestep,
+            "obs": {key: value.clone() for key, value in pre.items()},
+            "actions": actions,
+            "eligible": eligible,
+            "actor_cap": actor_cap,
+            "target_cap": pre["target_mask"].shape[1],
+            "actor_by_id": {
+                str(identifier): index
+                for index, row in enumerate(expert_actor_meta)
+                for identifier in (row.get("objectId"), row.get("id"))
+                if identifier
+            },
+            "target_by_id": {
+                str(row.get("id")): index
+                for index, row in enumerate(expert_target_meta)
+                if row.get("id")
+            },
+            "en_route": {},
+            "extra": dict(extra or {}),
+        }
+        object_by_actor = {
+            index: str(row.get("objectId") or row.get("id") or "")
+            for index, row in enumerate(expert_actor_meta)
+        }
+        for label in labels:
+            self._apply(entry, label, object_by_actor, actor_cap,
+                        _body_label_factor_mask, _parts_to_count_order)
+        self._pending.append(entry)
+        while len(self._pending) > self.window:
+            self._ready.append(self._pending.popleft())
+        return acted
+
+    def _apply(
+        self, entry: dict, label: Any, object_by_actor: dict[int, str], actor_cap: int,
+        body_label_factor_mask: Any, parts_to_count_order: Any,
+    ) -> None:
+        if label.rejection:
+            self._bump(f"rejected:{label.rejection}")
+            return
+        if label.actor_index is None or label.intent is None:
+            return
+        if label.actor_index >= actor_cap:
+            self._bump("rejected:actor_truncated")
+            return
+        if label.intent == "move":
+            # Held, not dropped: a later completed action on this creep turns its
+            # approach into that macro action.
+            object_id = object_by_actor.get(label.actor_index)
+            if object_id:
+                entry["en_route"][object_id] = True
+            return
+        ai = label.actor_index
+        intent_index = INTENT_TYPES.index(label.intent)
+        illegal = _factor_is_legal(
+            entry["obs"], actor_index=ai, intent_index=intent_index,
+            target_index=label.target_index, amount_index=label.amount_index,
+            construction_type=label.construction_type,
+            construction_tile=label.construction_tile,
+        )
+        if illegal is not None:
+            # The engine accepted an action this observation cannot express, so it
+            # is evidence we cannot supervise. Never widen a mask to admit it.
+            self._bump(f"illegal:{illegal}:{label.intent}")
+            return
+        actions, eligible = entry["actions"], entry["eligible"]
+        actions["types"][0, ai, 0] = intent_index
+        if label.full_action:
+            eligible[0, ai, 0] = True
+        if label.direction is not None:
+            actions["dirs"][0, ai, 0] = label.direction
+            eligible[0, ai, 1] = True
+        if label.target_index is not None:
+            actions["targets"][0, ai, 0] = label.target_index
+            eligible[0, ai, 2] = True
+        if label.amount_index is not None:
+            actions["amounts"][0, ai, 0] = label.amount_index
+            eligible[0, ai, 3] = True
+        if label.construction_type is not None:
+            actions["construction_types"][0, ai, 0] = label.construction_type
+            actions["construction_tiles"][0, ai, 0] = int(label.construction_tile or 0)
+            eligible[0, ai, 4:6] = True
+        if label.body_parts is not None:
+            counts, order, exact = parts_to_count_order(label.body_parts)
+            actions["body_counts"][0, ai, 0] = counts
+            actions["body_order"][0, ai, 0] = order
+            eligible[0, ai] |= body_label_factor_mask(counts, exact)
+            if not exact:
+                self._bump("partial:spawn_body_order_interleaved")
+        self._bump(f"accepted:{label.intent}:{'full' if label.full_action else 'factor'}")
+        if label.full_action and label.target_id is not None:
+            object_id = object_by_actor.get(label.actor_index)
+            if object_id:
+                claimed = _ti_en_route_backfill(
+                    self._pending,
+                    object_id=object_id,
+                    intent=label.intent,
+                    intent_index=intent_index,
+                    target_id=label.target_id,
+                    amount_index=label.amount_index,
+                )
+                if claimed:
+                    self._bump(f"backfilled:{label.intent}", claimed)
+
+    def drain(self, *, flush: bool = False) -> list[dict]:
+        """Ticks no later action can still claim, in the order observed."""
+        if flush:
+            while self._pending:
+                self._ready.append(self._pending.popleft())
+        ready, self._ready = self._ready, []
+        return ready
+
+
+def _env_stderr_diagnosis(env: Any, *, lines: int = 12) -> str:
+    """The environment's own recent stderr, for a failure with no Python cause.
+
+    Set `RL_BOT_CONSOLE=1` before a collection to include the bot's console in
+    this stream; without it only engine-level output is captured.
+    """
+    tail = list(getattr(env, "_stderr_tail", ()) or ())[-lines:]
+    if not tail:
+        return "  env stderr: empty (set RL_BOT_CONSOLE=1 to capture bot output)"
+    return "  env stderr:\n" + "\n".join(f"    {line}" for line in tail)
+
+
+TI_LIVENESS_WARMUP = 50
+TI_LIVENESS_MAX_SILENCE = 30
+TI_LIVENESS_MIN_ACTIVE_FRACTION = 0.5
+# Enough of the world to tell a faulting bot from a colony that cannot act:
+# spawn loss ends the economy, and creeps then decay with zero harvest.
+_LIVENESS_WORLD_KEYS = ("spawns", "creeps", "storedEnergy", "rclMax", "controlProgress")
+
+
+class TiTeacherStalled(RuntimeError):
+    """The expert stopped issuing engine intents while its colony was alive.
+
+    Raised instead of returning a short corpus, because a stalled teacher is
+    indistinguishable from a teacher that chose to idle once the labels are
+    detached from the run that produced them.
+    """
+
+    def __init__(self, message: str, metrics: dict[str, float]) -> None:
+        super().__init__(message)
+        self.metrics = dict(metrics)
+
+
+class TiLivenessGate:
+    """Reject an episode in which the expert stopped acting.
+
+    `SegmentsManager.run` aborts The International's whole tick when
+    `RawMemory.segments` is missing an entry, and that abort is load-sensitive:
+    two runs of one declared seed produced 660 and 2 labels. The teacher's own
+    log is byte-identical in both modes, so silence is the only observable.
+
+    Thresholds come from a healthy 3,000-tick episode: the expert acted on
+    2,974 ticks (99.1%), and its longest silence was 12 ticks, ending at tick
+    20 while the first creep was still spawning. Every later silence lasted a
+    single tick. `warmup` therefore covers the pre-creep opening, `max_silence`
+    is 2.5x the worst healthy gap, and the active-fraction floor separates
+    healthy runs from the 2.5%-20% activity of stalled ones.
+    """
+
+    def __init__(
+        self,
+        *,
+        warmup: int = TI_LIVENESS_WARMUP,
+        max_silence: int = TI_LIVENESS_MAX_SILENCE,
+        min_active_fraction: float = TI_LIVENESS_MIN_ACTIVE_FRACTION,
+        label: str = "TI",
+    ) -> None:
+        self.warmup = int(warmup)
+        self.max_silence = int(max_silence)
+        self.min_active_fraction = float(min_active_fraction)
+        self.label = label
+        self._ticks = 0
+        self._graded = 0
+        self._acted = 0
+        self._silent_run = 0
+        self._worst_silent_run = 0
+        self._world_tail: deque[tuple[int, dict[str, Any]]] = deque(maxlen=8)
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        graded = self._graded
+        return {
+            "ticks": float(self._ticks),
+            "graded_ticks": float(graded),
+            "acting_ticks": float(self._acted),
+            "active_fraction": float(self._acted / graded) if graded else 0.0,
+            "worst_silent_run": float(max(self._worst_silent_run, self._silent_run)),
+        }
+
+    def observe(
+        self, timestep: int, *, acted: bool, world: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Account one stepped tick; raise as soon as a stall is unambiguous.
+
+        ``world`` is the tick's observation globals. Silence has several causes
+        with one symptom: a bot fault, and a colony that lost every spawn and can
+        no longer act. Recording the trailing world states separates them without
+        a second collection run.
+        """
+        self._ticks += 1
+        if acted:
+            self._worst_silent_run = max(self._worst_silent_run, self._silent_run)
+            self._silent_run = 0
+        else:
+            self._silent_run += 1
+        if world is not None:
+            self._world_tail.append((timestep, {
+                key: world.get(key) for key in _LIVENESS_WORLD_KEYS
+            }))
+        if timestep < self.warmup:
+            # The opening has no creep to command, so silence carries no signal.
+            return
+        self._graded += 1
+        if acted:
+            self._acted += 1
+        if self._silent_run > self.max_silence:
+            raise TiTeacherStalled(
+                f"{self.label} issued no engine intent for {self._silent_run} "
+                f"consecutive ticks ending at tick {timestep}; healthy episodes "
+                f"never exceed {self.max_silence}\n"
+                + self.world_trace(),
+                self.metrics,
+            )
+
+    def world_trace(self) -> str:
+        """Render the trailing world states behind the current silence."""
+        if not self._world_tail:
+            return "  world: unrecorded"
+        rows = [
+            "  world " + " ".join(
+                [f"tick={tick}"] + [f"{key}={value}" for key, value in state.items()]
+            )
+            for tick, state in self._world_tail
+        ]
+        return "\n".join(rows)
+
+    def finish(self) -> dict[str, float]:
+        """Validate the whole episode; returns the metrics it validated."""
+        metrics = self.metrics
+        if self._graded and metrics["active_fraction"] < self.min_active_fraction:
+            raise TiTeacherStalled(
+                f"{self.label} acted on {self._acted}/{self._graded} graded ticks "
+                f"({metrics['active_fraction']:.1%}), below the "
+                f"{self.min_active_fraction:.0%} floor for a live teacher\n"
+                + self.world_trace(),
+                metrics,
+            )
+        return metrics
+
+
+def _has_engine_intent(payload: Any) -> bool:
+    """True when the teacher issued at least one object intent this tick."""
+    if not isinstance(payload, dict):
+        return False
+    for room in payload.values():
+        if isinstance(room, dict) and (room.get("object") or room.get("local")):
+            return True
+    return False
+
+
 def _ti_split(
     config: CorpusConfig, *, seed: int, factor_labels: bool,
 ) -> tuple[dict, list[dict], dict[str, int]]:
     try:
         from samples.rl.agent.env_client import ScreepsEnv
-        from samples.rl.agent.pretrain_joint import _body_label_factor_mask, _parts_to_count_order
-        from samples.rl.agent.ti_intents import translate_ti_intents
         from samples.rl.agent.vec_env import _clone_host_obs, _compact_entity_prefixes
     except ImportError:
         from agent.env_client import ScreepsEnv
-        from agent.pretrain_joint import _body_label_factor_mask, _parts_to_count_order
-        from agent.ti_intents import translate_ti_intents
         from agent.vec_env import _clone_host_obs, _compact_entity_prefixes
     steps = config.ti_actor_steps
     critic_rows: list[dict] = []
@@ -807,6 +1391,34 @@ def _ti_split(
         bot_dir=str(config.resolved_ti_bot_dir), lean_meta=not factor_labels,
         capture_expert_intents=factor_labels, seed=seed,
     )
+    labeller = TiLabeller(window=config.ti_en_route_window, counts=factor_counts)
+    gate = TiLivenessGate(label=f"TI seed={seed}")
+
+    def _commit_ti_entry(entry: dict) -> int:
+        """Reservoir-add a tick no later action can still claim.
+
+        Returns the updated eligible-row count, because reservoir replacement
+        probability depends on how many eligible rows have been seen.
+        """
+        seen = factor_seen
+        if not bool(entry["eligible"].any()):
+            return seen
+        cap = entry["actor_cap"]
+        row = {
+            "timestep": entry["timestep"],
+            "obs": entry["obs"],
+            "action": {k: v[:, :cap].clone() for k, v in entry["actions"].items()},
+            "eligible": entry["eligible"][:, :cap].clone(),
+        }
+        seen += 1
+        if len(factor_rows) < config.ti_replay_capacity:
+            factor_rows.append(row)
+        else:
+            replacement = int(factor_rng.integers(0, seen))
+            if replacement < config.ti_replay_capacity:
+                factor_rows[replacement] = row
+        return seen
+
     try:
         obs = env.reset()
         for timestep in range(steps):
@@ -824,64 +1436,14 @@ def _ti_split(
                 config.ti_critic_replay_per_stratum,
             )
             if factor_labels:
-                labels = translate_ti_intents(
-                    info.get("expertIntents"), info.get("expertActorMeta") or [],
-                    info.get("expertTargetMeta") or [], info.get("expertRoomNames") or [],
-                )
-                actor_cap = pre["actors"].shape[1]
-                actions, eligible = _empty_ti_actions(actor_cap)
-                for label in labels:
-                    if label.rejection:
-                        key = f"rejected:{label.rejection}"
-                        factor_counts[key] = factor_counts.get(key, 0) + 1
-                        continue
-                    if label.actor_index is None or label.actor_index >= actor_cap or label.intent is None:
-                        continue
-                    if label.intent == "move":
-                        key = "rejected:macro_incompatible_move"
-                        factor_counts[key] = factor_counts.get(key, 0) + 1
-                        continue
-                    ai = label.actor_index
-                    actions["types"][0, ai, 0] = INTENT_TYPES.index(label.intent)
-                    if label.full_action:
-                        eligible[0, ai, 0] = True
-                    if label.direction is not None:
-                        actions["dirs"][0, ai, 0] = label.direction
-                        eligible[0, ai, 1] = True
-                    if label.target_index is not None:
-                        actions["targets"][0, ai, 0] = label.target_index
-                        eligible[0, ai, 2] = True
-                    if label.construction_type is not None:
-                        actions["construction_types"][0, ai, 0] = label.construction_type
-                        actions["construction_tiles"][0, ai, 0] = int(label.construction_tile or 0)
-                        eligible[0, ai, 4:6] = True
-                    if label.body_parts is not None:
-                        counts, order, exact = _parts_to_count_order(label.body_parts)
-                        actions["body_counts"][0, ai, 0] = counts
-                        actions["body_order"][0, ai, 0] = order
-                        eligible[0, ai] |= _body_label_factor_mask(counts, exact)
-                        if not exact:
-                            key = "partial:spawn_body_order_interleaved"
-                            factor_counts[key] = factor_counts.get(key, 0) + 1
-                    key = f"accepted:{label.intent}:{'full' if label.full_action else 'factor'}"
-                    factor_counts[key] = factor_counts.get(key, 0) + 1
-                if bool(eligible.any()):
-                    compact_cap = compact["actors"].shape[1]
-                    row = {
-                        "timestep": timestep,
-                        "obs": {k: v.clone() for k, v in compact.items()},
-                        "action": {k: v[:, :compact_cap].clone() for k, v in actions.items()},
-                        "eligible": eligible[:, :compact_cap].clone(),
-                    }
-                    factor_seen += 1
-                    if len(factor_rows) < config.ti_replay_capacity:
-                        factor_rows.append(row)
-                    else:
-                        replacement = int(factor_rng.integers(0, factor_seen))
-                        if replacement < config.ti_replay_capacity:
-                            factor_rows[replacement] = row
+                gate.observe(timestep, acted=labeller.observe(compact, info, timestep))
+                for entry in labeller.drain():
+                    factor_seen = _commit_ti_entry(entry)
             if (timestep + 1) % 500 == 0 or timestep + 1 == steps:
                 print(f"[corpus] TI seed={seed} {timestep + 1}/{steps}", flush=True)
+        liveness = gate.finish()
+        for entry in labeller.drain(flush=True):
+            factor_seen = _commit_ti_entry(entry)
     finally:
         env.close()
     rewards_tn, dones_tn = torch.stack(rewards), torch.stack(dones)
@@ -894,6 +1456,9 @@ def _ti_split(
     factor_counts.update({
         "eligible_ticks_seen": factor_seen,
         "replay_rows": len(factor_rows),
+        "intent_ticks": int(liveness["acting_ticks"]),
+        "graded_ticks": int(liveness["graded_ticks"]),
+        "worst_silent_run": int(liveness["worst_silent_run"]),
     })
     split = {
         "critic_replay": critic_rows, "rewards_tn": rewards_tn,
@@ -919,8 +1484,11 @@ def _ti_split(
 
 
 def _spawn_row(row: tuple) -> dict[str, Any]:
-    stratum, actor_index, obs, action = row
-    return {"stratum": stratum, "actor_index": int(actor_index), "obs": obs, "action": action}
+    stratum, actor_index, obs, action, eligible = row
+    return {
+        "stratum": stratum, "actor_index": int(actor_index), "obs": obs,
+        "action": action, "eligible": eligible,
+    }
 
 
 def _merge_stage_metrics(
@@ -941,17 +1509,48 @@ def _merge_stage_metrics(
     return result
 
 
-def collect_corpus(config: CorpusConfig = CorpusConfig()) -> dict[str, Any]:
-    """Collect scripted and TI train/holdout corpora entirely on CPU."""
+def _spill(value: Any, directory: Path | None, name: str) -> Any:
+    """Move a completed split to disk and return an mmap-backed equivalent.
+
+    Collection assembles every split before anything is written, so peak host
+    memory was the *sum* of the splits: at 16 environments and 20,000 ticks that
+    is tens of GiB of small per-row tensors, and the collector was OOM-killed
+    part way through the holdout split while the train split sat resident. The
+    spilled tensors are byte-identical and keep dtype and shape, so the corpus
+    hash does not depend on whether a split was spilled; the pages are file
+    backed, so the kernel reclaims them under pressure instead of killing the
+    process. `weights_only=False` is safe here because this process wrote the
+    file itself moments earlier.
+    """
+    if directory is None:
+        return value
+    path = directory / f"{name}.pt"
+    torch.save(value, path)
+    del value
+    gc.collect()
+    return torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+
+
+def collect_corpus(
+    config: CorpusConfig = CorpusConfig(), *, spill: Path | None = None,
+) -> dict[str, Any]:
+    """Collect the teacher lifecycle and TI critic train/holdout corpora on CPU.
+
+    `spill` names a writable directory on real storage - never tmpfs, which is
+    host memory under another name - that holds completed splits so peak memory
+    tracks the largest split instead of their sum.
+    """
     config.validate()
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
-    train, spawn, train_totals, train_stages = _scripted_split(
+    train, spawn, train_totals, train_stages = _lifecycle_split(
         config, seed=config.seed, sampling_seed=config.seed + 7919,
     )
-    holdout, _holdout_spawn, holdout_totals, holdout_stages = _scripted_split(
+    train = _spill(train, spill, "train")
+    holdout, _holdout_spawn, holdout_totals, holdout_stages = _lifecycle_split(
         config, seed=config.holdout_seed, sampling_seed=config.holdout_seed + 7919,
     )
+    holdout = _spill(holdout, spill, "holdout")
     try:
         from samples.rl.agent.pretrain_joint import _collect_spawn_contract_replay
     except ImportError:
@@ -959,24 +1558,29 @@ def collect_corpus(config: CorpusConfig = CorpusConfig()) -> dict[str, Any]:
     contracts: list[tuple] = []
     contract_metrics: dict[str, dict[str, Any]] = {}
     _collect_spawn_contract_replay(
-        contracts, contract_metrics, node=config.node, room=config.room, seed=config.seed,
+        contracts, contract_metrics, node=config.node, room=config.room,
+        seed=config.seed, bot_dir=str(config.resolved_ti_bot_dir),
     )
     ti_train, ti_factors, ti_counts = _ti_split(config, seed=config.seed, factor_labels=True)
+    ti_train = _spill(ti_train, spill, "ti_train")
+    ti_factors = _spill(ti_factors, spill, "ti_factors")
     ti_holdout, _unused_factors, _unused_counts = _ti_split(
         config, seed=config.holdout_seed, factor_labels=False,
     )
+    ti_holdout = _spill(ti_holdout, spill, "ti_holdout")
     meta = {
         **asdict(config),
         "holdout_seed": config.holdout_seed,
         "ti_bot_dir": str(config.resolved_ti_bot_dir),
         "ti_bot_source_sha256": directory_signature(config.resolved_ti_bot_dir),
         "ti_runtime_source_sha256": _ti_runtime_signature(config.resolved_ti_bot_dir),
+        "ti_room_radii": ti_room_radii(config.resolved_ti_bot_dir),
         "environment_schema_version": SCHEMA["version"],
         "schema_sha256": SCHEMA_SHA256,
         "collection_source_sha256": _collection_source_signature(),
         "contracts": dict(SCHEMA["artifact"]),
         "runtime": _runtime_provenance(config),
-        "expert": "scripted+ti",
+        "expert": "ti",
         "critic_target": "finite_horizon_discounted_return",
         "critic_endpoint": "zero_at_declared_lifecycle_horizon",
         "teacher_late_window_steps": _late_window_size(config.steps),
@@ -1103,6 +1707,52 @@ def _validate_obs(
     return room, actor, target
 
 
+def _validate_eligible(eligible: Any, actor_cap: int, location: str) -> None:
+    """Check one supervision mask against the factor layout it must index.
+
+    The mask is the only record of which factors the expert actually decided, so
+    a wrong width would silently supervise body parts as directions.
+    """
+    factors = 6 + 2 * N_BODY_PART
+    if not torch.is_tensor(eligible) or eligible.dtype != torch.bool:
+        raise ValueError(f"{location} must be a bool tensor")
+    if tuple(eligible.shape) != (1, actor_cap, factors):
+        raise ValueError(
+            f"{location} shape={tuple(eligible.shape)}; "
+            f"expected={(1, actor_cap, factors)}"
+        )
+    if not bool(eligible.any()):
+        raise ValueError(f"{location} supervises nothing")
+
+
+def _validate_teacher_liveness(liveness: Any, *, split: str) -> None:
+    """Fail closed on a corpus collected from a stalled expert.
+
+    `TiLivenessGate` already fails a single episode as it happens; this checks
+    the persisted aggregate so a corpus can never be loaded later without the
+    evidence that its teacher was awake.
+    """
+    if not isinstance(liveness, Mapping):
+        raise ValueError(f"teacher {split} liveness record missing")
+    graded = int(liveness.get("graded_ticks", 0))
+    acting = int(liveness.get("acting_ticks", 0))
+    worst = int(liveness.get("worst_silent_run", -1))
+    if int(liveness.get("episodes_graded", 0)) <= 0 or graded <= 0:
+        raise ValueError(f"teacher {split} liveness was never graded")
+    if worst < 0 or worst > TI_LIVENESS_MAX_SILENCE:
+        raise ValueError(
+            f"teacher {split} went silent for {worst} consecutive ticks "
+            f"(limit {TI_LIVENESS_MAX_SILENCE})"
+        )
+    fraction = acting / graded
+    if fraction < TI_LIVENESS_MIN_ACTIVE_FRACTION:
+        raise ValueError(
+            f"teacher {split} acted on {acting}/{graded} graded ticks "
+            f"({fraction:.1%}), below the "
+            f"{TI_LIVENESS_MIN_ACTIVE_FRACTION:.0%} floor"
+        )
+
+
 def _validate_action(
     action: Any, actor_cap: int, location: str, *, target_cap: int | None = None,
 ) -> None:
@@ -1161,7 +1811,7 @@ def _validate_temporal_replay(
         row_location = f"{location}.temporal_replay[{index}]"
         required = {
             "stratum", "timestep", "env_index", "terminated", "truncated",
-            "obs", "action", "counterfactual_action", "next_obs",
+            "obs", "action", "eligible", "counterfactual_action", "next_obs",
         }
         if not isinstance(row, dict) or set(row) != required:
             raise ValueError(f"{row_location} keys differ from schema")
@@ -1258,7 +1908,9 @@ def _validate_return_split(
 ) -> None:
     required = {rows_key, "rewards_tn", "dones_tn", "returns_tn", "sampling"}
     if rows_key == "lifecycle_replay":
-        required |= {"temporal_replay", "temporal_sampling"}
+        required |= {
+            "temporal_replay", "temporal_sampling", "label_counts", "liveness",
+        }
     optional = {"factor_sampling"}
     if not isinstance(split, dict) or set(split) - optional != required:
         raise ValueError(f"{location} keys differ from schema")
@@ -1285,7 +1937,7 @@ def _validate_return_split(
         row_location = f"{location}.{rows_key}[{index}]"
         required_row = {"stratum", "timestep", "env_index", "return_target", "obs"}
         if rows_key == "lifecycle_replay":
-            required_row.add("action")
+            required_row |= {"action", "eligible"}
         if not isinstance(row, dict) or set(row) != required_row:
             raise ValueError(f"{row_location} keys differ from schema")
         timestep, env_index = int(row["timestep"]), int(row["env_index"])
@@ -1301,6 +1953,9 @@ def _validate_return_split(
             _validate_action(
                 row["action"], actor_cap, f"{row_location}.action",
                 target_cap=target_cap,
+            )
+            _validate_eligible(
+                row["eligible"], actor_cap, f"{row_location}.eligible",
             )
         seen[row["stratum"]] = seen.get(row["stratum"], 0) + 1
     sampling = split["sampling"]
@@ -1427,12 +2082,15 @@ def validate_corpus(
         gamma=gamma, rows_key="critic_replay", location="data.ti_holdout",
     )
     for index, row in enumerate(data["spawn_replay"]):
-        if not isinstance(row, dict) or set(row) != {"stratum", "actor_index", "obs", "action"}:
+        if not isinstance(row, dict) or set(row) != {
+            "stratum", "actor_index", "obs", "action", "eligible",
+        }:
             raise ValueError(f"spawn row {index} schema invalid")
         _, actor, target = _validate_obs(row["obs"], f"spawn[{index}].obs")
         _validate_action(
             row["action"], actor, f"spawn[{index}].action", target_cap=target,
         )
+        _validate_eligible(row["eligible"], actor, f"spawn[{index}].eligible")
         if not 0 <= int(row["actor_index"]) < actor:
             raise ValueError(f"spawn row {index} actor reference invalid")
     if len(data["ti_factor_replay"]) > int(meta["ti_replay_capacity"]):
@@ -1444,9 +2102,9 @@ def validate_corpus(
         _validate_action(
             row["action"], actor, f"ti_factor[{index}].action", target_cap=target,
         )
-        eligible = row["eligible"]
-        if not torch.is_tensor(eligible) or eligible.dtype != torch.bool or eligible.shape[:2] != (1, actor):
-            raise ValueError(f"TI factor row {index} eligibility invalid")
+        _validate_eligible(
+            row["eligible"], actor, f"ti_factor[{index}].eligible",
+        )
     factor_sampling = data["ti_train"].get("factor_sampling")
     if not isinstance(factor_sampling, dict) or factor_sampling.get("algorithm") != TI_FACTOR_RESERVOIR_ALGORITHM:
         raise ValueError("TI factor sampling provenance invalid")
@@ -1459,10 +2117,12 @@ def validate_corpus(
         totals = teacher.get(f"{split}_totals", {}) if isinstance(teacher, dict) else {}
         if int(totals.get("transitions", -1)) != int(meta["steps"]) * int(meta["num_envs"]):
             raise ValueError(f"teacher {split} transition total differs")
-        if int(totals.get("invalid", -1)) or int(totals.get("recovered", -1)):
-            raise ValueError(f"teacher {split} contains invalid/recovered transitions")
         if float(totals.get("skill", float("nan"))) != float(totals.get("harvest", 0)) + float(totals.get("control", 0)):
             raise ValueError(f"teacher {split} skill total double-counted or inconsistent")
+        # The expert issues its intents inside the engine, so the learner-intent
+        # validity counters read zero by construction and prove nothing about it.
+        # Liveness is the measurable evidence that the teacher was awake.
+        _validate_teacher_liveness(data[split].get("liveness"), split=split)
         if "seed_outpost" in config.curricula:
             _validate_outpost_teacher_readiness(teacher, split=split)
     expected_values = asdict(expected) if isinstance(expected, CorpusConfig) else expected
@@ -1641,8 +2301,23 @@ def main(argv: list[str] | None = None) -> int:
         temporal_replay_per_stratum=args.temporal_replay_per_stratum,
         ti_bot_dir=args.ti_bot_dir, node=args.node,
     )
-    corpus = collect_corpus(config)
-    destination = save_corpus(corpus, args.output)
+    # The spill lives beside the output root so it lands on the same real
+    # storage; `tempfile` would default to /tmp, which is tmpfs on this host and
+    # would charge the spill straight back to host memory. It has to outlive
+    # `save_corpus`, which reads the mmap-backed tensors while sharding them.
+    output_root = Path(args.output)
+    output_root.mkdir(parents=True, exist_ok=True)
+    spill = Path(tempfile.mkdtemp(prefix=".spill-", dir=output_root))
+    corpus: Any = None
+    try:
+        corpus = collect_corpus(config, spill=spill)
+        destination = save_corpus(corpus, args.output)
+    finally:
+        # Every mmap into the spill has to be dropped before the files go, or a
+        # later read would fault on a deleted mapping.
+        corpus = None
+        gc.collect()
+        shutil.rmtree(spill, ignore_errors=True)
     print(f"[corpus] saved immutable artifact {destination}", flush=True)
     return 0
 

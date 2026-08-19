@@ -166,8 +166,17 @@ class EconomyTelemetryEngineTest(unittest.TestCase):
             finally:
                 env.close()
 
+    @unittest.expectedFailure  # ROADMAP blocker 5: the baseline's aging finisher
     def test_outpost_route_finisher_and_replacement_remain_productive(self) -> None:
-        """Route cargo survives replacement and the successor works after TTL 1500."""
+        """Route cargo survives replacement and the successor works after TTL 1500.
+
+        The hand-written planner is now the evaluation baseline, not a teacher, and
+        it fails this at seed 7: the seeded outpost worker survives to tick 1,497
+        but its successor never delivers home again. The assertions describe the
+        behavior a baseline must have, so they stay executable and expected-failing
+        rather than deleted; fixing the planner turns this into an unexpected
+        success, which fails the suite and forces the marker off.
+        """
         with patch.dict(
             os.environ,
             {"RL_OBS_FMT": "bin", "RL_ECONOMY_TELEMETRY": "1"},

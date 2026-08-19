@@ -23,6 +23,7 @@ import * as Badge from 'xxscreeps/engine/db/user/badge.js';
 import * as User from 'xxscreeps/engine/db/user/index.js';
 import { PlayerInstance } from 'xxscreeps/engine/runner/instance.js';
 import { hooks as runnerHooks } from 'xxscreeps/engine/runner/index.js';
+import { getConsoleChannel } from 'xxscreeps/engine/runner/model.js';
 import { userToIntentRoomsSetKey, userToVisibleRoomsSetKey } from 'xxscreeps/engine/processor/model.js';
 import { controlledRoomsKey } from 'xxscreeps/mods/controller/model.js';
 import * as C from 'xxscreeps/game/constants/index.js';
@@ -65,6 +66,8 @@ config.runner.deterministicCpu = true;
 // restores stock engine behavior for defense work.
 const INVADERS = process.env.RL_INVADERS === '1';
 config.game.invaders = INVADERS;
+/** Mirror the expert bot's own console logging, not only its faults. */
+const BOT_CONSOLE = process.env.RL_BOT_CONSOLE === '1';
 
 const USER = '100';
 const ROOM = process.env.RL_ROOM || 'W7N3';
@@ -245,7 +248,12 @@ function bufFromTyped(a) {
  * Binary response frame (RL_OBS_FMT=bin):
  *   magic "XRL1" | ver u8 | flags u8 | schema_ver u16 LE
  *   | meta_len u32 LE | blob_len u32 LE | meta JSON | tensor blob
- * flags: bit0=ok bit1=done bit2=has_obs bit3=has_teacher_actions
+ * flags: bit0=ok bit1=done bit2=has_obs bit3=has_action_tail
+ *
+ * The action tail carries the scripted baseline's chosen planes and is set only
+ * by `step_scripted`. Behaviour-cloning labels never travel here: the expert's
+ * own intents are captured inside the runner and returned as `expertIntents`
+ * metadata by `step_expert`.
  */
 function encodeScriptedActionPlanes(actions) {
 	const scalarNames = [
@@ -764,6 +772,7 @@ async function bootShard({
 		try { await session.headful.stop(); } catch { /* */ }
 	}
 	if (session?.close) {
+		try { session.console?.(); } catch { /* */ }
 		try { session.instance?.disconnect?.(); } catch { /* */ }
 		await session.close();
 	}
@@ -803,6 +812,11 @@ async function bootShard({
 		lastEconomyCreeps: new Map(),
 		lastConstructionSites: new Set(),
 		expert: Boolean(expert),
+		// A restored world belongs to the scenario that produced it, not to this
+		// process's `RL_CURRICULUM`. Reservoir lanes restore snapshots from several
+		// curricula into one process, so every per-tick decision that depends on the
+		// scenario reads this field instead of the module constant.
+		curriculum: restore ? String(restore.meta?.curriculum ?? CURRICULUM) : CURRICULUM,
 		instance: null,
 		botDir,
 		headful: null,
@@ -838,6 +852,18 @@ async function bootShard({
 		const modules = await loadBotModules(botDir);
 		await Code.saveContent(handle.db, USER, 'main', modules);
 		handle.instance = await PlayerInstance.create(handle.shard, handle.world, USER);
+		// A teacher that throws inside its own tick publishes no intents and reports
+		// only on this channel, so leaving it unread turns a broken expert into a
+		// silently empty demonstration. Faults always reach stderr; the bot's own
+		// logging is voluminous and needs RL_BOT_CONSOLE=1.
+		handle.console = await getConsoleChannel(handle.shard, USER).listen(message => {
+			for (const line of JSON.parse(message)) {
+				const text = String(line.data);
+				if (line.fd === 2 || /error|exception/i.test(text) || BOT_CONSOLE) {
+					process.stderr.write(`[bot fd${line.fd}] ${text.slice(0, 400)}\n`);
+				}
+			}
+		});
 		console.error(`[rl-env] expert bot loaded from ${botDir}`);
 	}
 
@@ -858,6 +884,10 @@ async function bootShard({
 			info: {
 				room: ROOM,
 				seed: SCENARIO_SEED,
+				// The restored world's own scenario, so a reservoir lane can attribute
+				// its segment to the stage that produced the state, not to this
+				// process's `RL_CURRICULUM`.
+				curriculum: handle.curriculum,
 				time: restored.time,
 				step: handle.step,
 				expert: handle.expert,
@@ -908,6 +938,7 @@ async function bootShard({
 		info: {
 			room: ROOM,
 			seed: SCENARIO_SEED,
+			curriculum: handle.curriculum,
 			time: obs.time,
 			step: 0,
 			expert: handle.expert,
@@ -1010,7 +1041,7 @@ async function writeSnapshot(filePath, { events = [] } = {}) {
 	const meta = {
 		schemaVersion: Number(SCHEMA.version),
 		world_identity: snapshotWorldIdentity(),
-		curriculum: CURRICULUM,
+		curriculum: session.curriculum,
 		seed: SCENARIO_SEED,
 		expert: Boolean(session.expert),
 		randomState: scenarioRandomState >>> 0,
@@ -1037,7 +1068,7 @@ async function writeSnapshot(filePath, { events = [] } = {}) {
 				tick: world.time,
 				step: session.step,
 				rooms: rooms.map(room => room.name),
-				curriculum: CURRICULUM,
+				curriculum: session.curriculum,
 				expert: Boolean(session.expert),
 				events: [ ...events ],
 			},
@@ -1476,7 +1507,7 @@ async function encodeAndRewardAfterTick(intentResults = []) {
 	// strategic room. Primitive intents still run through the player's normal
 	// visible-room state; actions.mjs uses positional proxies until a creep scouts it.
 	if (!roomNames.includes(ROOM)) roomNames.push(ROOM);
-	const spawnArchetype = /^spawn_([^_]+)_/.exec(CURRICULUM)?.[1] || null;
+	const spawnArchetype = /^spawn_([^_]+)_/.exec(session.curriculum)?.[1] || null;
 	const exposeExpansion = spawnArchetype == null || spawnArchetype === 'claimer';
 	if (exposeExpansion && !roomNames.includes(EXPANSION_ROOM)) roomNames.push(EXPANSION_ROOM);
 	const rooms = await Promise.all(roomNames.map(n => session.shard.loadRoom(n)));
@@ -1792,24 +1823,15 @@ function rememberActorOutcomes(results) {
 	]));
 }
 
-async function stepRl(actions, { label = false } = {}) {
+async function stepRl(actions) {
 	if (!session) throw new Error('call reset first');
 	if (session.expert) throw new Error('session is expert mode; use step_expert');
 
 	// Apply intents against the world matching the last returned obs (session.meta).
 	// Encode ONLY after tick so the agent conditions on the true next state (H1 fix).
 	let intentResults = [];
-	let teacherActions = null;
 	await session.player(USER, Game => {
 		installSimulationGcl(Game);
-		// simulate() permits only one player callback per tick. Compute the label
-		// from the untouched pre-state, then apply the learner's actions in that
-		// same callback so the label is aligned with the caller's previous obs.
-		if (label) {
-			teacherActions = scriptedActions(
-				Game, session.meta || { actorMeta: [], targetMeta: [] },
-			);
-		}
 		intentResults = applyActions(Game, session.meta, actions || {
 			types: [], dirs: [], targets: [], amounts: [],
 		});
@@ -1837,10 +1859,8 @@ async function stepRl(actions, { label = false } = {}) {
 			intentResults: LEAN_META ? undefined : intentResults,
 			...summarizeIntentResults(intentResults),
 			globals: obs.globals,
-			curriculum: CURRICULUM,
+			curriculum: session.curriculum,
 			expert: false,
-			labeled: label || undefined,
-			actions: teacherActions || undefined,
 			...extras,
 		},
 	};
@@ -1958,7 +1978,7 @@ async function stepScripted() {
 				intentResults: LEAN_META ? undefined : intentResults,
 				...summarizeIntentResults(intentResults),
 				globals: obs.globals,
-				curriculum: CURRICULUM,
+				curriculum: session.curriculum,
 				expert: false,
 			scripted: true,
 			actions,
@@ -2007,6 +2027,9 @@ async function stepExpert() {
 			controlDelta,
 			harvestDelta,
 			globals: obs.globals,
+			// Stage attribution is per environment, and the teacher lane is the only
+			// collector now, so this key must exist on the expert wire too.
+			curriculum: session.curriculum,
 			expert: true,
 			botDir: session.botDir,
 			expertIntents: CAPTURE_EXPERT_INTENTS ? expertIntents : undefined,
@@ -2016,6 +2039,12 @@ async function stepExpert() {
 			expertActorMeta: CAPTURE_EXPERT_INTENTS ? expertPreMeta?.actorMeta : undefined,
 			expertTargetMeta: CAPTURE_EXPERT_INTENTS ? expertPreMeta?.targetMeta : undefined,
 			expertRoomNames: CAPTURE_EXPERT_INTENTS ? expertPreMeta?.roomNames : undefined,
+			// The runner only loads room blobs for `visibleRooms` and only publishes
+			// intents for `intentRooms`. A teacher that keeps deciding from cached
+			// Memory while these sets are empty issues nothing, which is otherwise
+			// indistinguishable from a teacher that chose to idle.
+			expertVisibleRooms: CAPTURE_EXPERT_INTENTS ? vr : undefined,
+			expertIntentRooms: CAPTURE_EXPERT_INTENTS ? ir : undefined,
 			// Identical replicas must consume the shared scenario stream identically.
 			// A divergent draw count is the earliest observable symptom of engine
 			// nondeterminism, well before the world visibly differs.
@@ -2030,6 +2059,7 @@ async function closeEpisode() {
 	if (session?.headful?.stop) {
 		try { await session.headful.stop(); } catch { /* */ }
 	}
+	try { session?.console?.(); } catch { /* */ }
 	if (session?.close) await session.close();
 	session = null;
 	return { ok: true };
@@ -2050,9 +2080,6 @@ async function dispatch(msg) {
 	} else if (msg.cmd === 'step') {
 		validateStepActions(msg.actions);
 		reply(await stepRl(msg.actions));
-	} else if (msg.cmd === 'step_labeled') {
-		validateStepActions(msg.actions);
-		reply(await stepRl(msg.actions, { label: true }));
 	} else if (msg.cmd === 'step_scripted') {
 		// One player() only (simulate forbids two per tick). Decide + apply together.
 		reply(await stepScripted());
@@ -2088,7 +2115,7 @@ function enqueueProtocolError(message) {
 }
 
 const COMMAND_MAGIC = Buffer.from('XAC1', 'ascii');
-const COMMAND_VERSION = 6;
+const COMMAND_VERSION = 7;
 const COMMAND_HEADER_BYTES = 16;
 const COMMAND_MAX_PAYLOAD = 1024 * 1024;
 const COMMANDS = Object.freeze({
@@ -2099,9 +2126,8 @@ const COMMANDS = Object.freeze({
 	5: 'step_expert',
 	6: 'schema',
 	7: 'close',
-	8: 'step_labeled',
-	9: 'snapshot',
-	10: 'restore',
+	8: 'snapshot',
+	9: 'restore',
 });
 const EMPTY_COMMANDS = new Set([ 'reset', 'step_scripted', 'step_expert', 'schema', 'close' ]);
 const ACTION_NAMES = [
@@ -2149,7 +2175,7 @@ function decodeBinaryCommand(frame) {
 	const cmd = COMMANDS[opcode];
 	if (!cmd) throw new Error(`unknown command opcode ${opcode}`);
 	const payload = frame.subarray(COMMAND_HEADER_BYTES);
-	if (cmd === 'step' || cmd === 'step_labeled') {
+	if (cmd === 'step') {
 		if (actors > SCHEMA.maxActors) {
 			throw new Error(`step actors=${actors} exceeds maxActors=${SCHEMA.maxActors}`);
 		}

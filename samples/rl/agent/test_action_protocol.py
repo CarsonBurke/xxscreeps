@@ -5,7 +5,9 @@ import io
 import json
 import os
 import struct
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -24,7 +26,6 @@ from .env_client import (
     _teacher_actions_from_response,
     _teacher_action_payload_bytes,
 )
-from .vec_env import VecScreepsEnv
 
 
 class BinaryCommandEncodingTest(unittest.TestCase):
@@ -45,8 +46,9 @@ class BinaryCommandEncodingTest(unittest.TestCase):
         actions["body_order"][0, 1, 0] = [3, 0, 1, 2, 4, 5, 6, 7]
         frame = _encode_binary_command({"cmd": "step", "actions": actions})
         header = struct.unpack("<4sBBHIHBB", frame[:16])
-        # Command protocol 6 added the snapshot and restore opcodes.
-        self.assertEqual(header, (b"XAC1", 6, 3, SCHEMA["version"], 46, 2, 1, 0))
+        # Command protocol 7 dropped the scripted-label opcode; snapshot and
+        # restore moved down to 8 and 9.
+        self.assertEqual(header, (b"XAC1", 7, 3, SCHEMA["version"], 46, 2, 1, 0))
         self.assertEqual(
             frame[16:26], bytes([1, 2, 3, 4, 5, 6, 7, 8, 2, 3]),
         )
@@ -93,31 +95,6 @@ class BinaryCommandEncodingTest(unittest.TestCase):
         for encoder in (_encode_binary_command, _json_command):
             with self.assertRaisesRegex(ValueError, "finite integers"):
                 encoder({"cmd": "step", "actions": bad})
-
-    def test_labeled_step_has_distinct_opcode_and_identical_action_payload(self) -> None:
-        shape = (1, INTENT_SLOTS)
-        actions = {
-            name: np.zeros(shape, dtype=np.int64)
-            for name in (
-                "types", "dirs", "targets", "amounts", "construction_types",
-                "construction_tiles",
-            )
-        }
-        actions["body_counts"] = np.zeros(
-            (1, INTENT_SLOTS, N_BODY_PART), dtype=np.int64,
-        )
-        actions["body_order"] = np.tile(
-            np.arange(N_BODY_PART), (1, INTENT_SLOTS, 1),
-        )
-        step = _encode_binary_command({"cmd": "step", "actions": actions})
-        labeled = _encode_binary_command({"cmd": "step_labeled", "actions": actions})
-        self.assertEqual(labeled[4], 6)
-        self.assertEqual(labeled[5], 8)
-        self.assertEqual(labeled[6:], step[6:])
-        self.assertEqual(
-            _json_command({"cmd": "step_labeled", "actions": actions})["actions"],
-            _json_command({"cmd": "step", "actions": actions})["actions"],
-        )
 
 
 class BinaryTeacherActionEncodingTest(unittest.TestCase):
@@ -212,14 +189,14 @@ class BinaryTeacherActionEncodingTest(unittest.TestCase):
     def test_json_teacher_response_is_strictly_validated(self) -> None:
         wire = _json_command({"cmd": "step", "actions": self._actions(1)})["actions"]
         decoded = _teacher_actions_from_response(
-            {}, {"actions": wire}, binary=False, command="step_labeled",
+            {}, {"actions": wire}, binary=False, command="step_scripted",
         )
         self.assertEqual(tuple(decoded["types"].shape), (1, INTENT_SLOTS))
 
         malformed = {**wire, "bodyOrder": []}
-        with self.assertRaisesRegex(RuntimeError, "invalid JSON step_labeled teacher actions"):
+        with self.assertRaisesRegex(RuntimeError, "invalid JSON step_scripted teacher actions"):
             _teacher_actions_from_response(
-                {}, {"actions": malformed}, binary=False, command="step_labeled",
+                {}, {"actions": malformed}, binary=False, command="step_scripted",
             )
 
     def test_response_rejects_redundant_flag_and_observation_length_disagreement(self) -> None:
@@ -400,103 +377,6 @@ class BinaryCommandServerTest(unittest.TestCase):
             if torch.is_tensor(value):
                 torch.testing.assert_close(value, json_obs[key], rtol=0, atol=0)
 
-    def test_labeled_step_uses_pre_state_teacher_and_learner_transition(self) -> None:
-        results = {}
-        for response_format in ("bin", "json"):
-            with patch.dict(os.environ, {"RL_OBS_FMT": response_format}):
-                env = ScreepsEnv(
-                    max_episode=4,
-                    command_format=response_format,
-                    curriculum="spawn_flexible_300",
-                    lean_meta=False,
-                    seed=117,
-                )
-                try:
-                    pre_obs = env.reset()
-                    spawn_actor = next(
-                        index for index, meta in enumerate(pre_obs["_actor_meta"])
-                        if meta.get("kind") == "structure"
-                    )
-                    obs, reward, done, info, teacher = env.step_labeled(
-                        self._zero_actions(),
-                    )
-                    results[response_format] = (
-                        obs, reward, done, info, pad_actions(teacher), spawn_actor,
-                    )
-                finally:
-                    env.close()
-
-        bin_obs, bin_reward, bin_done, bin_info, bin_teacher, spawn_actor = results["bin"]
-        json_obs, json_reward, json_done, json_info, json_teacher, json_spawn_actor = results["json"]
-        self.assertEqual(spawn_actor, json_spawn_actor)
-        self.assertEqual((bin_reward, bin_done), (json_reward, json_done))
-        self.assertTrue(bin_info["labeled"])
-        self.assertEqual(bin_info["intentIssued"], 0)
-        self.assertNotIn("actions", bin_info)
-        self.assertIn("actions", json_info)
-        self.assertEqual(
-            int(bin_teacher["types"][spawn_actor, 0]),
-            INTENT_TYPES.index("spawnCreep"),
-        )
-        for key in bin_teacher:
-            torch.testing.assert_close(
-                bin_teacher[key], json_teacher[key], rtol=0, atol=0,
-            )
-        for key, value in bin_obs.items():
-            if torch.is_tensor(value):
-                torch.testing.assert_close(value, json_obs[key], rtol=0, atol=0)
-
-        # A standalone scripted step from the identical reset must emit the same
-        # decision label, even though it applies that label rather than the no-op.
-        with patch.dict(os.environ, {"RL_OBS_FMT": "bin"}):
-            scripted_env = ScreepsEnv(
-                max_episode=4,
-                command_format="bin",
-                curriculum="spawn_flexible_300",
-                lean_meta=False,
-                seed=117,
-            )
-            try:
-                scripted_env.reset()
-                _, _, _, scripted_info, scripted_teacher = scripted_env.step_scripted()
-            finally:
-                scripted_env.close()
-        self.assertGreater(scripted_info["intentIssued"], 0)
-        scripted_teacher = pad_actions(scripted_teacher)
-        for key in bin_teacher:
-            torch.testing.assert_close(
-                bin_teacher[key], scripted_teacher[key], rtol=0, atol=0,
-            )
-
-    def test_vec_labeled_step_returns_batched_teacher_planes(self) -> None:
-        with patch.dict(os.environ, {"RL_OBS_FMT": "bin"}):
-            env = VecScreepsEnv(
-                1,
-                max_episode=4,
-                curriculum="spawn_flexible_300",
-                lean_meta=True,
-                seed=233,
-            )
-            try:
-                env.reset()
-                obs, rewards, dones, infos, teacher = env.step_labeled(
-                    self._zero_actions(),
-                )
-            finally:
-                env.close()
-        self.assertEqual(tuple(rewards.shape), (1,))
-        self.assertEqual(tuple(dones.shape), (1,))
-        self.assertEqual(obs["actors"].shape[0], 1)
-        self.assertLessEqual(obs["actors"].shape[1], MAX_ACTORS)
-        self.assertEqual(tuple(teacher["types"].shape), (1, MAX_ACTORS, INTENT_SLOTS))
-        self.assertEqual(
-            tuple(teacher["body_counts"].shape),
-            (1, MAX_ACTORS, INTENT_SLOTS, N_BODY_PART),
-        )
-        self.assertTrue(infos[0]["labeled"])
-        self.assertEqual(infos[0]["intentIssued"], 0)
-        self.assertTrue(torch.any(teacher["types"] == INTENT_TYPES.index("spawnCreep")))
-
     def test_binary_and_json_materialize_the_same_grouped_spawn_body(self) -> None:
         observed: dict[str, list[int]] = {}
         with patch.dict(os.environ, {"RL_OBS_FMT": "bin"}):
@@ -619,6 +499,49 @@ class BinaryCommandServerTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "refusing unsafe resynchronization"):
                     env._read_bin_frame()
                 self.assertNotEqual(env.proc.wait(timeout=2), 0)
+            finally:
+                env.close()
+
+    def test_restored_world_keeps_its_own_scenario_rooms(self) -> None:
+        """A reservoir lane restores several curricula into one env process.
+
+        Room exposure and stage attribution are properties of the restored world,
+        not of the process's `RL_CURRICULUM`. `spawn_claimer_650` carries the
+        connected expansion room and `spawn_flexible_300` does not, so restoring
+        both into a flexible process is what catches a process-level rule.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            captured: dict[str, tuple[str, int]] = {}
+            paths: dict[str, Path] = {}
+            for stage in ("spawn_flexible_300", "spawn_claimer_650"):
+                path = Path(tmp) / f"{stage}.xsnp"
+                paths[stage] = path
+                env = ScreepsEnv(max_episode=8, curriculum=stage)
+                try:
+                    obs = env.reset()
+                    env.snapshot(str(path))
+                    captured[stage] = (
+                        str(env.last_info["curriculum"]),
+                        int(obs["room_mask"].sum()),
+                    )
+                finally:
+                    env.close()
+            self.assertEqual(captured["spawn_flexible_300"][1], 1)
+            self.assertEqual(captured["spawn_claimer_650"][1], 2)
+
+            env = ScreepsEnv(max_episode=8, curriculum="spawn_flexible_300")
+            try:
+                env.reset()
+                for stage in (
+                    "spawn_flexible_300", "spawn_claimer_650",
+                    "spawn_flexible_300", "spawn_claimer_650",
+                ):
+                    obs = env.restore(str(paths[stage]))
+                    self.assertEqual(
+                        (str(env.last_info["curriculum"]), int(obs["room_mask"].sum())),
+                        captured[stage],
+                        f"{stage} lost state when restored after another scenario",
+                    )
             finally:
                 env.close()
 

@@ -6,7 +6,7 @@
     "observationAbi": 9,
     "actionAbi": 11,
     "rewardAbi": 3,
-    "teacherAbi": 20,
+    "teacherAbi": 22,
     "learningAbi": 14
   },
   "roomSize": 50,
@@ -117,6 +117,11 @@
     "energyHarvested": 0.1,
     "controlPoints": 1.0,
     "_comment": "Only harvested energy and controller progress enter reward. Delivery, construction, claims, spawning, and storage flows remain diagnostics and qualification gates because gross progress signals can be gamed."
+  },
+  "teacher": {
+    "maxRemoteRoomDistance": 1,
+    "maxScoutRoomDistance": 1,
+    "_comment": "The International is configured for this observation ABI. Stock radii (remotes 5, unbounded scouting) grow a 7-to-15-room colony, so a labelled tick commands creeps in rooms no room slot can hold: at 20,000 ticks a staked room was dropped on 74-86% of ticks across three seeds and live creeps peaked at 111-122 against 64 creep slots. Collection asserts the loaded bundle's constants equal these values; changing either changes what the corpus means and must bump teacherAbi."
   },
   "model": {
     "dModel": 128,

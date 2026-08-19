@@ -21,14 +21,17 @@ from .pretrain_corpus import (
     TEMPORAL_OBS_KEYS,
     CorpusConfig,
     _append_temporal_replay,
-    _invalid_scripted_intent_details,
+    _spill,
+    content_sha256,
     _same_state_counterfactual_action,
     _validate_temporal_replay,
     _record_teacher_step,
     assemble_corpus,
     load_corpus,
     save_corpus,
+    ti_room_radii,
     validate_corpus,
+    validate_teacher_configuration,
     parse_args as parse_corpus_args,
 )
 
@@ -83,6 +86,22 @@ def _action() -> dict[str, torch.Tensor]:
     return action
 
 
+def _eligible(actor: int = 8) -> torch.Tensor:
+    """A supervision mask standing for one fully labelled teacher decision."""
+    mask = torch.zeros(1, actor, 6 + 2 * N_BODY_PART, dtype=torch.bool)
+    mask[0, 0, :3] = True
+    return mask
+
+
+def _new_totals_fixture() -> dict:
+    return {
+        "transitions": 0, "harvest": 0.0, "control": 0.0, "skill": 0.0,
+        "delivery": 0.0, "build": 0.0, "claims": 0, "max_creeps": 0,
+        "spawn_success": 0, "issued": 0, "invalid": 0, "recovered": 0,
+        "action_type_hist": {name: 0 for name in INTENT_TYPES},
+    }
+
+
 def _sampling(stratum: str) -> dict:
     return {
         "algorithm": "algorithm_r_per_stratum",
@@ -103,10 +122,11 @@ def _corpus() -> dict:
     rewards = torch.tensor([[1.0], [2.0]])
     dones = torch.zeros_like(rewards)
     returns = torch.tensor([[2.8], [2.0]])
-    scripted_stratum = "empty:r1:p0_3:none"
-    scripted_row = {
-        "stratum": scripted_stratum, "timestep": 0, "env_index": 0,
-        "return_target": returns[0, 0].clone(), "obs": _obs(), "action": _action(),
+    teacher_stratum = "empty:r1:p0_3:none"
+    teacher_row = {
+        "stratum": teacher_stratum, "timestep": 0, "env_index": 0,
+        "return_target": returns[0, 0].clone(), "obs": _obs(),
+        "action": _action(), "eligible": _eligible(),
     }
     temporal_rows = []
     for timestep in range(2):
@@ -120,13 +140,14 @@ def _corpus() -> dict:
         counterfactual = _same_state_counterfactual_action(current, action, 0, 8)
         assert counterfactual is not None
         temporal_rows.append({
-            "stratum": scripted_stratum,
+            "stratum": teacher_stratum,
             "timestep": timestep,
             "env_index": 0,
             "terminated": False,
             "truncated": False,
             "obs": {key: current[key] for key in TEMPORAL_OBS_KEYS},
             "action": action,
+            "eligible": _eligible(),
             "counterfactual_action": counterfactual,
             "next_obs": {key: future[key] for key in TEMPORAL_OBS_KEYS},
         })
@@ -135,11 +156,16 @@ def _corpus() -> dict:
         "stratum": ti_stratum, "timestep": 0, "env_index": 0,
         "return_target": returns[0, 0].clone(), "obs": _obs(),
     }
-    scripted = {
-        "lifecycle_replay": [scripted_row], "rewards_tn": rewards,
+    teacher = {
+        "lifecycle_replay": [teacher_row], "rewards_tn": rewards,
         "dones_tn": dones, "returns_tn": returns,
-        "sampling": _sampling(scripted_stratum),
+        "sampling": _sampling(teacher_stratum),
         "temporal_replay": temporal_rows,
+        "label_counts": {"accepted:harvest:full": 1},
+        "liveness": {
+            "episodes_graded": 1, "acting_ticks": 2, "graded_ticks": 2,
+            "worst_silent_run": 0,
+        },
         "temporal_sampling": {
             "algorithm": "algorithm_r_per_stratum_causal_pairs",
             "capacity_per_stratum": config.temporal_replay_per_stratum,
@@ -147,8 +173,8 @@ def _corpus() -> dict:
             "seed": 101,
             "pairing": "same_env_same_tick_pre_action_to_post_action",
             "terminal_policy": "exclude_episode_end_before_vec_reset",
-            "seen_by_stratum": {scripted_stratum: 2},
-            "retained_by_stratum": {scripted_stratum: 2},
+            "seen_by_stratum": {teacher_stratum: 2},
+            "retained_by_stratum": {teacher_stratum: 2},
             "excluded_terminal": 0,
             "excluded_truncated": 0,
             "counterfactual_retained": 2,
@@ -180,7 +206,7 @@ def _corpus() -> dict:
         "environment_schema_version": SCHEMA["version"],
         "schema_sha256": SCHEMA_SHA256, "collection_source_sha256": "test",
         "contracts": dict(SCHEMA["artifact"]), "runtime": {},
-        "expert": "scripted+ti", "critic_target": "finite_horizon_discounted_return",
+        "expert": "ti", "critic_target": "finite_horizon_discounted_return",
         "critic_endpoint": "zero_at_declared_lifecycle_horizon",
         "train_env_map": config.env_map(config.seed),
         "holdout_env_map": config.env_map(config.holdout_seed),
@@ -189,10 +215,10 @@ def _corpus() -> dict:
             {"split": "holdout", "env_index": 0, "seed": config.holdout_seed, "expert": "ti"},
         ],
     }
-    holdout_scripted = copy.deepcopy(scripted)
-    holdout_scripted["temporal_sampling"]["seed"] = 202
+    holdout_teacher = copy.deepcopy(teacher)
+    holdout_teacher["temporal_sampling"]["seed"] = 202
     data = {
-        "train": scripted, "holdout": holdout_scripted,
+        "train": teacher, "holdout": holdout_teacher,
         "ti_train": ti_train, "ti_holdout": ti,
         "spawn_replay": [], "ti_factor_replay": [],
         "teacher": {"train_totals": totals, "holdout_totals": dict(totals)},
@@ -201,20 +227,26 @@ def _corpus() -> dict:
 
 
 class CorpusArtifactTests(unittest.TestCase):
-    def test_executable_provenance_binds_supplement_helper_dependency(self) -> None:
+    def test_executable_provenance_binds_label_helper_dependency(self) -> None:
         from unittest.mock import patch
 
         from .artifacts import SOURCE_SIGNATURE_AGENT_NAMES, source_signature
 
-        self.assertIn("outpost_actor_corpus.py", SOURCE_SIGNATURE_AGENT_NAMES)
-        self.assertIn("dagger_corpus.py", SOURCE_SIGNATURE_AGENT_NAMES)
-        dagger_path = Path(__file__).with_name("dagger_corpus.py")
+        # Every fingerprinted name must still be executable source on disk, or
+        # the signature silently stops covering what it claims to cover.
+        for name in SOURCE_SIGNATURE_AGENT_NAMES:
+            self.assertTrue(Path(__file__).with_name(name).is_file(), name)
+        self.assertIn("ti_intents.py", SOURCE_SIGNATURE_AGENT_NAMES)
+        translator_path = Path(__file__).with_name("ti_intents.py")
         original_read_bytes = Path.read_bytes
         baseline = source_signature()
 
         def dependency_changed(path: Path) -> bytes:
             payload = original_read_bytes(path)
-            return payload + b"\n# provenance probe" if path == dagger_path else payload
+            return (
+                payload + b"\n# provenance probe"
+                if path == translator_path else payload
+            )
 
         with patch.object(Path, "read_bytes", dependency_changed):
             changed = source_signature()
@@ -229,42 +261,29 @@ class CorpusArtifactTests(unittest.TestCase):
         from .pretrain_joint import parse_args as parse_joint_args
         joint_args = parse_joint_args(["--corpus", "unused"])
         self.assertEqual(joint_args.min_rare_intent_rows, 32)
-        self.assertIsNone(joint_args.actor_supplement)
 
-    def test_invalid_teacher_diagnostic_identifies_env_seed_stage_and_result(self) -> None:
-        details = _invalid_scripted_intent_details(
-            [{"intentInvalid": 0}, {
+    def test_teacher_step_records_engine_outcomes_without_labels(self) -> None:
+        totals = _new_totals_fixture()
+        by_stage: dict[str, dict] = {}
+        _record_teacher_step(
+            totals, by_stage,
+            [{"intentInvalid": 0, "curriculum": "empty", "harvestDelta": 2}, {
                 "curriculum": "seed_outpost", "intentInvalid": 1,
                 "intentByType": {"harvest": {"issued": 1, "invalid": 1}},
-                "intentResults": [
-                    {"actor": "remote", "type": "move", "code": -11},
-                    {
-                        "actor": "remote", "type": "harvest", "code": -6,
-                        "executed": False, "targetKind": "source", "targetId": "s1",
-                    },
-                ],
             }],
-            [
-                {"env_index": 0, "seed": 3, "curriculum": "empty"},
-                {"env_index": 1, "seed": 4, "curriculum": "seed_outpost"},
-            ],
         )
-        self.assertEqual(len(details), 1)
-        self.assertEqual(details[0]["env_index"], 1)
-        self.assertEqual(details[0]["seed"], 4)
-        self.assertEqual(details[0]["curriculum"], "seed_outpost")
-        self.assertEqual(details[0]["results"], [{
-            "actor": "remote", "type": "harvest", "code": -6,
-            "executed": False, "targetKind": "source", "targetId": "s1",
-        }])
+        self.assertEqual(totals["transitions"], 2)
+        self.assertEqual(totals["invalid"], 1)
+        self.assertEqual(
+            by_stage["seed_outpost"]["intent_by_type"]["harvest"],
+            {"issued": 1, "invalid": 1},
+        )
+        # The expert decides inside the engine, so a tick's economy outcome is
+        # recorded without any label; labels arrive later, out of lockstep.
+        self.assertEqual(totals["action_type_hist"], {name: 0 for name in INTENT_TYPES})
 
     def test_metric_skill_is_counted_once(self) -> None:
-        totals = {
-            "transitions": 0, "harvest": 0.0, "control": 0.0, "skill": 0.0,
-            "delivery": 0.0, "build": 0.0, "claims": 0, "max_creeps": 0,
-            "spawn_success": 0, "issued": 0, "invalid": 0, "recovered": 0,
-            "action_type_hist": {name: 0 for name in INTENT_TYPES},
-        }
+        totals = _new_totals_fixture()
         infos = [{
             "curriculum": "empty", "harvestDelta": 2, "controlDelta": 3,
             "remoteHarvestDelta": 7, "remoteHomeDeliveryDelta": 5,
@@ -272,11 +291,7 @@ class CorpusArtifactTests(unittest.TestCase):
             "remoteRoomsStaffed": 1, "remoteProductiveCreeps": 1,
             "neutralOutpostRooms": 1,
         }]
-        actions = _action()
-        _record_teacher_step(
-            totals, {}, _obs(), actions, infos, lambda *_args: None,
-            late_window=True,
-        )
+        _record_teacher_step(totals, {}, infos, late_window=True)
         self.assertEqual(totals["skill"], 5.0)
         self.assertEqual(totals["skill"], totals["harvest"] + totals["control"])
         self.assertEqual(totals["remote_harvest"], 7.0)
@@ -332,6 +347,48 @@ class CorpusArtifactTests(unittest.TestCase):
                     ):
                         validate_corpus(broken, verify_hashes=False)
 
+    def test_teacher_radii_must_match_the_observation_abi(self) -> None:
+        """A stock teacher labels rooms and creeps the observation cannot hold."""
+        declared = {
+            name: int(value) for name, value in SCHEMA["teacher"].items()
+            if not name.startswith("_")
+        }
+        self.assertIn("maxRemoteRoomDistance", declared)
+        self.assertIn("maxScoutRoomDistance", declared)
+        configured = "".join(f"const {n} = {v};\n" for n, v in declared.items())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "main.js"
+            bundle.write_text(f"const other = 3;\n{configured}")
+            self.assertEqual(ti_room_radii(root), declared)
+            self.assertEqual(validate_teacher_configuration(root), declared)
+
+            # Every declared constant is load-bearing, one at a time.
+            for name in declared:
+                widened = dict(declared, **{name: declared[name] + 4})
+                bundle.write_text(
+                    "".join(f"const {n} = {v};\n" for n, v in widened.items()),
+                )
+                with self.assertRaisesRegex(ValueError, "requires"):
+                    validate_teacher_configuration(root)
+
+            # An unreadable constant is a silent teacher swap, not a default.
+            bundle.write_text("const unrelated = 1;\n")
+            with self.assertRaisesRegex(ValueError, "expected exactly one"):
+                ti_room_radii(root)
+            bundle.unlink()
+            with self.assertRaises(FileNotFoundError):
+                ti_room_radii(root)
+
+    def test_corpus_config_rejects_an_unconfigured_teacher(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "main.js").write_text(
+                "const maxRemoteRoomDistance = 5;\nconst maxScoutRoomDistance = 5;\n",
+            )
+            with self.assertRaisesRegex(ValueError, "room slots"):
+                CorpusConfig(ti_bot_dir=str(root)).validate()
+
     def test_tensor_shard_roundtrip_is_weights_only_and_idempotent(self) -> None:
         corpus = _corpus()
         with tempfile.TemporaryDirectory() as temporary:
@@ -345,6 +402,25 @@ class CorpusArtifactTests(unittest.TestCase):
                 loaded["data"]["train"]["returns_tn"],
                 corpus["data"]["train"]["returns_tn"],
             ))
+
+    def test_spilled_split_is_indistinguishable_from_a_resident_one(self) -> None:
+        # Peak collection memory was the sum of the splits, so completed splits
+        # move to disk. A spilled split must stay byte-identical and hash-equal,
+        # or two corpora collected from the same seed under different host memory
+        # pressure would carry different content addresses.
+        corpus = _corpus()
+        split = corpus["data"]["train"]
+        with tempfile.TemporaryDirectory() as temporary:
+            spilled = _spill(split, Path(temporary), "train")
+            self.assertEqual(content_sha256(split), content_sha256(spilled))
+            self.assertTrue(torch.equal(spilled["returns_tn"], split["returns_tn"]))
+            self.assertEqual(
+                spilled["lifecycle_replay"][0]["stratum"],
+                split["lifecycle_replay"][0]["stratum"],
+            )
+            corpus["data"]["train"] = spilled
+            validate_corpus(corpus, verify_hashes=True)
+        self.assertIs(_spill(split, None, "train"), split)
 
     def test_tensor_shard_corruption_is_rejected(self) -> None:
         corpus = _corpus()
@@ -393,6 +469,7 @@ class CorpusArtifactTests(unittest.TestCase):
         post["globals"][0, 1] = 12
         actions = _action()
         actions["dirs"][0, 0, 0] = 5
+        eligible = _eligible()
         rows: list[dict] = []
         seen: dict[str, int] = {}
         retained: dict[str, list[int]] = {}
@@ -400,8 +477,10 @@ class CorpusArtifactTests(unittest.TestCase):
         _append_temporal_replay(
             rows, seen, retained, excluded, np.random.default_rng(1),
             pre, actions, post, torch.zeros(1), [{"curriculum": "empty"}],
-            timestep=5, capacity_per_stratum=1,
+            timestep=5, capacity_per_stratum=1, eligible=eligible, env_labels=[3],
         )
+        self.assertEqual(rows[0]["env_index"], 3)
+        self.assertTrue(bool(rows[0]["eligible"][0, 0, 1]))
         self.assertEqual(len(rows), 1)
         self.assertEqual(float(rows[0]["obs"]["globals"][0, 1]), 11)
         self.assertEqual(int(rows[0]["action"]["dirs"][0, 0, 0]), 5)
@@ -419,7 +498,7 @@ class CorpusArtifactTests(unittest.TestCase):
                 rows, seen, retained, excluded, reservoir_rng,
                 current, marked_action, future, torch.zeros(1),
                 [{"curriculum": "empty"}], timestep=timestep,
-                capacity_per_stratum=1,
+                capacity_per_stratum=1, eligible=eligible, env_labels=[3],
             )
         retained_timestep = rows[0]["timestep"]
         self.assertEqual(
@@ -438,7 +517,7 @@ class CorpusArtifactTests(unittest.TestCase):
             rows, seen, retained, excluded, np.random.default_rng(2),
             post, actions, reset, torch.ones(1),
             [{"curriculum": "empty", "episode_done": True, "truncated": True}],
-            timestep=20, capacity_per_stratum=1,
+            timestep=20, capacity_per_stratum=1, eligible=eligible, env_labels=[3],
         )
         self.assertEqual(len(rows), 1)
         self.assertEqual(excluded["excluded_truncated"], 1)
@@ -504,7 +583,6 @@ class CorpusArtifactTests(unittest.TestCase):
     def test_joint_epoch_uses_one_step_for_lifecycle_and_nextlat(self) -> None:
         from .model import Actor, Critic
         from .pretrain_joint import (
-            DaggerSample,
             _evaluate_nextlat,
             _lifecycle_samples,
             _temporal_samples,
@@ -554,13 +632,6 @@ class CorpusArtifactTests(unittest.TestCase):
         rare_replay[1].action["types"][0, 0, 0] = INTENT_TYPES.index(
             "claimController"
         )
-        dagger_replay = [
-            DaggerSample(
-                kind="correction", stratum=f"dagger:{index}", actor_index=0,
-                obs=sample.obs, action=sample.action,
-            )
-            for index, sample in enumerate(rare_replay)
-        ]
         spawn_action = copy.deepcopy(lifecycle[0].action)
         spawn_action["types"][0, 0, 0] = INTENT_TYPES.index("spawnCreep")
         spawn_action["body_counts"][0, 0, 0, 0] = 1
@@ -570,9 +641,15 @@ class CorpusArtifactTests(unittest.TestCase):
         spawn_obs["actors"][
             0, 0, ACTOR_FEATURE_INDEX["roomEnergyAvailable"]
         ] = 300 / MAX_ROOM_ENERGY
+        spawn_eligible = torch.ones(
+            1, spawn_obs["actors"].shape[1], 6 + 2 * N_BODY_PART, dtype=torch.bool,
+        )
         spawn_replay = [
-            ("spawn:test", 0, spawn_obs, spawn_action),
-            ("waitlegal:test", 0, spawn_obs, lifecycle[0].action),
+            ("spawn:test", 0, spawn_obs, spawn_action, spawn_eligible),
+            (
+                "waitlegal:test", 0, spawn_obs, lifecycle[0].action,
+                spawn_eligible.clone(),
+            ),
         ]
         actor_before = actor.latent_dynamics.dynamics_mlp[-1].weight.detach().clone()
         critic_before = critic.latent_dynamics.dynamics_mlp[-1].weight.detach().clone()
@@ -585,8 +662,6 @@ class CorpusArtifactTests(unittest.TestCase):
             device=torch.device("cpu"), use_bf16=False, minibatch=2,
             shuffle_generator=torch.Generator().manual_seed(11),
             nextlat_shuffle_generator=torch.Generator().manual_seed(12),
-            correction_replay=dagger_replay,
-            correction_shuffle_generator=torch.Generator().manual_seed(13),
             rare_replay=rare_replay,
             rare_refs_by_intent={
                 "createConstructionSite": [(0, 0)],
@@ -604,17 +679,14 @@ class CorpusArtifactTests(unittest.TestCase):
         self.assertEqual(actor_optimizer.step_calls, 3)
         self.assertEqual(critic_optimizer.zero_grad_calls, 3)
         self.assertEqual(critic_optimizer.step_calls, 3)
-        self.assertEqual(metrics["correction_exposures"], 2.0)
         self.assertEqual(metrics["rare_exposures"], 2.0)
         self.assertEqual(metrics["spawn_exposures"], 2.0)
         self.assertEqual(metrics["optimizer_steps"], 3.0)
-        self.assertEqual(metrics["auxiliary_batches"], 3.0)
+        self.assertEqual(metrics["auxiliary_batches"], 2.0)
         self.assertEqual(metrics["auxiliary_minibatch"], 2.0)
         self.assertEqual(
             metrics["auxiliary_batches"],
-            metrics["correction_batches"]
-            + metrics["rare_batches"]
-            + metrics["spawn_batches"],
+            metrics["rare_batches"] + metrics["spawn_batches"],
         )
         self.assertFalse(torch.equal(
             actor_before, actor.latent_dynamics.dynamics_mlp[-1].weight,
@@ -661,7 +733,7 @@ class CorpusArtifactTests(unittest.TestCase):
         self.assertEqual(metadata["nextlat_pretrain"]["actorCoef"], 1.0)
         self.assertEqual(
             metadata["nextlat_pretrain"]["optimizerAuthority"],
-            "lifecycle_primary_fused_bc_value_nextlat_correction_rare_spawn_v3",
+            "lifecycle_primary_fused_bc_value_nextlat_rare_spawn_tile_v5",
         )
         self.assertEqual(
             metadata["nextlat_pretrain"]["actionAblation"],
@@ -708,88 +780,28 @@ class CorpusArtifactTests(unittest.TestCase):
         one_gpu = dict(bf16, visible_cuda_device_count=1)
         self.assertNotEqual(bf16, one_gpu)
 
-    def test_actor_supplement_identity_is_exact_resume_contract(self) -> None:
-        from .pretrain_joint import (
-            _actor_supplement_identity, _continuation_mismatches,
-        )
-
-        args = SimpleNamespace(
-            actor_supplement_kind="scripted_teacher_supplement",
-            actor_supplement_sha256="a" * 64,
-            actor_supplement_schema_version=1,
-            actor_supplement_schema_sha256="b" * 64,
-            actor_supplement_source_sha256="c" * 64,
-            actor_supplement_collector_sha256="d" * 64,
-            actor_supplement_collection_seeds=[20_003, 20_004],
-        )
-        expected = _actor_supplement_identity(args)
-        self.assertEqual(expected["actor_supplement_kind"], args.actor_supplement_kind)
-        self.assertEqual(expected["actor_supplement_collection_seeds"], [20_003, 20_004])
-        for key in expected:
-            stale = copy.deepcopy(expected)
-            stale[key] = None
-            self.assertIn(key, _continuation_mismatches(stale, expected), key)
-
-    def test_actor_supplement_routes_all_row_kinds_with_source_identity(self) -> None:
-        from .pretrain_joint import _route_correction_rows
-
-        lifecycle_row = copy.deepcopy(
-            _corpus()["data"]["train"]["lifecycle_replay"][0]
-        )
-        rows = []
-        for kind in ("exact_intent", "spawn_positive", "spawn_wait_legal"):
-            rows.append({
-                "kind": kind,
-                "stratum": f"outpost:{kind}",
-                "timestep": lifecycle_row["timestep"],
-                "env_index": lifecycle_row["env_index"],
-                "actor_index": 0,
-                "obs": lifecycle_row["obs"],
-                "action": lifecycle_row["action"],
-            })
-        tagged, exact, spawn = _route_correction_rows(
-            rows, source="actor_supplement",
-        )
-        self.assertEqual(len(tagged), 3)
-        self.assertEqual(len(exact), 1)
-        self.assertEqual(len(spawn), 2)
-        self.assertTrue(all(
-            sample.stratum.startswith("actor_supplement:") for sample in tagged
-        ))
-        self.assertEqual(
-            {row[0].split(":", 1)[0] for row in spawn},
-            {"spawn", "waitlegal"},
-        )
-        bad = copy.deepcopy(rows[:1])
-        bad[0]["kind"] = "unknown"
-        with self.assertRaisesRegex(ValueError, "unsupported actor_supplement"):
-            _route_correction_rows(bad, source="actor_supplement")
-
-    def test_actor_supplement_seeds_are_independent_of_every_authority(self) -> None:
-        from .pretrain_joint import _correction_seed_conflicts
+    def test_evaluation_seeds_are_disjoint_from_collected_worlds(self) -> None:
+        from .pretrain_joint import _evaluation_seed_overlap
 
         meta = {
             "seed": 3,
             "train_env_map": [{"seed": 3}, {"seed": 4}],
             "holdout_env_map": [{"seed": 10_003}],
         }
-        conflicts = _correction_seed_conflicts(
-            meta,
-            dagger_seeds={30_000, 30_001},
-            supplement_seeds={4, 23, 30_001},
-            evaluation_offset=20,
-            num_envs=2,
+        self.assertEqual(
+            _evaluation_seed_overlap(meta, offset=1, num_envs=2), {4},
         )
-        self.assertEqual(conflicts["dagger_base"], set())
-        self.assertEqual(conflicts["supplement_base"], {4})
-        self.assertEqual(conflicts["dagger_supplement"], {30_001})
-        self.assertEqual(conflicts["evaluation"], {23})
+        self.assertEqual(
+            _evaluation_seed_overlap(meta, offset=10_000, num_envs=1), {10_003},
+        )
+        self.assertEqual(
+            _evaluation_seed_overlap(meta, offset=20_000, num_envs=2), set(),
+        )
 
     def test_joint_epoch_resume_matches_uninterrupted_training(self) -> None:
         from .model import Actor, Critic
         from .pretrain_joint import (
-            DaggerSample, _lifecycle_samples, _temporal_samples,
-            _train_joint_lifecycle_epoch,
+            _lifecycle_samples, _temporal_samples, _train_joint_lifecycle_epoch,
         )
 
         cfg = dict(MODEL_CFG)
@@ -813,13 +825,6 @@ class CorpusArtifactTests(unittest.TestCase):
         rare_replay[1].action["types"][0, 0, 0] = INTENT_TYPES.index(
             "claimController"
         )
-        dagger_replay = [
-            DaggerSample(
-                kind="exact_intent", stratum=f"dagger:{index}", actor_index=0,
-                obs=sample.obs, action=sample.action,
-            )
-            for index, sample in enumerate(rare_replay)
-        ]
         spawn_obs = copy.deepcopy(lifecycle[0].obs)
         spawn_obs["actors"][0, 0, ACTOR_FEATURE_INDEX["isNonCreep"]] = 1
         spawn_obs["actors"][0, 0, ACTOR_FEATURE_INDEX["isSpawn"]] = 1
@@ -829,9 +834,15 @@ class CorpusArtifactTests(unittest.TestCase):
         spawn_action = copy.deepcopy(lifecycle[0].action)
         spawn_action["types"][0, 0, 0] = INTENT_TYPES.index("spawnCreep")
         spawn_action["body_counts"][0, 0, 0, 0] = 1
+        spawn_eligible = torch.ones(
+            1, spawn_obs["actors"].shape[1], 6 + 2 * N_BODY_PART, dtype=torch.bool,
+        )
         spawn_replay = [
-            ("spawn:test", 0, spawn_obs, spawn_action),
-            ("waitlegal:test", 0, spawn_obs, lifecycle[0].action),
+            ("spawn:test", 0, spawn_obs, spawn_action, spawn_eligible),
+            (
+                "waitlegal:test", 0, spawn_obs, lifecycle[0].action,
+                spawn_eligible.clone(),
+            ),
         ]
 
         def initialized():
@@ -845,21 +856,18 @@ class CorpusArtifactTests(unittest.TestCase):
                 torch.Generator().manual_seed(13),
                 torch.Generator().manual_seed(14),
                 torch.Generator().manual_seed(15),
-                torch.Generator().manual_seed(16),
             )
 
         def train_epoch(parts):
             (
                 actor, critic, actor_opt, critic_opt, lifecycle_rng, temporal_rng,
-                dagger_rng, rare_rng, spawn_rng,
+                rare_rng, spawn_rng,
             ) = parts
             return _train_joint_lifecycle_epoch(
                 actor, critic, actor_opt, critic_opt, lifecycle, returns, temporal,
                 device=torch.device("cpu"), use_bf16=False, minibatch=2,
                 shuffle_generator=lifecycle_rng,
                 nextlat_shuffle_generator=temporal_rng,
-                correction_replay=dagger_replay,
-                correction_shuffle_generator=dagger_rng,
                 rare_replay=rare_replay,
                 rare_refs_by_intent={
                     "createConstructionSite": [(0, 0)],
@@ -887,9 +895,8 @@ class CorpusArtifactTests(unittest.TestCase):
             "critic_opt": copy.deepcopy(split[3].state_dict()),
             "lifecycle_rng": split[4].get_state().clone(),
             "temporal_rng": split[5].get_state().clone(),
-            "dagger_rng": split[6].get_state().clone(),
-            "rare_rng": split[7].get_state().clone(),
-            "spawn_rng": split[8].get_state().clone(),
+            "rare_rng": split[6].get_state().clone(),
+            "spawn_rng": split[7].get_state().clone(),
             "global_epoch": 1,
             "global_step": split_step,
         }
@@ -900,9 +907,8 @@ class CorpusArtifactTests(unittest.TestCase):
         resumed[3].load_state_dict(saved["critic_opt"])
         resumed[4].set_state(saved["lifecycle_rng"])
         resumed[5].set_state(saved["temporal_rng"])
-        resumed[6].set_state(saved["dagger_rng"])
-        resumed[7].set_state(saved["rare_rng"])
-        resumed[8].set_state(saved["spawn_rng"])
+        resumed[6].set_state(saved["rare_rng"])
+        resumed[7].set_state(saved["spawn_rng"])
         resumed_result = train_epoch(resumed)
         resumed_step = saved["global_step"] + resumed_result[3]
         resumed_epoch = saved["global_epoch"] + 1
@@ -931,13 +937,11 @@ class CorpusArtifactTests(unittest.TestCase):
         self.assertTrue(torch.equal(uninterrupted[5].get_state(), resumed[5].get_state()))
         self.assertTrue(torch.equal(uninterrupted[6].get_state(), resumed[6].get_state()))
         self.assertTrue(torch.equal(uninterrupted[7].get_state(), resumed[7].get_state()))
-        self.assertTrue(torch.equal(uninterrupted[8].get_state(), resumed[8].get_state()))
         self.assertEqual(uninterrupted_step, resumed_step)
         self.assertEqual(resumed_epoch, 2)
         self.assertIsNotNone(uninterrupted_result)
         for key in (
-            "correction_exposures", "rare_exposures", "spawn_exposures",
-            "optimizer_steps",
+            "rare_exposures", "spawn_exposures", "optimizer_steps",
         ):
             self.assertEqual(
                 uninterrupted_result[4][key], resumed_result[4][key], key,
@@ -961,9 +965,8 @@ class CorpusArtifactTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "step count"):
             _evenly_distribute_batches([[0]], 0)
         lanes = {
-            "dagger": [["d", index] for index in range(3)],
-            "rare": [["r", index] for index in range(2)],
-            "spawn": [["s", index] for index in range(4)],
+            "rare": [["r", index] for index in range(3)],
+            "spawn": [["s", index] for index in range(6)],
         }
         lane_schedule = _schedule_auxiliary_lanes(lanes, 12)
         for name, source in lanes.items():
@@ -985,56 +988,47 @@ class CorpusArtifactTests(unittest.TestCase):
 
         geometry = {
             "nextlat_train_optimizer_steps": 475.0,
-            "nextlat_train_correction_batches": 76.0,
             "nextlat_train_rare_batches": 6.0,
             "nextlat_train_spawn_batches": 180.0,
-            "nextlat_train_auxiliary_batches": 262.0,
+            "nextlat_train_auxiliary_batches": 186.0,
             "nextlat_train_auxiliary_minibatch": 32.0,
-            "nextlat_train_correction_exposures": 2_432.0,
             "nextlat_train_rare_exposures": 166.0,
             "nextlat_train_spawn_exposures": 5_760.0,
         }
-        self.assertTrue(_auxiliary_schedule_qualified(geometry, required=True))
+        self.assertTrue(_auxiliary_schedule_qualified(geometry))
         over_capacity = dict(
             geometry,
-            nextlat_train_optimizer_steps=261.0,
+            nextlat_train_optimizer_steps=185.0,
         )
-        self.assertFalse(_auxiliary_schedule_qualified(
-            over_capacity, required=True,
-        ))
+        self.assertFalse(_auxiliary_schedule_qualified(over_capacity))
         wrong_total = dict(
             geometry,
-            nextlat_train_auxiliary_batches=261.0,
+            nextlat_train_auxiliary_batches=185.0,
         )
-        self.assertFalse(_auxiliary_schedule_qualified(
-            wrong_total, required=True,
-        ))
-        self.assertFalse(_auxiliary_schedule_qualified({}, required=True))
+        self.assertFalse(_auxiliary_schedule_qualified(wrong_total))
+        # A run that never persisted fused geometry cannot be qualified.
+        self.assertFalse(_auxiliary_schedule_qualified({}))
 
     def test_production_preflight_rejects_oversize_before_training_init(self) -> None:
         import inspect
 
         from . import pretrain_joint
-        from .pretrain_joint import DaggerSample, _preflight_joint_geometry
+        from .pretrain_joint import _preflight_joint_geometry
 
         corpus = _corpus()
         lifecycle = pretrain_joint._lifecycle_samples(
             corpus["data"]["train"]["lifecycle_replay"],
         )
-        correction = [
-            DaggerSample(
-                kind="exact_intent", stratum=f"supplement:{index}",
-                actor_index=0, obs=lifecycle[0].obs, action=lifecycle[0].action,
-            )
-            for index in range(2)
-        ]
+        # One rare-intent epoch alone must not be allowed to exceed the
+        # collision-free capacity that lifecycle steps provide.
+        capacity = len(pretrain_joint._balanced_lifecycle_indices(lifecycle))
         with self.assertRaisesRegex(
             ValueError, "exceeds collision-free lifecycle capacity",
         ):
             _preflight_joint_geometry(
-                lifecycle, correction,
+                lifecycle,
                 {
-                    "createConstructionSite": [(0, 0)],
+                    "createConstructionSite": [(0, 0)] * (capacity + 1),
                     "claimController": [(1, 0)],
                 },
                 [], minibatch=1,
@@ -1047,17 +1041,6 @@ class CorpusArtifactTests(unittest.TestCase):
             preflight_position,
             main_source.index("_should_run_ti_initialization("),
         )
-
-    def test_dagger_build_supervises_type_not_arbitrary_site_identity(self) -> None:
-        from .pretrain_joint import _dagger_factor_mask
-
-        active = torch.ones(3, 14, dtype=torch.bool)
-        selected = _dagger_factor_mask("build", active)
-        self.assertTrue(selected[:, 0].all())
-        self.assertFalse(selected[:, 1:].any())
-        self.assertTrue(torch.equal(
-            _dagger_factor_mask("harvest", active), active,
-        ))
 
     def test_joint_epoch_critic_failure_is_transactional(self) -> None:
         from .model import Actor, Critic
@@ -1235,28 +1218,50 @@ class CorpusArtifactTests(unittest.TestCase):
             min_rows=32, max_nll=1.0, min_accuracy=0.8,
         ))
 
-    def test_correction_sources_qualify_independently(self) -> None:
-        from .pretrain_joint import _correction_source_qualified
+    def test_liveness_gate_accepts_a_healthy_opening_silence(self) -> None:
+        from .pretrain_corpus import TiLivenessGate
 
-        metrics = {
-            "_actor_supplement_actor_rows": 96.0,
-            "_actor_supplement_actor_nll": 0.2,
-            "_actor_supplement_actor_legal_frac": 1.0,
-            "_actor_supplement_accuracy": 0.9,
-            "_actor_supplement_min_intent_accuracy": 0.85,
-        }
-        self.assertTrue(_correction_source_qualified(
-            metrics, prefix="actor_supplement",
-            artifact_sha256="a" * 64, min_accuracy=0.8,
-        ))
-        self.assertTrue(_correction_source_qualified(
-            {}, prefix="dagger", artifact_sha256=None, min_accuracy=0.8,
-        ))
-        metrics["_actor_supplement_min_intent_accuracy"] = 0.79
-        self.assertFalse(_correction_source_qualified(
-            metrics, prefix="actor_supplement",
-            artifact_sha256="a" * 64, min_accuracy=0.8,
-        ))
+        gate = TiLivenessGate()
+        # The measured healthy episode is silent for its first 12 ticks while the
+        # opening creep spawns, then acts on all but isolated single ticks.
+        for timestep in range(3000):
+            gate.observe(timestep, acted=timestep >= 12 and timestep % 250 != 0)
+        metrics = gate.finish()
+        self.assertGreater(metrics["active_fraction"], 0.99)
+        self.assertEqual(metrics["worst_silent_run"], 12.0)
+        self.assertEqual(metrics["graded_ticks"], 2950.0)
+
+    def test_liveness_gate_rejects_a_stalled_teacher_mid_episode(self) -> None:
+        from .pretrain_corpus import TiLivenessGate, TiTeacherStalled
+
+        gate = TiLivenessGate()
+        for timestep in range(400):
+            gate.observe(timestep, acted=True)
+        with self.assertRaises(TiTeacherStalled) as caught:
+            for timestep in range(400, 500):
+                gate.observe(timestep, acted=False)
+        self.assertEqual(caught.exception.metrics["worst_silent_run"], 31.0)
+        self.assertEqual(int(caught.exception.metrics["acting_ticks"]), 350)
+
+    def test_liveness_gate_rejects_a_teacher_that_never_acts(self) -> None:
+        from .pretrain_corpus import TiLivenessGate, TiTeacherStalled
+
+        gate = TiLivenessGate(max_silence=10**9)
+        # A stalled run still emits a few intents, which is why the silence rule
+        # alone is not sufficient: 3 acting ticks in 120 was a measured stall.
+        for timestep in range(120):
+            gate.observe(timestep, acted=timestep % 40 == 0)
+        with self.assertRaises(TiTeacherStalled) as caught:
+            gate.finish()
+        self.assertLess(caught.exception.metrics["active_fraction"], 0.1)
+
+    def test_liveness_gate_ignores_silence_inside_the_warmup(self) -> None:
+        from .pretrain_corpus import TiLivenessGate
+
+        gate = TiLivenessGate(warmup=50)
+        for timestep in range(50):
+            gate.observe(timestep, acted=False)
+        self.assertEqual(gate.finish()["graded_ticks"], 0.0)
 
 
 if __name__ == "__main__":

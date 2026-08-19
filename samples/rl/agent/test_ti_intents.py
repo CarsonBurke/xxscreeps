@@ -15,7 +15,7 @@ class TiIntentTranslationTests(unittest.TestCase):
         ]
         self.targets = [{"id": "source", "kind": "source", "room": "W7N3"}]
 
-    def test_spawn_body_is_exact_factor_only(self) -> None:
+    def test_spawn_type_is_exact_with_exact_body_counts(self) -> None:
         labels = translate_ti_intents({"W7N3": {"local": {}, "object": {
             "spawn": {"spawn": [["work", "carry", "move"], "name", ["spawn"], [1]]},
         }}}, self.actors, self.targets, ["W7N3"])
@@ -24,7 +24,24 @@ class TiIntentTranslationTests(unittest.TestCase):
             labels[0].body_parts,
             tuple(BODY_PART_TYPES.index(part) for part in ("work", "carry", "move")),
         )
-        self.assertFalse(labels[0].full_action)
+        # Name, spawn direction and the energy-structure order to drain are not
+        # action factors of this ABI, so they do not make the type inexact.
+        self.assertTrue(labels[0].full_action)
+
+    def test_interleaved_spawn_body_keeps_counts_and_drops_order(self) -> None:
+        from .pretrain_joint import _parts_to_count_order
+
+        label = translate_ti_intents({"W7N3": {"local": {}, "object": {
+            "spawn": {"spawn": [["work", "carry", "work"], "name", ["spawn"], [1]]},
+        }}}, self.actors, self.targets, ["W7N3"])[0]
+        self.assertTrue(label.full_action)
+        work, carry = BODY_PART_TYPES.index("work"), BODY_PART_TYPES.index("carry")
+        self.assertEqual(label.body_parts, (work, carry, work))
+        counts, order, order_exact = _parts_to_count_order(label.body_parts)
+        self.assertEqual(int(counts[work]), 2)
+        self.assertEqual(int(counts[carry]), 1)
+        self.assertEqual(order[:2].tolist(), [work, carry])
+        self.assertFalse(order_exact)
 
     def test_direct_move_and_target_are_full_labels(self) -> None:
         move = translate_ti_intents({"W7N3": {"local": {}, "object": {

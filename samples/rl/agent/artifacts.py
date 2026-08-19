@@ -16,8 +16,7 @@ from .constants import SCHEMA, SCHEMA_SHA256
 SOURCE_SIGNATURE_AGENT_NAMES = (
     "actions_util.py", "artifacts.py", "constants.py", "env_client.py",
     "gae.py", "hl_gauss.py", "model.py", "ppo.py", "pretrain_joint.py",
-    "muon.py", "pretrain_ti.py", "dagger_corpus.py",
-    "outpost_actor_corpus.py", "rollout_buffer.py", "running_stats.py",
+    "muon.py", "pretrain_ti.py", "rollout_buffer.py", "running_stats.py",
     "ti_intents.py", "train.py", "vec_env.py",
 )
 

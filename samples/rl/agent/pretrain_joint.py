@@ -16,8 +16,8 @@ The scripted planner supplies complete actor labels. TI contributes exact
 representable actor factors plus independent train/holdout critic splits.
 Rare `createConstructionSite` and `claimController` actors are reindexed from
 the same lifecycle rows into an intent-balanced actor-only auxiliary lane. It
-imitates intent+structure type for construction and intent+target for claims;
-construction tile preference remains the learner's downstream objective.
+imitates intent+structure type+tile for construction and intent+target for
+claims, so a construction demonstration is cloned as a structure at a position.
 
   python3 -m samples.rl.agent.pretrain_joint \\
     --corpus samples/rl/runs/pretrain-corpora/<corpus-sha256> \\
@@ -35,7 +35,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -58,24 +58,20 @@ try:
         validate_artifact,
     )
     from samples.rl.agent.actions_util import safe_bc_nll
-    from samples.rl.agent.env_client import ScreepsEnv
     from samples.rl.agent.constants import (
         ACTOR_FEATURE_INDEX, BODY_PART_COSTS, INTENT_TYPES, MAX_ACTORS,
         MAX_BODY_PARTS, MAX_ROOM_ENERGY, N_BODY_PART,
         PPO_CFG, SCHEMA, VALUE_CFG,
     )
-    from samples.rl.agent.gae import discounted_returns_tn
     from samples.rl.agent.model import Actor, Critic, count_params
     from samples.rl.agent.muon import (
         MUON_MOMENTUM_MAX, MUON_MOMENTUM_MIN, MUON_MOMENTUM_WARMUP_STEPS,
         MUON_WEIGHT_DECAY, OPTIMIZER_KIND, PRETRAIN_MUON_LR,
         HybridMuonAdamW, optimizer_parameter_counts,
     )
-    from samples.rl.agent.rollout_buffer import HostRolloutBuffer
     from samples.rl.agent.ti_intents import translate_ti_intents
     from samples.rl.agent.vec_env import (
-        VecScreepsEnv, _clone_host_obs, _compact_entity_prefixes,
-        promote_obs_device,
+        VecScreepsEnv, _compact_entity_prefixes, promote_obs_device,
     )
 except ImportError:
     from agent.artifacts import (
@@ -83,24 +79,20 @@ except ImportError:
         load_full_state, source_signature, validate_artifact,
     )
     from agent.actions_util import safe_bc_nll
-    from agent.env_client import ScreepsEnv
     from agent.constants import (
         ACTOR_FEATURE_INDEX, BODY_PART_COSTS, INTENT_TYPES, MAX_ACTORS,
         MAX_BODY_PARTS, MAX_ROOM_ENERGY, N_BODY_PART,
         PPO_CFG, SCHEMA, VALUE_CFG,
     )
-    from agent.gae import discounted_returns_tn
     from agent.model import Actor, Critic, count_params
     from agent.muon import (
         MUON_MOMENTUM_MAX, MUON_MOMENTUM_MIN, MUON_MOMENTUM_WARMUP_STEPS,
         MUON_WEIGHT_DECAY, OPTIMIZER_KIND, PRETRAIN_MUON_LR,
         HybridMuonAdamW, optimizer_parameter_counts,
     )
-    from agent.rollout_buffer import HostRolloutBuffer
     from agent.ti_intents import translate_ti_intents
     from agent.vec_env import (
-        VecScreepsEnv, _clone_host_obs, _compact_entity_prefixes,
-        promote_obs_device,
+        VecScreepsEnv, _compact_entity_prefixes, promote_obs_device,
     )
 
 
@@ -113,22 +105,60 @@ SPAWN_CURRICULA = (
     "spawn_claimer_650",
 )
 SPAWN_REPLAY_PER_STRATUM = 16
-SCRIPTED_REPLAY_PER_STRATUM = 64
+# Spawn supervision is audited in buckets of the two quantities a body decision
+# is made against: the energy the room can spend right now, and the part count
+# that energy buys.  Every bucket count in this file is measured from the
+# teacher's own decisions; none of them encodes an expected body.
+SPAWN_BUDGET_BUCKETS = ("le300", "301_549", "550_649", "ge650")
+SPAWN_LENGTH_BUCKETS = ("le6", "7_15", "ge16")
+# Body length the simulated economy cannot fund.  The engine charges at least
+# 50 energy per part, so a 16-part body needs 800+ energy in a single spawn,
+# which is an RCL3 spawn plus ten extensions plus a full refill; the curricula
+# this pipeline trains on settle around RCL1-RCL2, and The International spends
+# its budget on expensive work parts rather than on part count.  The bucket is
+# therefore recorded as a named, non-fatal coverage gap
+# (`*_length_unreached_<bucket>`) instead of being deleted, so a higher-RCL
+# curriculum that starts filling it can promote it back to a fatal requirement.
+SPAWN_LENGTH_UNREACHED_BUCKETS = ("ge16",)
+SPAWN_LENGTH_REQUIRED_BUCKETS = tuple(
+    bucket for bucket in SPAWN_LENGTH_BUCKETS
+    if bucket not in SPAWN_LENGTH_UNREACHED_BUCKETS
+)
+TEACHER_REPLAY_PER_STRATUM = 64
 _SPAWN_ENERGY_FEATURE = ACTOR_FEATURE_INDEX["roomEnergyAvailable"]
 RARE_ACTOR_INTENTS = ("createConstructionSite", "claimController")
+# Factors the rare lane imitates and therefore requires a teacher to have
+# labelled: the intent plus its structure type, or the intent plus its exact
+# controller pointer.  A factor-masked row naming the intent without them
+# carries no rare demonstration at all.
+RARE_INTENT_REQUIRED_FACTORS = {
+    "createConstructionSite": (0, 4),
+    "claimController": (0, 2),
+}
 MAX_CLOSED_LOOP_INVALID_FRAC = 0.01
 OUTPOST_LATE_WINDOW_STEPS = 1_000
 
 
+SpawnReplayRow = tuple[
+    str, int, dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor,
+]
+
+
 @dataclass
 class LifecycleSample:
-    """One compact complete teacher row retained across the full economy lifecycle."""
+    """One compact teacher row plus the factors its labels actually supervise.
+
+    The teacher is The International, which is exactly representable only for a
+    subset of factors per tick, so every row carries its own eligibility mask of
+    shape ``[1, actors, 6 + 2 * N_BODY_PART]`` in ``factor_logprob`` order.
+    """
 
     stratum: str
     timestep: int
     env_index: int
     obs: dict[str, torch.Tensor]
     action: dict[str, torch.Tensor]
+    eligible: torch.Tensor
 
 
 @dataclass
@@ -139,17 +169,6 @@ class CriticSample:
     timestep: int
     env_index: int
     obs: dict[str, torch.Tensor]
-
-
-@dataclass
-class DaggerSample:
-    """One exact actor label on a state visited by an earlier learned policy."""
-
-    kind: str
-    stratum: str
-    actor_index: int
-    obs: dict[str, torch.Tensor]
-    action: dict[str, torch.Tensor]
 
 
 @dataclass
@@ -167,7 +186,7 @@ class TemporalSample:
 
 TI_ACTOR_TRAINING = "one_time_initialization_before_joint_epochs"
 JOINT_OBJECTIVE_AUTHORITY = (
-    "lifecycle_primary_fused_bc_value_nextlat_correction_rare_spawn_v3"
+    "lifecycle_primary_fused_bc_value_nextlat_rare_spawn_tile_v5"
 )
 ACTOR_AUXILIARY_SCHEDULE = (
     "one_balanced_source_epoch_joint_collision_free_quantiles_v2"
@@ -200,6 +219,7 @@ def _lifecycle_samples(rows: list[dict]) -> list[LifecycleSample]:
             env_index=int(row["env_index"]),
             obs=row["obs"],
             action=row["action"],
+            eligible=row["eligible"],
         )
         for row in rows
     ]
@@ -215,62 +235,6 @@ def _critic_samples(rows: list[dict]) -> list[CriticSample]:
         )
         for row in rows
     ]
-
-
-def _dagger_samples(rows: list[dict]) -> list[DaggerSample]:
-    return [
-        DaggerSample(
-            kind=str(row["kind"]),
-            stratum=str(row["stratum"]),
-            actor_index=int(row["actor_index"]),
-            obs=row["obs"],
-            action=row["action"],
-        )
-        for row in rows
-    ]
-
-
-def _route_correction_rows(
-    rows: list[dict], *, source: str,
-) -> tuple[
-    list[DaggerSample],
-    list[DaggerSample],
-    list[tuple[str, int, dict[str, torch.Tensor], dict[str, torch.Tensor]]],
-]:
-    """Tag one correction authority and route its three supported row kinds."""
-    samples = _dagger_samples(rows)
-    tagged = [
-        DaggerSample(
-            kind=sample.kind,
-            stratum=f"{source}:{sample.stratum}",
-            actor_index=sample.actor_index,
-            obs=sample.obs,
-            action=sample.action,
-        )
-        for sample in samples
-    ]
-    exact: list[DaggerSample] = []
-    spawn: list[
-        tuple[str, int, dict[str, torch.Tensor], dict[str, torch.Tensor]]
-    ] = []
-    for sample in tagged:
-        if sample.kind == "exact_intent":
-            exact.append(sample)
-        elif sample.kind == "spawn_positive":
-            spawn.append((
-                f"spawn:{sample.stratum}", sample.actor_index,
-                sample.obs, sample.action,
-            ))
-        elif sample.kind == "spawn_wait_legal":
-            spawn.append((
-                f"waitlegal:{sample.stratum}", sample.actor_index,
-                sample.obs, sample.action,
-            ))
-        else:
-            raise ValueError(
-                f"unsupported {source} correction row kind {sample.kind!r}"
-            )
-    return tagged, exact, spawn
 
 
 def _temporal_samples(rows: list[dict]) -> list[TemporalSample]:
@@ -297,20 +261,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--corpus", type=Path, required=True,
         help="validated immutable corpus artifact; training never recollects it",
-    )
-    p.add_argument(
-        "--dagger-corpus", type=Path, default=None,
-        help=(
-            "optional immutable correction corpus containing scripted labels "
-            "on states visited by a prior learned policy"
-        ),
-    )
-    p.add_argument(
-        "--actor-supplement", type=Path, default=None,
-        help=(
-            "optional immutable outpost actor supplement; remains a distinct "
-            "provenance authority from DAgger"
-        ),
     )
     p.add_argument(
         "--global-epochs", type=int, default=16,
@@ -386,7 +336,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--critic-init", type=Path, default=None,
         help="initialize the raw-H+C critic from a qualified TI critic artifact",
     )
-    p.add_argument("--validation-steps", type=int, default=256)
     p.add_argument("--closed-loop-steps", type=int, default=20000)
     p.add_argument(
         "--evaluation-seed-offset", type=int, default=20_000,
@@ -394,19 +343,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--min-closed-loop-rate", type=float, default=0.1)
     p.add_argument("--min-validation-ev", type=float, default=0.01)
-    p.add_argument("--max-spawn-validation-nll", type=float, default=1.5)
     p.add_argument(
         "--min-spawn-replay-accuracy", type=float, default=0.8,
         help=(
             "minimum final positive intent, exact body, and per-body-stratum "
             "accuracy on the balanced spawn replay"
-        ),
-    )
-    p.add_argument(
-        "--min-dagger-accuracy", type=float, default=0.8,
-        help=(
-            "minimum final semantic exact accuracy overall and per represented "
-            "intent for each optional correction source"
         ),
     )
     p.add_argument(
@@ -455,443 +396,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _train_chunk(
-    actor: nn.Module,
-    critic: nn.Module,
-    actor_c: nn.Module,
-    critic_c: nn.Module,
-    opt_a: torch.optim.Optimizer,
-    opt_c: torch.optim.Optimizer,
-    buf_obs: list[dict[str, torch.Tensor]] | HostRolloutBuffer,
-    buf_act: list[dict[str, torch.Tensor]],
-    rewards_tn: torch.Tensor,
-    dones_tn: torch.Tensor,
-    *,
-    next_obs: dict[str, torch.Tensor] | None,
-    term_obs_rows: list[list[dict[str, torch.Tensor] | None]],
-    bc_valid_tn: torch.Tensor | None = None,
-    gamma: float,
-    epochs: int,
-    mb: int,
-    value_coef: float,
-    device: torch.device,
-    use_bf16: bool,
-    writer,
-    global_step: int,
-) -> tuple[float, float, float, int, dict[str, float]]:
-    """Joint CE + discounted reward-to-go value fit on one chunk.
-
-    `bc_valid_tn` optional [T, N] float/bool — 0 drops that transition from BC only
-    (e.g. env crash recovery with empty action labels). Critic still sees r/done.
-    """
-    T, N = rewards_tn.shape
-    if isinstance(buf_obs, HostRolloutBuffer):
-        lazy_obs = buf_obs.as_flat_obs()
-        obs_flat = lazy_obs
-        act_tn = {
-            key: buf_obs.tn(key)
-            for key in (
-                "types", "dirs", "targets", "amounts",
-                "body_counts", "body_order", "construction_types", "construction_tiles",
-            )
-        }
-    else:
-        keys = [k for k in buf_obs[0].keys() if not k.startswith("_")]
-        obs_tn = {k: torch.stack([buf_obs[t][k] for t in range(T)], dim=0) for k in keys}
-        obs_flat = {k: v.reshape(T * N, *v.shape[2:]) for k, v in obs_tn.items()}
-        lazy_obs = None
-        act_tn = {
-            k: torch.stack([buf_act[t][k] for t in range(T)], dim=0)
-            for k in (
-                "types", "dirs", "targets", "amounts",
-                "body_counts", "body_order", "construction_types", "construction_tiles",
-            )
-        }
-    if bc_valid_tn is None:
-        bc_valid_flat = torch.ones(T * N, dtype=torch.bool)
-    else:
-        bc_valid_flat = bc_valid_tn.reshape(T * N).cpu() > 0.5
-
-    try:
-        from samples.rl.agent.env_client import stack_batches
-    except ImportError:
-        from agent.env_client import stack_batches
-
-    with torch.no_grad():
-        if next_obs is not None:
-            raw = {
-                k: v for k, v in next_obs.items()
-                if not str(k).startswith("_") and torch.is_tensor(v)
-            }
-            boot_in = promote_obs_device(raw, device, non_blocking=False)
-        else:
-            if lazy_obs is not None:
-                raw_last = lazy_obs.gather_minibatch(
-                    torch.arange((T - 1) * N, T * N),
-                )
-            else:
-                raw_last = {k: v[-1] for k, v in obs_tn.items()}
-            boot_in = promote_obs_device(raw_last, device, non_blocking=False)
-        boot = critic_c(boot_in).float().cpu()
-
-        next_values_tn = torch.zeros(T, N)
-        next_values_tn[-1] = boot
-        term_batches: list[dict[str, torch.Tensor]] = []
-        term_slots: list[tuple[int, int]] = []
-        for t_i, row in enumerate(term_obs_rows):
-            for i, term in enumerate(row):
-                if term is None:
-                    continue
-                batch = {
-                    k: (v if v.dim() > 0 and v.shape[0] == 1 else v.unsqueeze(0))
-                    for k, v in term.items()
-                    if torch.is_tensor(v)
-                }
-                term_batches.append(batch)
-                term_slots.append((t_i, i))
-        if term_batches:
-            stacked = promote_obs_device(stack_batches(term_batches), device, non_blocking=False)
-            vals = critic_c(stacked).float().cpu()
-            for j, (t_i, i) in enumerate(term_slots):
-                next_values_tn[t_i, i] = vals[j]
-
-    # Time-limit env: every done is a truncation today.
-    trunc = dones_tn.clone()
-    returns = discounted_returns_tn(
-        rewards_tn,
-        dones_tn,
-        gamma=gamma,
-        next_value=boot,
-        truncations=trunc,
-        next_values_tn=next_values_tn,
-    )
-
-    # Keep the corpus typed on host. Promote only the active minibatch; promoting
-    # a documented 512×4 patch chunk at once consumed multiple GiB of device RAM.
-    act_flat = {k: v.reshape(T * N, *v.shape[2:]) for k, v in act_tn.items()}
-    ret_flat = returns.reshape(T * N)
-    target_diag = critic.support.target_diagnostics(ret_flat)
-    critic.support.validate_targets(ret_flat)
-    B = T * N
-    idx = torch.arange(B)
-
-    nlls: list[float] = []
-    vlosses: list[float] = []
-    legal_fracs: list[float] = []
-    factor_nll_sum = torch.zeros(
-        6 + 2 * N_BODY_PART, dtype=torch.float64, device=device,
-    )
-    factor_count = torch.zeros(
-        6 + 2 * N_BODY_PART, dtype=torch.float64, device=device,
-    )
-    with torch.no_grad():
-        # Count live-actor primary slot types only (ignore padded none mass).
-        am = (
-            obs_flat.dense.get("actor_mask")
-            if lazy_obs is not None else obs_flat.get("actor_mask")
-        )
-        types = act_flat["types"]  # [B, A, S]
-        if am is not None and types.dim() == 3:
-            live = am > 0.5  # [B, A]
-            chosen = types[..., 0][live].long()
-        else:
-            chosen = types.reshape(-1).long()
-        chosen = chosen[(chosen >= 0) & (chosen < len(INTENT_TYPES))]
-        type_hist = torch.bincount(chosen, minlength=len(INTENT_TYPES)).cpu()
-
-    actor.train()
-    critic.train()
-    for _ in range(epochs):
-        perm = idx[torch.randperm(B)]
-        for start in range(0, B, mb):
-            inds = perm[start : start + mb]
-            if inds.numel() == 0:
-                continue
-            host_batch = (
-                lazy_obs.gather_minibatch(inds)
-                if lazy_obs is not None
-                else {k: v[inds] for k, v in obs_flat.items()}
-            )
-            batch_obs = promote_obs_device(host_batch, device, non_blocking=False)
-            batch_act = {k: v[inds].to(device) for k, v in act_flat.items()}
-            target = ret_flat[inds].to(device)
-            actor_ctx = (
-                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                if use_bf16 else nullcontext()
-            )
-            with actor_ctx:
-                out = actor_c(batch_obs, action=batch_act)
-                # Validate each active conditional factor. One bad target/amount must
-                # not silently discard an otherwise useful actor label.
-                lp = out.factor_logprob
-                bc_ok = bc_valid_flat[inds].to(device)
-                eligible = bc_ok[:, None, None] & out.factor_active
-                nll, frac_legal = safe_bc_nll(lp, eligible, strict=True)
-                with torch.no_grad():
-                    factor_nll_sum += (
-                        -torch.where(eligible, lp, torch.zeros_like(lp)).sum(dim=(0, 1))
-                    ).double()
-                    factor_count += eligible.sum(dim=(0, 1)).double()
-            if not torch.isfinite(nll).all():
-                raise FloatingPointError(
-                    f"non-finite joint actor loss nll={float(nll.detach())} "
-                    f"legal_frac={frac_legal:.3f}"
-                )
-            opt_a.zero_grad(set_to_none=True)
-            nll.backward()
-            nn.utils.clip_grad_norm_(
-                actor.parameters(),
-                float(PPO_CFG.get("maxGradNorm", 0.5)),
-                error_if_nonfinite=True,
-            )
-            opt_a.step()
-            # Actor and critic have disjoint trunks. Free the larger actor graph
-            # before constructing the critic graph to lower peak accelerator RAM.
-            del out, lp, eligible
-
-            critic_ctx = (
-                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                if use_bf16 else nullcontext()
-            )
-            with critic_ctx:
-                value_logits = critic_c(batch_obs, return_logits=True)
-                vloss = critic.support.cross_entropy(
-                    value_logits.float(), target, validate=False
-                ).mean()
-            if not torch.isfinite(vloss).all():
-                raise FloatingPointError(
-                    f"non-finite joint critic loss vloss={float(vloss.detach())}; "
-                    "actor step was applied, aborting before any artifact can be saved"
-                )
-            opt_c.zero_grad(set_to_none=True)
-            (value_coef * vloss).backward()
-            critic_grad_norm = nn.utils.clip_grad_norm_(
-                critic.parameters(),
-                float(VALUE_CFG["criticMaxGradNorm"]),
-                error_if_nonfinite=True,
-            )
-            opt_c.step()
-            nlls.append(float(nll.detach()))
-            vlosses.append(float(vloss.detach()))
-            legal_fracs.append(frac_legal)
-            global_step += int(inds.numel())
-            if writer is not None:
-                writer.add_scalar("joint/bc_nll", nlls[-1], global_step)
-                writer.add_scalar("joint/value_loss", vlosses[-1], global_step)
-                writer.add_scalar("joint/bc_legal_frac", frac_legal, global_step)
-                writer.add_scalar(
-                    "joint/grad_norm_critic", float(critic_grad_norm), global_step
-                )
-
-    with torch.no_grad():
-        sub = idx[torch.randperm(B)[: min(4096, B)]]
-        eval_host = (
-            lazy_obs.gather_minibatch(sub)
-            if lazy_obs is not None
-            else {k: v[sub] for k, v in obs_flat.items()}
-        )
-        eval_obs = promote_obs_device(eval_host, device, non_blocking=False)
-        pred = critic(eval_obs).float().cpu().numpy()
-        y = ret_flat[sub].cpu().numpy()
-        var_y = float(np.var(y))
-        ev = float("nan") if var_y == 0 else 1.0 - float(np.var(y - pred) / var_y)
-
-    hist = {
-        INTENT_TYPES[i]: int(type_hist[i])
-        for i in range(len(INTENT_TYPES))
-        if int(type_hist[i]) > 0
-    }
-    if legal_fracs:
-        hist["_bc_legal_frac"] = float(np.mean(legal_fracs))
-    hist["_value_target_min"] = float(target_diag["target_min"].item())
-    hist["_value_target_max"] = float(target_diag["target_max"].item())
-    hist["_value_target_overflow_fraction"] = float(
-        target_diag["overflow_fraction"].item()
-    )
-    hist["_value_target_saturation_fraction"] = float(
-        target_diag["saturation_fraction"].item()
-    )
-    hist["_critic_max_grad_norm"] = float(VALUE_CFG["criticMaxGradNorm"])
-    factor_names = (
-        "type", "direction", "target", "amount",
-        "construction_type", "construction_tile",
-        *(f"body_count_{index}" for index in range(N_BODY_PART)),
-        *(f"body_order_{index}" for index in range(N_BODY_PART)),
-    )
-    factor_nll_sum = factor_nll_sum.cpu()
-    factor_count = factor_count.cpu()
-    for index, name in enumerate(factor_names):
-        if factor_count[index] > 0:
-            hist[f"_bc_{name}_nll"] = float(factor_nll_sum[index] / factor_count[index])
-            hist[f"_bc_{name}_count"] = int(factor_count[index])
-    return (
-        float(np.mean(nlls)) if nlls else float("nan"),
-        float(np.mean(vlosses)) if vlosses else float("nan"),
-        ev,
-        global_step,
-        hist,
-    )
-
-
-@torch.inference_mode()
-def _validate_teacher_forced(
-    actor: Actor,
-    critic: Critic,
-    envs: VecScreepsEnv,
-    *,
-    steps: int,
-    device: torch.device,
-    gamma: float,
-) -> dict[str, float]:
-    """Fresh teacher-forced actor legality plus critic return validation."""
-    envs.reset()
-    total_nll = 0.0
-    total_factors = 0
-    total_skill = 0.0
-    total_delivery = 0.0
-    total_build = 0.0
-    total_claims = 0.0
-    max_creeps = 0
-    values_rows: list[torch.Tensor] = []
-    value_logits_rows: list[torch.Tensor] = []
-    rewards_rows: list[torch.Tensor] = []
-    dones_rows: list[torch.Tensor] = []
-    type_hist = torch.zeros(len(INTENT_TYPES), dtype=torch.long)
-    spawn_validation: dict[str, dict[str, float]] = {}
-    actor.eval()
-    critic.eval()
-    for _ in range(max(1, steps)):
-        assert envs.host_obs is not None
-        obs = promote_obs_device(envs.host_obs, device, non_blocking=False)
-        value_logits = critic.value_logits(obs).float()
-        value_logits_rows.append(value_logits)
-        values_rows.append(critic.support.to_expected_scalar(value_logits).cpu())
-        _next, reward, done, infos, actions = envs.step_scripted()
-        rewards_rows.append(reward.float().cpu())
-        dones_rows.append(done.float().cpu())
-        actor_cap = obs["actors"].shape[1]
-        action_device = {
-            key: value[:, :actor_cap].to(device) for key, value in actions.items()
-        }
-        out = actor(obs, action=action_device)
-        eligible = out.factor_active
-        nll, legal = safe_bc_nll(out.factor_logprob, eligible, strict=True)
-        count = int(eligible.sum().item())
-        total_nll += float(nll.item()) * count
-        total_factors += count
-        if legal != 1.0:
-            raise RuntimeError(f"teacher-forced legal coverage={legal:.6f}")
-        spawn_type = INTENT_TYPES.index("spawnCreep")
-        for env_index, info in enumerate(infos):
-            stage = str((info or {}).get("curriculum") or "unknown")
-            if not stage.startswith("spawn_"):
-                continue
-            spawn_rows = torch.nonzero(
-                action_device["types"][env_index, :, 0] == spawn_type,
-                as_tuple=False,
-            ).flatten()
-            stage_spawn = spawn_validation.setdefault(
-                stage, {"nll_sum": 0.0, "labels": 0.0, "success": 0.0},
-            )
-            for actor_index_tensor in spawn_rows:
-                actor_index = int(actor_index_tensor)
-                factor_lp = out.factor_logprob[env_index, actor_index]
-                factor_active = out.factor_active[env_index, actor_index]
-                count_nll = -factor_lp[6 : 6 + N_BODY_PART].sum()
-                order_active = factor_active[6 + N_BODY_PART :]
-                order_nll = -torch.where(
-                    order_active,
-                    factor_lp[6 + N_BODY_PART :],
-                    torch.zeros_like(factor_lp[6 + N_BODY_PART :]),
-                ).sum()
-                semantic_nll = torch.stack((
-                    -factor_lp[0], count_nll, order_nll,
-                )).mean()
-                stage_spawn["nll_sum"] += float(semantic_nll)
-                stage_spawn["labels"] += 1.0
-            stage_spawn["success"] += float(sum(
-                result.get("type") == "spawnCreep" and int(result.get("code", -1)) == C_OK
-                for result in (info or {}).get("intentResults", ())
-            ))
-        total_skill += sum(
-            float((info or {}).get("harvestDelta") or 0)
-            + float((info or {}).get("controlDelta") or 0)
-            for info in infos
-        )
-        total_delivery += sum(float((info or {}).get("transferDelta") or 0) for info in infos)
-        total_build += sum(float((info or {}).get("buildDelta") or 0) for info in infos)
-        total_claims += sum(float((info or {}).get("claimDelta") or 0) for info in infos)
-        teacher_invalid = sum(int((info or {}).get("intentInvalid") or 0) for info in infos)
-        if teacher_invalid:
-            raise RuntimeError(
-                f"teacher-forced validation produced {teacher_invalid} engine-invalid intents"
-            )
-        max_creeps = max(
-            [max_creeps, *(int((info or {}).get("creeps") or 0) for info in infos)],
-        )
-        live = obs["actor_mask"].bool()
-        chosen = actions["types"][:, :actor_cap, 0][live.cpu()].long()
-        chosen = chosen[(chosen >= 0) & (chosen < len(INTENT_TYPES))]
-        type_hist += torch.bincount(chosen, minlength=len(INTENT_TYPES))
-    assert envs.host_obs is not None
-    final_obs = promote_obs_device(envs.host_obs, device, non_blocking=False)
-    next_value = critic(final_obs).float().cpu()
-    rewards_tn = torch.stack(rewards_rows)
-    dones_tn = torch.stack(dones_rows)
-    returns = discounted_returns_tn(
-        rewards_tn,
-        dones_tn,
-        gamma=gamma,
-        next_value=next_value,
-        truncations=dones_tn,
-    )
-    predicted = torch.stack(values_rows)
-    validation_logits = torch.stack(value_logits_rows)
-    returns_device = returns.to(device)
-    critic.support.validate_targets(returns)
-    validation_value_loss = float(
-        critic.support.cross_entropy(
-            validation_logits, returns_device, validate=False
-        ).mean().item()
-    )
-    target_diag = critic.support.target_diagnostics(returns)
-    target_np = returns.numpy()
-    pred_np = predicted.numpy()
-    variance = float(np.var(target_np))
-    validation_ev = (
-        float("nan") if variance == 0
-        else 1.0 - float(np.var(target_np - pred_np) / variance)
-    )
-    denominator = max(1, steps * envs.n)
-    metrics = {
-        "validation_factor_nll": total_nll / max(1, total_factors),
-        "validation_legal_frac": 1.0,
-        "validation_teacher_skill_rate": total_skill / denominator,
-        "validation_value_ev": validation_ev,
-        "validation_value_loss": validation_value_loss,
-        "validation_value_target_min": float(target_diag["target_min"].item()),
-        "validation_value_target_max": float(target_diag["target_max"].item()),
-        "validation_value_target_overflow_fraction": float(
-            target_diag["overflow_fraction"].item()
-        ),
-        "validation_value_target_saturation_fraction": float(
-            target_diag["saturation_fraction"].item()
-        ),
-        "validation_delivery": total_delivery,
-        "validation_build": total_build,
-        "validation_claims": total_claims,
-        "validation_max_creeps": float(max_creeps),
-    }
-    for index, name in enumerate(INTENT_TYPES):
-        metrics[f"validation_intent_{name}_count"] = float(type_hist[index])
-    for stage, stage_spawn in spawn_validation.items():
-        labels = max(1.0, stage_spawn["labels"])
-        metrics[f"validation_{stage}_labels"] = stage_spawn["labels"]
-        metrics[f"validation_{stage}_nll"] = stage_spawn["nll_sum"] / labels
-        metrics[f"validation_{stage}_success"] = stage_spawn["success"]
-    return metrics
-
-
 @torch.inference_mode()
 def _validate_closed_loop(
     actor: Actor,
@@ -899,8 +403,15 @@ def _validate_closed_loop(
     *,
     steps: int,
     device: torch.device,
+    deterministic: bool = True,
 ) -> dict[str, object]:
-    """Run the learned deterministic actor in fresh environments."""
+    """Run the learned actor in fresh environments.
+
+    `deterministic` selects the decode. Greedy decoding is the qualification
+    setting, but it cannot see behaviour that survives only as low-probability
+    policy mass, construction being the clearest case, so a sampled run is the
+    comparable measurement when behaviour counts are the question.
+    """
     obs = envs.reset()
     actor.eval()
     total_skill = 0.0
@@ -917,7 +428,7 @@ def _validate_closed_loop(
     late_window_size = min(OUTPOST_LATE_WINDOW_STEPS, max(1, steps // 5))
     for timestep in range(max(1, steps)):
         late_window = timestep >= max(1, steps) - late_window_size
-        out = actor(obs, deterministic=True)
+        out = actor(obs, deterministic=deterministic)
         obs, reward, _done, infos = envs.step({
             "types": out.types,
             "dirs": out.dirs,
@@ -1195,6 +706,26 @@ def _body_label_factor_mask(body_counts: torch.Tensor, order_exact: bool) -> tor
     return eligible
 
 
+def _spawn_budget_bucket(budget: int) -> str:
+    """Bucket the energy a spawn decision could actually spend."""
+    if budget <= 300:
+        return "le300"
+    if budget < 550:
+        return "301_549"
+    if budget < 650:
+        return "550_649"
+    return "ge650"
+
+
+def _spawn_length_bucket(length: int) -> str:
+    """Bucket the part count a spawn decision bought."""
+    if length <= 6:
+        return "le6"
+    if length <= 15:
+        return "7_15"
+    return "ge16"
+
+
 def _record_spawn_labels(
     metrics: dict[str, float], actions: dict[str, torch.Tensor], obs: dict[str, torch.Tensor], env_index: int,
 ) -> None:
@@ -1227,29 +758,17 @@ def _record_spawn_labels(
         metrics["spawn_body_length_max"] = max(
             metrics.get("spawn_body_length_max", 0.0), float(length),
         )
-        length_bucket = (
-            "spawn_length_le_6" if length <= 6
-            else "spawn_length_7_15" if length <= 15
-            else "spawn_length_ge_16"
-        )
-        metrics[length_bucket] = metrics.get(length_bucket, 0.0) + 1.0
-        if budget <= 300:
-            bucket = "spawn_budget_le_300"
-        elif budget < 550:
-            bucket = "spawn_budget_301_549"
-        elif budget < 650:
-            bucket = "spawn_budget_550_649"
-        else:
-            bucket = "spawn_budget_ge_650"
-        metrics[bucket] = metrics.get(bucket, 0.0) + 1.0
+        length_key = f"spawn_length_{_spawn_length_bucket(length)}"
+        metrics[length_key] = metrics.get(length_key, 0.0) + 1.0
+        budget_key = f"spawn_budget_{_spawn_budget_bucket(budget)}"
+        metrics[budget_key] = metrics.get(budget_key, 0.0) + 1.0
 
 
 def _append_spawn_replay(
-    replay: list[
-        tuple[str, int, dict[str, torch.Tensor], dict[str, torch.Tensor]]
-    ],
+    replay: list[SpawnReplayRow],
     obs: dict[str, torch.Tensor],
     actions: dict[str, torch.Tensor],
+    eligible: torch.Tensor,
 ) -> None:
     """Retain bounded positive *and wait* decisions for every available spawn.
 
@@ -1257,6 +776,12 @@ def _append_spawn_replay(
     and erases the teacher's economically essential save-up decisions.  Body
     factors remain active only on positive rows; wait rows supervise the intent
     choice and are stratified by budget, capacity, and population phase.
+
+    ``eligible`` is the teacher's per-factor supervision mask, laid out over
+    ``[batch, actors, 6 + 2 * N_BODY_PART]`` exactly like ``actions``.  The two
+    row kinds supervise disjoint factors, so each is retained only when its own
+    factors carry a label: a positive row needs every body-count factor, a wait
+    row needs the intent factor.  Anything else would contribute zero gradient.
     """
     spawn_type = INTENT_TYPES.index("spawnCreep")
     none_type = INTENT_TYPES.index("none")
@@ -1281,16 +806,17 @@ def _append_spawn_replay(
                 float(obs["actors"][env_index, actor_index, ACTOR_FEATURE_INDEX["roomEnergyCapacity"]])
                 * MAX_ROOM_ENERGY
             ))
-            budget_bucket = (
-                "le300" if budget <= 300 else "301_549" if budget < 550
-                else "550_649" if budget < 650 else "ge650"
-            )
+            budget_bucket = _spawn_budget_bucket(budget)
             if decision == spawn_type:
+                if not bool(
+                    eligible[env_index, actor_index, 6 : 6 + N_BODY_PART].all()
+                ):
+                    # This row exists to supervise the exact composition, so a
+                    # body this ABI cannot express has nothing to teach here.
+                    continue
                 counts = actions["body_counts"][env_index, actor_index, 0].long()
                 length = int(counts.sum())
-                length_bucket = (
-                    "le6" if length <= 6 else "7_15" if length <= 15 else "ge16"
-                )
+                length_bucket = _spawn_length_bucket(length)
                 body_signature = "_".join(str(int(count)) for count in counts.tolist())
                 stratum = f"spawn:{budget_bucket}:{length_bucket}:{body_signature}"
             else:
@@ -1304,6 +830,9 @@ def _append_spawn_replay(
                 # merely dilute the balanced decision loss, so replay only genuine
                 # economic waits where spawning was a legal alternative.
                 if wait_kind == "waitforced":
+                    continue
+                if not bool(eligible[env_index, actor_index, 0]):
+                    # The intent is the only factor a wait row ever supervises.
                     continue
                 capacity_bucket = (
                     "cap300" if capacity <= 300 else "cap301_549" if capacity < 550
@@ -1334,13 +863,12 @@ def _append_spawn_replay(
                     key: value[env_index : env_index + 1, :actor_cap].clone()
                     for key, value in actions.items()
                 },
+                eligible[env_index : env_index + 1, :actor_cap].clone(),
             ))
 
 
 def _spawn_replay_coverage(
-    replay: list[
-        tuple[str, int, dict[str, torch.Tensor], dict[str, torch.Tensor]]
-    ],
+    replay: list[SpawnReplayRow],
 ) -> dict[str, float]:
     """Measure positive body coverage from tensors, never diagnostic names.
 
@@ -1351,34 +879,132 @@ def _spawn_replay_coverage(
     authoritative data.
     """
     coverage = {
-        f"budget_{bucket}": 0.0
-        for bucket in ("le300", "301_549", "550_649", "ge650")
+        f"budget_{bucket}": 0.0 for bucket in SPAWN_BUDGET_BUCKETS
     } | {
-        f"length_{bucket}": 0.0
-        for bucket in ("le6", "7_15", "ge16")
+        f"length_{bucket}": 0.0 for bucket in SPAWN_LENGTH_BUCKETS
     }
     spawn_type = INTENT_TYPES.index("spawnCreep")
-    for _stratum, actor_index, obs, action in replay:
+    for _stratum, actor_index, obs, action, _eligible in replay:
         if int(action["types"][0, actor_index, 0]) != spawn_type:
             continue
         budget = int(round(
             float(obs["actors"][0, actor_index, _SPAWN_ENERGY_FEATURE])
             * MAX_ROOM_ENERGY
         ))
-        budget_bucket = (
-            "le300" if budget <= 300 else "301_549" if budget < 550
-            else "550_649" if budget < 650 else "ge650"
-        )
         length = int(action["body_counts"][0, actor_index, 0].sum())
-        length_bucket = "le6" if length <= 6 else "7_15" if length <= 15 else "ge16"
+        budget_bucket = _spawn_budget_bucket(budget)
+        length_bucket = _spawn_length_bucket(length)
         coverage[f"budget_{budget_bucket}"] += 1.0
         coverage[f"length_{length_bucket}"] += 1.0
     return coverage
 
 
+def _spawn_length_coverage_gap(counts: Mapping[str, float], prefix: str) -> dict[str, float]:
+    """Name every body-length bucket this economy cannot fund, with its count.
+
+    The gate above requires only the reachable buckets, so the unreached ones
+    would otherwise vanish from the record.  Emitting them under an explicit
+    ``<prefix>_length_unreached_<bucket>`` key keeps the gap visible in the
+    checkpoint: the day a higher-RCL curriculum starts filling one, it shows up
+    here first and can be promoted back into `SPAWN_LENGTH_REQUIRED_BUCKETS`.
+    """
+    return {
+        f"{prefix}_length_unreached_{bucket}": float(counts.get(bucket, 0.0))
+        for bucket in SPAWN_LENGTH_UNREACHED_BUCKETS
+    }
+
+
+def _teacher_spawn_coverage(
+    teacher_by_curriculum: Mapping[str, Mapping[str, float]],
+) -> dict[str, float]:
+    """Total the teacher's measured spawn supervision breadth per bucket.
+
+    Every value is a count of the teacher's own labelled decisions, summed over
+    curricula, plus the named body-length coverage gap.  Nothing here is an
+    expectation about which body the teacher should have chosen.
+    """
+    def total(key: str) -> float:
+        return sum(
+            float(metrics.get(key, 0.0))
+            for metrics in teacher_by_curriculum.values()
+        )
+
+    coverage = {"teacher_spawn_labels": total("spawn_labels")}
+    coverage.update({
+        f"teacher_spawn_budget_{bucket}": total(f"spawn_budget_{bucket}")
+        for bucket in SPAWN_BUDGET_BUCKETS
+    })
+    coverage.update({
+        f"teacher_spawn_length_{bucket}": total(f"spawn_length_{bucket}")
+        for bucket in SPAWN_LENGTH_BUCKETS
+    })
+    coverage.update(_spawn_length_coverage_gap(
+        {
+            bucket: coverage[f"teacher_spawn_length_{bucket}"]
+            for bucket in SPAWN_LENGTH_BUCKETS
+        },
+        "teacher_spawn",
+    ))
+    return coverage
+
+
+def _teacher_contract_bodies(
+    spawn_replay: Sequence[SpawnReplayRow],
+) -> dict[str, dict[str, Any]]:
+    """Read each spawn world's teacher body decision out of the corpus rows.
+
+    The contract rows are The International's own labels, collected in those
+    worlds and carried with the corpus `ti_bot_source_sha256` provenance, so
+    qualification can compare a learned policy against the measured teacher
+    instead of against a frozen archetype table.  Each row also carries the
+    eligibility mask that decided which factors were supervised: body order is
+    representable only for contiguous type blocks, so an interleaved teacher
+    body is comparable by composition alone and says nothing about part order.
+    """
+    spawn_type = INTENT_TYPES.index("spawnCreep")
+    order_start = 6 + N_BODY_PART
+    prefix = "spawn:contract:"
+    bodies: dict[str, dict[str, Any]] = {}
+    for stratum, actor_index, _obs, action, eligible in spawn_replay:
+        if not stratum.startswith(prefix):
+            continue
+        stage = stratum[len(prefix):]
+        if int(action["types"][0, actor_index, 0]) != spawn_type:
+            raise SystemExit(
+                f"[joint] corpus spawn contract row {stratum!r} is not a spawn decision"
+            )
+        counts = action["body_counts"][0, actor_index, 0].long()
+        order = action["body_order"][0, actor_index, 0].long()
+        measured = {
+            "parts": [
+                int(part)
+                for part in order.tolist()
+                for _ in range(int(counts[part]))
+            ],
+            "order_supervised": bool(eligible[0, actor_index, order_start:].any()),
+        }
+        previous = bodies.setdefault(stage, measured)
+        if previous != measured:
+            raise SystemExit(
+                f"[joint] corpus carries two different teacher bodies for {stage!r}: "
+                f"{previous} and {measured}"
+            )
+    return bodies
+
+
+def _spawn_body_matches(observed: Any, measured: Mapping[str, Any]) -> bool:
+    """Compare a policy body against the teacher's, over supervised factors only."""
+    if not isinstance(observed, (list, tuple)):
+        return False
+    parts = [int(part) for part in observed]
+    teacher = [int(part) for part in measured["parts"]]
+    if measured["order_supervised"]:
+        return parts == teacher
+    return sorted(parts) == sorted(teacher)
+
+
 def _evaluation_seed_overlap(
     meta: dict[str, Any], *, offset: int, num_envs: int,
-    extra_seeds: Iterable[int] = (),
 ) -> set[int]:
     """Return evaluation seeds already present in either corpus split."""
     evaluation = {
@@ -1389,241 +1015,212 @@ def _evaluation_seed_overlap(
         int(entry["seed"])
         for key in ("train_env_map", "holdout_env_map")
         for entry in meta.get(key, [])
-    } | {int(seed) for seed in extra_seeds}
+    }
     return evaluation & collected
 
 
-def _auxiliary_seed_overlap(
-    meta: dict[str, Any], auxiliary_seeds: Iterable[int],
-) -> set[int]:
-    """Return auxiliary actor-training seeds reused by a base corpus split."""
-    base = {
-        int(entry["seed"])
-        for key in ("train_env_map", "holdout_env_map")
-        for entry in meta.get(key, [])
-    }
-    return base & {int(seed) for seed in auxiliary_seeds}
+def _ti_spawn_contract_label(
+    obs: dict[str, torch.Tensor], info: dict[str, Any], *, stage: str,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor, bool] | None:
+    """Label the teacher's body decision for one spawn-world tick, if it made one.
 
-
-def _correction_seed_conflicts(
-    meta: dict[str, Any],
-    *,
-    dagger_seeds: Iterable[int],
-    supplement_seeds: Iterable[int],
-    evaluation_offset: int,
-    num_envs: int,
-) -> dict[str, set[int]]:
-    """Return every cross-authority/evaluation seed collision independently."""
-    dagger = {int(seed) for seed in dagger_seeds}
-    supplement = {int(seed) for seed in supplement_seeds}
-    return {
-        "dagger_base": _auxiliary_seed_overlap(meta, dagger),
-        "supplement_base": _auxiliary_seed_overlap(meta, supplement),
-        "dagger_supplement": dagger & supplement,
-        "evaluation": _evaluation_seed_overlap(
-            meta, offset=evaluation_offset, num_envs=num_envs,
-            extra_seeds=dagger | supplement,
-        ),
+    Mirrors `pretrain_corpus.TiLabeller` for the single factor group these worlds
+    exist to cover.  The International's spawn command is deliberately not a full
+    action today: it carries an energy-structure order and a spawn direction this
+    ABI does not express, so the intent factor is eligible only when the shared
+    translator declares the command exact, and the supervised factors are the
+    body composition plus, when the body is ordered by block, its part order.
+    Returns the batch-one action tensors, their eligibility mask, and whether the
+    order factors were exact; `None` when the teacher did not spawn.
+    """
+    labels = [
+        label for label in translate_ti_intents(
+            info.get("expertIntents"),
+            info.get("expertActorMeta") or [],
+            info.get("expertTargetMeta") or [],
+            info.get("expertRoomNames") or [],
+        )
+        if label.rejection is None
+        and label.body_parts is not None
+        and label.actor_index is not None
+    ]
+    if not labels:
+        return None
+    if len(labels) > 1:
+        raise RuntimeError(
+            f"spawn contract {stage!r} produced {len(labels)} spawn decisions in one "
+            "tick; a contract world owns exactly one spawn"
+        )
+    label = labels[0]
+    actor_index = int(label.actor_index)
+    actor_cap = obs["actors"].shape[1]
+    spawn_type = INTENT_TYPES.index("spawnCreep")
+    if actor_index >= actor_cap:
+        raise RuntimeError(
+            f"spawn contract {stage!r} spawned from actor {actor_index} truncated "
+            f"out of the {actor_cap}-row observation"
+        )
+    if not bool(obs["intent_mask"][0, actor_index, 0, spawn_type]):
+        # `safe_bc_nll(..., strict=True)` refuses a masked label, and these worlds
+        # are built with an idle spawn and a funded budget, so a masked spawn is a
+        # world/ABI disagreement rather than a row to drop.
+        raise RuntimeError(
+            f"spawn contract {stage!r} spawn intent is masked illegal for actor "
+            f"{actor_index}"
+        )
+    body_counts, body_order, order_exact = _parts_to_count_order(label.body_parts)
+    actions = {
+        "types": torch.zeros(1, actor_cap, 1, dtype=torch.long),
+        "dirs": torch.zeros(1, actor_cap, 1, dtype=torch.long),
+        "targets": torch.zeros(1, actor_cap, 1, dtype=torch.long),
+        "amounts": torch.zeros(1, actor_cap, 1, dtype=torch.long),
+        "construction_types": torch.zeros(1, actor_cap, 1, dtype=torch.long),
+        "construction_tiles": torch.zeros(1, actor_cap, 1, dtype=torch.long),
+        "body_counts": torch.zeros(1, actor_cap, 1, N_BODY_PART, dtype=torch.long),
+        "body_order": torch.arange(N_BODY_PART).view(1, 1, 1, N_BODY_PART).expand(
+            1, actor_cap, 1, -1,
+        ).clone(),
     }
+    actions["types"][0, actor_index, 0] = spawn_type
+    actions["body_counts"][0, actor_index, 0] = body_counts
+    actions["body_order"][0, actor_index, 0] = body_order
+    eligible = torch.zeros(1, actor_cap, 6 + 2 * N_BODY_PART, dtype=torch.bool)
+    if label.full_action:
+        eligible[0, actor_index, 0] = True
+    eligible[0, actor_index] |= _body_label_factor_mask(body_counts, order_exact)
+    return actions, eligible, order_exact
 
 
 def _collect_spawn_contract_replay(
-    replay: list[tuple[str, int, dict[str, torch.Tensor], dict[str, torch.Tensor]]],
+    replay: list[SpawnReplayRow],
     teacher_by_curriculum: dict[str, dict[str, float]],
     *,
     node: str | None,
     room: str,
+    bot_dir: str | None = None,
     seed: int = 0,
+    max_ticks: int = 64,
 ) -> None:
     """Collect one exact, observable body decision per dedicated spawn world.
 
     These scenarios exist to cover rare 2..50-part bodies, not to occupy 60% of
-    critic training for 14k artificial ticks.  Each reset contributes precisely
-    its first decision; the long economy streams remain the critic distribution.
+    critic training for 14k artificial ticks.  Each world contributes precisely
+    one teacher body decision; the long economy streams remain the critic
+    distribution.
+
+    The teacher is The International, which does not act on its opening ticks: a
+    measured healthy episode issued no engine intent for its first twelve.  Each
+    world is therefore stepped until its spawn decision lands and stops
+    contributing afterwards, rather than being read once after reset.
+
+    `bot_dir` of `None` defers to `ScreepsEnv`'s canonical resolution
+    (`RL_EXPERT_BOT`, else the sibling TI dist), which is what
+    `pretrain_corpus.CorpusConfig.resolved_ti_bot_dir` names.
     """
     envs = VecScreepsEnv(
-        len(SPAWN_CURRICULA), node=node, room=room, max_episode=2,
+        len(SPAWN_CURRICULA), node=node, room=room, max_episode=max_ticks + 5,
         device="cpu", curriculum=",".join(SPAWN_CURRICULA), lean_meta=False,
-        seed=seed,
+        expert=True, bot_dir=bot_dir, capture_expert_intents=True, seed=seed,
     )
+    pending = set(range(len(SPAWN_CURRICULA)))
     try:
-        replay_start = len(replay)
         envs.reset()
-        assert envs.host_obs is not None
-        pre = _clone_host_obs(envs.host_obs)
-        _obs, _reward, _done, infos, actions = envs.step_scripted()
-        _append_spawn_replay(replay, pre, actions)
-        if len(replay) - replay_start != len(SPAWN_CURRICULA):
-            raise RuntimeError("spawn contract collector did not retain one row per world")
-        for env_index, stage in enumerate(SPAWN_CURRICULA):
-            replay_index = replay_start + env_index
-            _stratum, actor_index, row_obs, row_action = replay[replay_index]
-            replay[replay_index] = (
-                f"spawn:contract:{stage}", actor_index, row_obs, row_action,
-            )
-        for env_index, stage in enumerate(SPAWN_CURRICULA):
-            info = infos[env_index] or {}
-            metrics = teacher_by_curriculum.setdefault(stage, {
-                "transitions": 0.0, "skill": 0.0, "delivery": 0.0,
-                "build": 0.0, "claims": 0.0, "max_creeps": 0.0,
-                "spawn_success": 0.0, "issued": 0.0, "invalid": 0.0,
-            })
-            metrics["transitions"] += 1.0
-            spawn_results = [
-                result for result in (info.get("intentResults") or [])
-                if result.get("type") == "spawnCreep"
-                and int(result.get("code", -1)) == 0
-            ]
-            metrics["spawn_success"] += float(len(spawn_results))
-            metrics["issued"] += float(info.get("intentIssued") or 0)
-            metrics["invalid"] += float(info.get("intentInvalid") or 0)
-            _record_spawn_labels(metrics, actions, pre, env_index)
-            if int(info.get("intentInvalid") or 0):
-                raise RuntimeError(f"spawn contract {stage!r} produced invalid intent")
-            if len(spawn_results) != 1:
-                raise RuntimeError(f"spawn contract {stage!r} did not execute exactly once")
+        for tick in range(max_ticks):
+            if not pending:
+                break
+            assert envs.host_obs is not None
+            # Two host stacks alternate, so the pre-step batch stays valid across
+            # exactly one step; the retained rows clone what they keep.
+            pre = envs.host_obs
+            _obs, _reward, _done, infos = envs.step_expert()
+            for env_index in sorted(pending):
+                stage = SPAWN_CURRICULA[env_index]
+                info = infos[env_index] or {}
+                metrics = teacher_by_curriculum.setdefault(stage, {
+                    "transitions": 0.0, "skill": 0.0, "delivery": 0.0,
+                    "build": 0.0, "claims": 0.0, "max_creeps": 0.0,
+                    "spawn_success": 0.0,
+                })
+                metrics["transitions"] += 1.0
+                # `stepExpert` reports no intent summary at all, so an issued /
+                # invalid counter here would report a measurement that does not
+                # exist.  Spawn execution is on the expert wire, and the label is
+                # checked against it below.
+                metrics["spawn_success"] += float(info.get("spawnSuccess") or 0)
+                single_pre = _compact_entity_prefixes({
+                    key: value[env_index : env_index + 1] for key, value in pre.items()
+                })
+                labelled = _ti_spawn_contract_label(single_pre, info, stage=stage)
+                if labelled is None:
+                    continue
+                actions, eligible, order_exact = labelled
+                if float(info.get("spawnSuccess") or 0) < 1.0:
+                    raise RuntimeError(
+                        f"spawn contract {stage!r} decided a body the engine did not "
+                        "execute"
+                    )
+                replay_start = len(replay)
+                _append_spawn_replay(replay, single_pre, actions, eligible)
+                if len(replay) - replay_start != 1:
+                    raise RuntimeError(
+                        f"spawn contract {stage!r} retained "
+                        f"{len(replay) - replay_start} rows for one decision"
+                    )
+                _stratum, actor_index, row_obs, row_action, row_eligible = replay[replay_start]
+                replay[replay_start] = (
+                    f"spawn:contract:{stage}", actor_index, row_obs, row_action,
+                    row_eligible,
+                )
+                _record_spawn_labels(metrics, actions, single_pre, 0)
+                metrics["spawn_label_tick"] = float(tick)
+                if not order_exact:
+                    # Same accounting as the corpus labeller: an interleaved body
+                    # keeps its exact composition and drops the order factors.
+                    metrics["spawn_body_order_interleaved"] = 1.0
+                pending.discard(env_index)
     finally:
         envs.close()
+    if pending:
+        raise RuntimeError(
+            "spawn contract teacher issued no spawn within "
+            f"{max_ticks} ticks for "
+            + ", ".join(repr(SPAWN_CURRICULA[index]) for index in sorted(pending))
+        )
 
 
-def _collect_ti_actor_replay(
-    *,
-    steps: int,
-    node: str | None,
-    room: str,
-    bot_dir: str | None,
-    seed: int,
-    capacity: int = 512,
-) -> tuple[list[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]], dict[str, int]]:
-    """Collect exactly representable TI factors with deterministic reservoir sampling."""
-    if steps <= 0:
-        return [], {}
-    env = ScreepsEnv(
-        node=node, room=room, max_episode=steps + 5, expert=True,
-        bot_dir=bot_dir, lean_meta=False, capture_expert_intents=True, seed=seed,
-    )
-    rng = np.random.default_rng(seed ^ 0x5449)
-    replay: list[
-        tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]
-    ] = []
-    counts: dict[str, int] = {}
-    seen = 0
-    try:
-        obs = env.reset()
-        for _ in range(steps):
-            pre = _clone_host_obs(obs)
-            obs, _reward, done, info = env.step()
-            labels = translate_ti_intents(
-                info.get("expertIntents"),
-                info.get("expertActorMeta") or [],
-                info.get("expertTargetMeta") or [],
-                info.get("expertRoomNames") or [],
-            )
-            actor_cap = pre["actors"].shape[1]
-            actions = {
-                "types": torch.zeros(1, actor_cap, 1, dtype=torch.long),
-                "dirs": torch.zeros(1, actor_cap, 1, dtype=torch.long),
-                "targets": torch.zeros(1, actor_cap, 1, dtype=torch.long),
-                "amounts": torch.zeros(1, actor_cap, 1, dtype=torch.long),
-                "construction_types": torch.zeros(1, actor_cap, 1, dtype=torch.long),
-                "construction_tiles": torch.zeros(1, actor_cap, 1, dtype=torch.long),
-                "body_counts": torch.zeros(
-                    1, actor_cap, 1, N_BODY_PART, dtype=torch.long,
-                ),
-                "body_order": torch.arange(N_BODY_PART).view(
-                    1, 1, 1, N_BODY_PART,
-                ).expand(1, actor_cap, 1, -1).clone(),
-            }
-            eligible = torch.zeros(1, actor_cap, 6 + 2 * N_BODY_PART, dtype=torch.bool)
-            for label in labels:
-                if label.rejection:
-                    counts[f"rejected:{label.rejection}"] = counts.get(
-                        f"rejected:{label.rejection}", 0,
-                    ) + 1
-                    continue
-                if label.actor_index is None or label.actor_index >= actor_cap or label.intent is None:
-                    continue
-                # TI's raw move direction is conditioned on private task/path
-                # memory, whereas this policy normally chooses a persistent
-                # macro target and lets the executor navigate.  It is an exact
-                # engine intent but not an equivalent policy label.
-                if label.intent == "move":
-                    counts["rejected:macro_incompatible_move"] = counts.get(
-                        "rejected:macro_incompatible_move", 0,
-                    ) + 1
-                    continue
-                ai = label.actor_index
-                intent_index = INTENT_TYPES.index(label.intent)
-                actions["types"][0, ai, 0] = intent_index
-                if label.full_action:
-                    eligible[0, ai, 0] = True
-                if label.direction is not None:
-                    actions["dirs"][0, ai, 0] = label.direction
-                    eligible[0, ai, 1] = True
-                if label.target_index is not None:
-                    actions["targets"][0, ai, 0] = label.target_index
-                    eligible[0, ai, 2] = True
-                if label.construction_type is not None:
-                    actions["construction_types"][0, ai, 0] = label.construction_type
-                    actions["construction_tiles"][0, ai, 0] = int(label.construction_tile or 0)
-                    eligible[0, ai, 4:6] = True
-                if label.body_parts is not None:
-                    body_counts, body_order, order_exact = _parts_to_count_order(
-                        label.body_parts,
-                    )
-                    actions["body_counts"][0, ai, 0] = body_counts
-                    actions["body_order"][0, ai, 0] = body_order
-                    eligible[0, ai] |= _body_label_factor_mask(body_counts, order_exact)
-                    if not order_exact:
-                        counts["partial:spawn_body_order_interleaved"] = counts.get(
-                            "partial:spawn_body_order_interleaved", 0,
-                        ) + 1
-                key = f"accepted:{label.intent}:{'full' if label.full_action else 'factor'}"
-                counts[key] = counts.get(key, 0) + 1
-            if bool(eligible.any()):
-                compact_obs = _compact_entity_prefixes(pre)
-                compact_actor_cap = compact_obs["actors"].shape[1]
-                row = (
-                    {key: value.clone() for key, value in compact_obs.items()},
-                    {
-                        key: value[:, :compact_actor_cap].clone()
-                        for key, value in actions.items()
-                    },
-                    eligible[:, :compact_actor_cap].clone(),
-                )
-                seen += 1
-                if len(replay) < capacity:
-                    replay.append(row)
-                else:
-                    replace = int(rng.integers(0, seen))
-                    if replace < capacity:
-                        replay[replace] = row
-            if done:
-                raise RuntimeError("TI actor corpus ended before requested steps")
-    finally:
-        env.close()
-    counts["replay_rows"] = len(replay)
-    counts["eligible_ticks_seen"] = seen
-    return replay, counts
-
-
-def _append_scripted_lifecycle_replay(
+def _append_teacher_lifecycle_replay(
     replay: list[LifecycleSample],
     seen_by_stratum: dict[str, int],
     retained_by_stratum: dict[str, list[int]],
     rng: np.random.Generator,
     obs: dict[str, torch.Tensor],
     actions: dict[str, torch.Tensor],
+    eligible: torch.Tensor,
     infos: list[dict],
     *,
     timestep: int,
+    env_labels: list[int] | None = None,
 ) -> None:
     """Retain one bounded row per stage/state/action signature.
 
     A team tick may contain harvest, logistics, construction, and control at
     once. Preserve that joint label once under its complete category signature
     instead of cloning it or letting common harvest hide the rare actions.
+
+    ``eligible`` is the teacher's per-factor supervision mask over
+    ``[batch, actors, 6 + 2 * N_BODY_PART]``.  A tick the teacher did not label
+    at all is not a candidate: it never counts as seen and never draws from the
+    reservoir RNG, so eligibility cannot perturb the retained sampling of ticks
+    that do carry labels.
+
+    ``env_labels`` renames each batch row's recorded ``env_index``.  Callers that
+    step one environment at a time still need the row to name its true fleet
+    index, because the return lookup is indexed by ``(timestep, env_index)``.
     """
+    if env_labels is not None and len(env_labels) != len(infos):
+        raise ValueError(
+            f"env_labels labels {len(env_labels)} rows for {len(infos)} infos"
+        )
     groups = {
         "spawn": {INTENT_TYPES.index("spawnCreep")},
         "harvest": {INTENT_TYPES.index("harvest")},
@@ -1644,6 +1241,8 @@ def _append_scripted_lifecycle_replay(
     for env_index, info in enumerate(infos):
         if (info or {}).get("invalid_demo") or (info or {}).get("recovered"):
             continue
+        if not bool(eligible[env_index].any()):
+            continue
         chosen = set(int(value) for value in actions["types"][env_index, :, 0].tolist())
         categories = [name for name, members in groups.items() if chosen & members]
         if not categories:
@@ -1658,9 +1257,9 @@ def _append_scripted_lifecycle_replay(
         seen_by_stratum[stratum] = seen
         stratum_indices = retained_by_stratum.setdefault(stratum, [])
         replacement_index: int | None = None
-        if len(stratum_indices) >= SCRIPTED_REPLAY_PER_STRATUM:
+        if len(stratum_indices) >= TEACHER_REPLAY_PER_STRATUM:
             replacement = int(rng.integers(0, seen))
-            if replacement >= SCRIPTED_REPLAY_PER_STRATUM:
+            if replacement >= TEACHER_REPLAY_PER_STRATUM:
                 continue
             replacement_index = stratum_indices[replacement]
         compact_obs = _compact_entity_prefixes({
@@ -1670,88 +1269,21 @@ def _append_scripted_lifecycle_replay(
         sample = LifecycleSample(
             stratum=stratum,
             timestep=timestep,
-            env_index=env_index,
+            env_index=(
+                int(env_labels[env_index]) if env_labels is not None else env_index
+            ),
             obs={key: value.clone() for key, value in compact_obs.items()},
             action={
                 key: value[env_index : env_index + 1, :actor_cap].clone()
                 for key, value in actions.items()
             },
+            eligible=eligible[env_index : env_index + 1, :actor_cap].clone(),
         )
         if replacement_index is None:
             replay.append(sample)
             stratum_indices.append(len(replay) - 1)
         else:
             replay[replacement_index] = sample
-
-
-def _collect_lifecycle_holdout(
-    *,
-    num_envs: int,
-    steps: int,
-    max_episode: int,
-    curriculum: str,
-    node: str | None,
-    room: str,
-    seed: int,
-    gamma: float,
-) -> tuple[list[LifecycleSample], torch.Tensor]:
-    """Collect an independent full teacher lifecycle with no optimizer access."""
-    envs = VecScreepsEnv(
-        num_envs,
-        node=node,
-        room=room,
-        seed=seed,
-        max_episode=max_episode,
-        device="cpu",
-        curriculum=curriculum,
-        lean_meta=False,
-    )
-    replay: list[LifecycleSample] = []
-    seen: dict[str, int] = {}
-    retained: dict[str, list[int]] = {}
-    rng = np.random.default_rng(seed)
-    rewards: list[torch.Tensor] = []
-    dones: list[torch.Tensor] = []
-    try:
-        envs.reset()
-        for timestep in range(steps):
-            assert envs.host_obs is not None
-            pre = envs.host_obs
-            _next, reward, done, infos, actions = envs.step_scripted()
-            recovered = sum(
-                bool((info or {}).get("recovered"))
-                or bool((info or {}).get("invalid_demo"))
-                for info in infos
-            )
-            if recovered:
-                raise RuntimeError(
-                    f"holdout teacher recovered {recovered} environment(s) at "
-                    f"step={timestep + 1}; trajectory is not valid training data"
-                )
-            invalid = sum(int((info or {}).get("intentInvalid") or 0) for info in infos)
-            if invalid:
-                raise RuntimeError(
-                    f"holdout teacher produced {invalid} engine-invalid intents "
-                    f"at step={timestep + 1}"
-                )
-            rewards.append(reward.detach().cpu().float())
-            dones.append(done.detach().cpu().float())
-            _append_scripted_lifecycle_replay(
-                replay, seen, retained, rng,
-                pre, actions, infos, timestep=timestep,
-            )
-    finally:
-        envs.close()
-    rewards_tn = torch.stack(rewards)
-    dones_tn = torch.stack(dones)
-    returns_tn = discounted_returns_tn(
-        rewards_tn,
-        dones_tn,
-        gamma=gamma,
-        next_value=torch.zeros(num_envs),
-        truncations=torch.zeros_like(dones_tn),
-    )
-    return replay, returns_tn
 
 
 def _balanced_lifecycle_indices(replay: list[LifecycleSample]) -> list[int]:
@@ -1867,11 +1399,8 @@ def _schedule_auxiliary_lanes(
 
 def _preflight_joint_geometry(
     lifecycle_replay: list[LifecycleSample],
-    correction_replay: list[DaggerSample],
     rare_refs_by_intent: dict[str, list[tuple[int, int]]],
-    spawn_replay: list[
-        tuple[str, int, dict[str, torch.Tensor], dict[str, torch.Tensor]]
-    ],
+    spawn_replay: list[SpawnReplayRow],
     *,
     minibatch: int,
 ) -> dict[str, int]:
@@ -1879,10 +1408,6 @@ def _preflight_joint_geometry(
     width = max(1, int(minibatch))
     lifecycle_rows = len(_balanced_lifecycle_indices(lifecycle_replay))
     primary_steps = (lifecycle_rows + width - 1) // width
-    correction_batches = _dagger_actor_batches(
-        correction_replay, minibatch=min(32, width),
-        shuffle_generator=torch.Generator().manual_seed(0x434F5252),
-    )
     rare_batches = _rare_intent_actor_batches(
         rare_refs_by_intent, minibatch=min(32, width),
         shuffle_generator=torch.Generator().manual_seed(0x52415245),
@@ -1892,7 +1417,6 @@ def _preflight_joint_geometry(
         shuffle_generator=torch.Generator().manual_seed(0x53504157),
     )
     lanes = {
-        "correction": correction_batches,
         "rare": rare_batches,
         "spawn": spawn_batches,
     }
@@ -1923,21 +1447,17 @@ def _train_joint_lifecycle_epoch(
     nextlat_actor_coef: float = 1.0,
     nextlat_critic_coef: float = 1.0,
     nextlat_critic_kl_coef: float = 0.1,
-    correction_replay: list[DaggerSample] | None = None,
-    correction_shuffle_generator: torch.Generator | None = None,
     rare_replay: list[LifecycleSample] | None = None,
     rare_refs_by_intent: dict[str, list[tuple[int, int]]] | None = None,
     rare_shuffle_generator: torch.Generator | None = None,
-    spawn_replay: list[
-        tuple[str, int, dict[str, torch.Tensor], dict[str, torch.Tensor]]
-    ] | None = None,
+    spawn_replay: list[SpawnReplayRow] | None = None,
     spawn_shuffle_generator: torch.Generator | None = None,
 ) -> tuple[float, float, float, int, dict[str, float]]:
     """Optimize lifecycle authority and NextLat in the same model updates.
 
     Lifecycle rows define the number and size of optimizer steps. Temporal
     rows are independently shuffled and cycled to the same exposure count.
-    Correction, rare-intent, and spawn rows each contribute exactly one of their
+    Rare-intent and spawn rows each contribute exactly one of their
     independently balanced source epochs, evenly interleaved over those same
     steps. Every actor loss is combined before one clip/update, so no narrow
     replay owns a later Muon step that can overwrite the broad policy.
@@ -1946,8 +1466,6 @@ def _train_joint_lifecycle_epoch(
         raise ValueError("joint lifecycle replay is empty")
     if not temporal_replay:
         raise ValueError("joint temporal replay is empty")
-    if correction_replay and correction_shuffle_generator is None:
-        raise ValueError("fused correction replay requires its dedicated shuffle RNG")
     if rare_replay and rare_shuffle_generator is None:
         raise ValueError("fused rare-intent replay requires its dedicated shuffle RNG")
     if spawn_replay and spawn_shuffle_generator is None:
@@ -1960,10 +1478,6 @@ def _train_joint_lifecycle_epoch(
         generator=nextlat_shuffle_generator,
     )
     primary_steps = (order.numel() + max(1, minibatch) - 1) // max(1, minibatch)
-    correction_batches = _dagger_actor_batches(
-        correction_replay or [], minibatch=min(32, minibatch),
-        shuffle_generator=correction_shuffle_generator,
-    ) if correction_shuffle_generator is not None else []
     rare_batches = _rare_intent_actor_batches(
         rare_refs_by_intent or {}, minibatch=min(32, minibatch),
         shuffle_generator=rare_shuffle_generator,
@@ -1973,11 +1487,9 @@ def _train_joint_lifecycle_epoch(
         shuffle_generator=spawn_shuffle_generator,
     ) if spawn_replay else []
     auxiliary_schedule = _schedule_auxiliary_lanes({
-        "correction": correction_batches,
         "rare": rare_batches,
         "spawn": spawn_batches,
     }, primary_steps)
-    correction_schedule = auxiliary_schedule["correction"]
     rare_schedule = auxiliary_schedule["rare"]
     spawn_schedule = auxiliary_schedule["spawn"]
     losses: list[float] = []
@@ -1987,8 +1499,6 @@ def _train_joint_lifecycle_epoch(
     critic_latent_losses: list[float] = []
     critic_kls: list[float] = []
     auxiliary_sums = {
-        "correction_nll": 0.0, "correction_legal": 0.0,
-        "correction_exposures": 0,
         "rare_nll": 0.0, "rare_legal": 0.0, "rare_exposures": 0,
         "spawn_nll": 0.0, "spawn_legal": 0.0, "spawn_exposures": 0,
     }
@@ -2014,6 +1524,9 @@ def _train_joint_lifecycle_epoch(
                 room_cap=room_cap, actions=True,
             ).items()
         }
+        eligible_device = _pad_eligible_masks(
+            [replay[index].eligible for index in selected], actor_cap=actor_cap,
+        ).to(device)
         target = torch.tensor(
             [
                 float(returns_tn[replay[index].timestep, replay[index].env_index])
@@ -2030,8 +1543,12 @@ def _train_joint_lifecycle_epoch(
             if use_bf16 else nullcontext()
         ):
             out = actor(obs_device, action=action_device)
+            # Only factors this teacher actually labelled on this row may be
+            # supervised; the model's own active-factor mask narrows it further.
             nll, fraction = safe_bc_nll(
-                out.factor_logprob, out.factor_active, strict=True,
+                out.factor_logprob,
+                _supervised_factor_mask(eligible_device, out.factor_active),
+                strict=True,
             )
             current_actor_latent = actor.encode_state(temporal_obs)
             with torch.no_grad():
@@ -2047,21 +1564,6 @@ def _train_joint_lifecycle_epoch(
             raise FloatingPointError(f"non-finite joint actor loss {actor_total}")
         optimizer.zero_grad(set_to_none=True)
         actor_total.backward()
-        for correction_selected in correction_schedule[primary_step]:
-            correction_loss, correction_legal, correction_per_actor = (
-                _dagger_actor_batch_loss(
-                    actor, correction_replay or [], correction_selected,
-                    device=device, use_bf16=use_bf16,
-                )
-            )
-            correction_loss.backward()
-            auxiliary_sums["correction_nll"] += float(
-                correction_per_actor.detach().sum()
-            )
-            auxiliary_sums["correction_legal"] += (
-                float(correction_legal) * len(correction_selected)
-            )
-            auxiliary_sums["correction_exposures"] += len(correction_selected)
         for rare_selected in rare_schedule[primary_step]:
             rare_loss, rare_legal, rare_per_actor = _rare_intent_batch_loss(
                 actor, rare_replay or [], rare_selected,
@@ -2156,19 +1658,16 @@ def _train_joint_lifecycle_epoch(
                     float(auxiliary_sums[f"{lane}_{metric}"])
                     / max(1, int(auxiliary_sums[f"{lane}_exposures"]))
                 )
-                for lane in ("correction", "rare", "spawn")
+                for lane in ("rare", "spawn")
                 for metric in ("nll", "legal")
             },
             **{
                 f"{lane}_exposures": float(auxiliary_sums[f"{lane}_exposures"])
-                for lane in ("correction", "rare", "spawn")
+                for lane in ("rare", "spawn")
             },
-            "correction_batches": float(len(correction_batches)),
             "rare_batches": float(len(rare_batches)),
             "spawn_batches": float(len(spawn_batches)),
-            "auxiliary_batches": float(
-                len(correction_batches) + len(rare_batches) + len(spawn_batches)
-            ),
+            "auxiliary_batches": float(len(rare_batches) + len(spawn_batches)),
             "auxiliary_minibatch": float(min(32, max(1, minibatch))),
             "optimizer_steps": float(primary_steps),
         },
@@ -2258,6 +1757,9 @@ def _evaluate_global_lifecycle(
                 room_cap=room_cap, actions=True,
             ).items()
         }
+        eligible_device = _pad_eligible_masks(
+            [replay[index].eligible for index in selected], actor_cap=actor_cap,
+        ).to(device)
         target = torch.tensor(
             [
                 float(returns_tn[replay[index].timestep, replay[index].env_index])
@@ -2265,7 +1767,7 @@ def _evaluate_global_lifecycle(
             ], dtype=torch.float32, device=device,
         )
         out = actor(obs_device, action=action_device)
-        active = out.factor_active
+        active = _supervised_factor_mask(eligible_device, out.factor_active)
         nll, legal = safe_bc_nll(out.factor_logprob, active, strict=True)
         if legal != 1.0:
             raise RuntimeError(f"global lifecycle legal fraction={legal}")
@@ -2342,13 +1844,15 @@ def _evaluate_lifecycle_actor_nll(
                 room_cap=room_cap, actions=True,
             ).items()
         }
+        eligible_device = _pad_eligible_masks(
+            [replay[index].eligible for index in selected], actor_cap=actor_cap,
+        ).to(device)
         out = actor(obs_device, action=action_device)
-        nll, legal = safe_bc_nll(
-            out.factor_logprob, out.factor_active, strict=True,
-        )
+        eligible = _supervised_factor_mask(eligible_device, out.factor_active)
+        nll, legal = safe_bc_nll(out.factor_logprob, eligible, strict=True)
         if legal != 1.0:
             raise RuntimeError(f"lifecycle retention legal fraction={legal}")
-        count = int(out.factor_active.sum())
+        count = int(eligible.sum())
         nll_sum += float(nll) * count
         factor_count += count
     actor.train()
@@ -2372,7 +1876,13 @@ def _auxiliary_lifecycle_retained(
 def _rare_intent_actor_refs(
     replay: list[LifecycleSample],
 ) -> dict[str, list[tuple[int, int]]]:
-    """Index every exact rare-intent actor without copying corpus tensors."""
+    """Index rare-intent actors whose semantic factors are actually labelled.
+
+    A teacher row may name a rare intent while supervising none of the factors
+    this lane imitates, which is routine for factor-masked TI rows.  Admitting
+    such an actor would clone a fabricated structure type or controller pointer,
+    so require exactly what :data:`RARE_INTENT_REQUIRED_FACTORS` names.
+    """
     intent_ids = {name: INTENT_TYPES.index(name) for name in RARE_ACTOR_INTENTS}
     refs = {name: [] for name in RARE_ACTOR_INTENTS}
     for sample_index, sample in enumerate(replay):
@@ -2383,10 +1893,13 @@ def _rare_intent_actor_refs(
                 f"{tuple(types.shape)}"
             )
         chosen = types[0, :, 0]
+        eligible = sample.eligible[0]
         for name, intent_id in intent_ids.items():
+            required = list(RARE_INTENT_REQUIRED_FACTORS[name])
             refs[name].extend(
                 (sample_index, int(actor_index))
                 for actor_index in (chosen == intent_id).nonzero().flatten().tolist()
+                if bool(eligible[actor_index, required].all())
             )
     return refs
 
@@ -2401,16 +1914,12 @@ def _ti_rare_intent_samples(
     harvest ticks.  Only rows carrying every semantic factor required by the
     rare objective are admitted here.
     """
-    required = {
-        "createConstructionSite": (0, 4),
-        "claimController": (0, 2),
-    }
     samples: list[LifecycleSample] = []
     refs = {name: [] for name in RARE_ACTOR_INTENTS}
     for row_index, row in enumerate(rows):
         types = row["action"]["types"][0, :, 0]
         eligible = row["eligible"][0]
-        for name, factors in required.items():
+        for name, factors in RARE_INTENT_REQUIRED_FACTORS.items():
             intent_id = INTENT_TYPES.index(name)
             candidates = torch.nonzero(types == intent_id, as_tuple=False).flatten()
             for actor_tensor in candidates:
@@ -2424,6 +1933,7 @@ def _ti_rare_intent_samples(
                     env_index=0,
                     obs=row["obs"],
                     action=row["action"],
+                    eligible=row["eligible"],
                 ))
                 refs[name].append((sample_index, actor_index))
     return samples, refs
@@ -2450,12 +1960,28 @@ def _rare_actor_batch(
             room_cap=room_cap, actions=True,
         ).items()
     }
+    # No eligibility here: callers that supervise masked teacher factors narrow
+    # the mask themselves through _rare_eligible_batch.
     actor_indices = torch.tensor(
         [actor_index for _sample_index, actor_index in selected],
         dtype=torch.long,
         device=device,
     )
     return obs_device, action_device, actor_indices
+
+
+def _rare_eligible_batch(
+    replay: list[LifecycleSample],
+    selected: list[tuple[int, int]],
+    *,
+    actor_cap: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Batch the rare lane's teacher masks at its already padded actor cap."""
+    return _pad_eligible_masks(
+        [replay[sample_index].eligible for sample_index, _actor_index in selected],
+        actor_cap=actor_cap,
+    ).to(device)
 
 
 def _action_factor_values(action) -> torch.Tensor:
@@ -2498,16 +2024,17 @@ def _rare_intent_factor_mask(
 ) -> torch.Tensor:
     """Select the semantic factors worth imitating for a rare intent.
 
-    Construction placement is deliberately learned downstream: the teacher's
-    deterministic anchor stamp is one legal layout, not an optimal target. BC
-    teaches the room actor to create the requested structure type, while the
-    authoritative mask and realized economy judge its tile. Claim examples
-    retain their exact controller pointer.
+    A construction demonstration is a structure type at a position, and cloning
+    only the type teaches half of it. Construction is rare enough (a few hundred
+    rows against tens of thousands) that the main corpus mean cannot carry the
+    placement on its own, so the rare lane imitates the teacher's tile exactly.
+    Claim examples retain their exact controller pointer.
     """
     selected = torch.zeros_like(factor_active)
     selected[..., 0] = factor_active[..., 0]
     if intent == "createConstructionSite":
         selected[..., 4] = factor_active[..., 4]
+        selected[..., 5] = factor_active[..., 5]
     elif intent == "claimController":
         selected[..., 2] = factor_active[..., 2]
     else:
@@ -2561,13 +2088,19 @@ def _rare_intent_batch_loss(
     obs_device, action_device, actor_indices = _rare_actor_batch(
         replay, selected, device=device,
     )
+    eligible_device = _rare_eligible_batch(
+        replay, selected, actor_cap=action_device["types"].shape[1], device=device,
+    )
     row = torch.arange(len(selected), device=device)
     with (
         torch.autocast("cuda", dtype=torch.bfloat16)
         if use_bf16 else nullcontext()
     ):
         out = actor(obs_device, action=action_device)
-        active = out.factor_active[row, actor_indices]
+        active = (
+            out.factor_active[row, actor_indices]
+            & eligible_device[row, actor_indices]
+        )
         selected_factors = torch.stack([
             _rare_intent_factor_mask(name, active[index])
             for index, (name, _sample_index, _actor_index)
@@ -2650,10 +2183,16 @@ def _evaluate_rare_intent_actors(
             obs_device, action_device, actor_indices = _rare_actor_batch(
                 replay, selected, device=device,
             )
+            eligible_device = _rare_eligible_batch(
+                replay, selected,
+                actor_cap=action_device["types"].shape[1], device=device,
+            )
             row = torch.arange(len(selected), device=device)
             teacher = actor(obs_device, action=action_device)
             selected_active = _rare_intent_factor_mask(
-                name, teacher.factor_active[row, actor_indices],
+                name,
+                teacher.factor_active[row, actor_indices]
+                & eligible_device[row, actor_indices],
             )
             _nll, legal, per_actor = _actor_balanced_factor_nll(
                 teacher.factor_logprob[row, actor_indices], selected_active,
@@ -2687,205 +2226,6 @@ def _evaluate_rare_intent_actors(
         })
     actor.train()
     return metrics
-
-
-def _dagger_factor_mask(intent: str, factor_active: torch.Tensor) -> torch.Tensor:
-    """Select authoritative semantic factors, excluding set-valued targets."""
-    if intent == "createConstructionSite":
-        return _rare_intent_factor_mask(intent, factor_active)
-    if intent == "build":
-        # The scripted planner chooses the first packed buildable site, while
-        # every buildable site is behaviorally equivalent for this correction.
-        # Supervise the decision to build; the actor's target mask still makes
-        # its independently selected target structurally legal.
-        selected = torch.zeros_like(factor_active)
-        selected[..., 0] = factor_active[..., 0]
-        if bool((selected.sum(dim=-1) <= 0).any()):
-            raise RuntimeError("DAgger build actor has no active intent factor")
-        return selected
-    return factor_active
-
-
-@torch.inference_mode()
-def _evaluate_dagger_actor(
-    actor: Actor,
-    replay: list[DaggerSample],
-    *,
-    device: torch.device,
-    minibatch: int,
-) -> dict[str, float]:
-    """Score final semantic exactness on learned-policy occupancy labels."""
-    if not replay:
-        return {
-            "nll": float("nan"), "legal_frac": 0.0,
-            "accuracy": float("nan"), "min_intent_accuracy": float("nan"),
-        }
-    actor.eval()
-    nll_sum = 0.0
-    legal_sum = 0.0
-    actor_count = 0
-    exact_by_intent: dict[str, list[int]] = {}
-    for start in range(0, len(replay), max(1, minibatch)):
-        selected_samples = replay[start : start + max(1, minibatch)]
-        selected = [
-            (start + index, sample.actor_index)
-            for index, sample in enumerate(selected_samples)
-        ]
-        obs_device, action_device, actor_indices = _rare_actor_batch(
-            replay, selected, device=device,
-        )
-        row = torch.arange(len(selected), device=device)
-        out = actor(obs_device, action=action_device)
-        deterministic = actor(obs_device, deterministic=True)
-        active = out.factor_active[row, actor_indices]
-        chosen_types = action_device["types"][row, actor_indices, 0]
-        intent_names = [INTENT_TYPES[int(index)] for index in chosen_types.tolist()]
-        selected_factors = torch.stack([
-            _dagger_factor_mask(name, active[index])
-            for index, name in enumerate(intent_names)
-        ])
-        _nll, legal, per_actor = _actor_balanced_factor_nll(
-            out.factor_logprob[row, actor_indices], selected_factors,
-        )
-        teacher_values = _action_factor_values(action_device)[row, actor_indices]
-        predicted_values = _action_factor_values(deterministic)[row, actor_indices]
-        exact = torch.where(
-            selected_factors,
-            teacher_values == predicted_values,
-            torch.ones_like(selected_factors),
-        ).all(dim=-1)
-        for name, is_exact in zip(intent_names, exact.tolist(), strict=True):
-            correct, count = exact_by_intent.setdefault(name, [0, 0])
-            exact_by_intent[name] = [correct + int(is_exact), count + 1]
-        nll_sum += float(per_actor.sum())
-        legal_sum += float(legal) * len(selected)
-        actor_count += len(selected)
-    metrics = {
-        "nll": nll_sum / max(1, actor_count),
-        "legal_frac": legal_sum / max(1, actor_count),
-        "accuracy": sum(
-            correct for correct, _count in exact_by_intent.values()
-        ) / max(1, actor_count),
-        "min_intent_accuracy": min(
-            (correct / count for correct, count in exact_by_intent.values()),
-            default=float("nan"),
-        ),
-    }
-    for name, (correct, count) in exact_by_intent.items():
-        metrics[f"intent_{name}_count"] = float(count)
-        metrics[f"intent_{name}_accuracy"] = correct / count
-    actor.train()
-    return metrics
-
-
-def _dagger_actor_batches(
-    replay: list[DaggerSample],
-    *,
-    minibatch: int,
-    shuffle_generator: torch.Generator,
-) -> list[list[int]]:
-    """Build one exact semantic-stratum-balanced DAgger epoch."""
-    if not replay:
-        return []
-    by_stratum: dict[str, list[int]] = {}
-    for index, sample in enumerate(replay):
-        by_stratum.setdefault(sample.stratum, []).append(index)
-    largest = max(len(indices) for indices in by_stratum.values())
-    balanced: list[int] = []
-    for indices in by_stratum.values():
-        repeats, remainder = divmod(largest, len(indices))
-        balanced.extend(indices * repeats)
-        if remainder:
-            choices = torch.randperm(
-                len(indices), generator=shuffle_generator,
-            )[:remainder].tolist()
-            balanced.extend(indices[index] for index in choices)
-    order = torch.tensor(balanced, dtype=torch.long)
-    order = order[torch.randperm(order.numel(), generator=shuffle_generator)]
-    width = max(1, int(minibatch))
-    return [
-        order[start : start + width].tolist()
-        for start in range(0, order.numel(), width)
-    ]
-
-
-def _dagger_actor_batch_loss(
-    actor: Actor,
-    replay: list[DaggerSample],
-    selected_indices: list[int],
-    *,
-    device: torch.device,
-    use_bf16: bool,
-) -> tuple[torch.Tensor, float, torch.Tensor]:
-    selected = [(index, replay[index].actor_index) for index in selected_indices]
-    obs_device, action_device, actor_indices = _rare_actor_batch(
-        replay, selected, device=device,
-    )
-    row = torch.arange(len(selected), device=device)
-    with (
-        torch.autocast("cuda", dtype=torch.bfloat16)
-        if use_bf16 else nullcontext()
-    ):
-        out = actor(obs_device, action=action_device)
-        active = out.factor_active[row, actor_indices]
-        chosen_types = action_device["types"][row, actor_indices, 0]
-        intent_names = [INTENT_TYPES[int(index)] for index in chosen_types.tolist()]
-        selected_factors = torch.stack([
-            _dagger_factor_mask(name, active[index])
-            for index, name in enumerate(intent_names)
-        ])
-        nll, legal, per_actor = _actor_balanced_factor_nll(
-            out.factor_logprob[row, actor_indices], selected_factors,
-        )
-    if not torch.isfinite(nll):
-        raise FloatingPointError(f"non-finite DAgger actor loss {nll}")
-    return nll, legal, per_actor
-
-
-def _train_dagger_actor_epoch(
-    actor: Actor,
-    optimizer: torch.optim.Optimizer,
-    replay: list[DaggerSample],
-    *,
-    device: torch.device,
-    use_bf16: bool,
-    minibatch: int,
-    shuffle_generator: torch.Generator,
-) -> tuple[float, float, dict[str, float]]:
-    """One semantic-stratum-balanced actor epoch over DAgger corrections."""
-    if not replay:
-        return float("nan"), 0.0, _evaluate_dagger_actor(
-            actor, replay, device=device, minibatch=minibatch,
-        )
-    batches_for_epoch = _dagger_actor_batches(
-        replay, minibatch=minibatch, shuffle_generator=shuffle_generator,
-    )
-    actor.train()
-    nll_sum = 0.0
-    legal_sum = 0.0
-    trained = 0
-    for selected_indices in batches_for_epoch:
-        nll, legal, per_actor = _dagger_actor_batch_loss(
-            actor, replay, selected_indices, device=device, use_bf16=use_bf16,
-        )
-        optimizer.zero_grad(set_to_none=True)
-        nll.backward()
-        nn.utils.clip_grad_norm_(
-            actor.parameters(), float(PPO_CFG.get("maxGradNorm", 0.5)),
-            error_if_nonfinite=True,
-        )
-        optimizer.step()
-        nll_sum += float(per_actor.detach().sum())
-        legal_sum += float(legal) * len(selected_indices)
-        trained += len(selected_indices)
-    diagnostics = _evaluate_dagger_actor(
-        actor, replay, device=device, minibatch=minibatch,
-    )
-    return (
-        nll_sum / max(1, trained),
-        legal_sum / max(1, trained),
-        diagnostics,
-    )
 
 
 def _train_critic_replay_epoch(
@@ -3029,13 +2369,9 @@ def _train_ti_actor_replay(
             action_rows, actor_cap=actor_cap, target_cap=target_cap,
             room_cap=room_cap, actions=True,
         )
-        eligible_rows = []
-        for index in selected:
-            eligible = replay[index][2]
-            padded = torch.zeros(1, actor_cap, 6 + 2 * N_BODY_PART, dtype=torch.bool)
-            padded[:, : eligible.shape[1]].copy_(eligible)
-            eligible_rows.append(padded)
-        requested = torch.cat(eligible_rows).to(device)
+        requested = _pad_eligible_masks(
+            [replay[index][2] for index in selected], actor_cap=actor_cap,
+        ).to(device)
         obs_device = promote_obs_device(obs_host, device, non_blocking=False)
         action_device = {key: value.to(device) for key, value in action_host.items()}
         context = (
@@ -3044,10 +2380,13 @@ def _train_ti_actor_replay(
         )
         with context:
             out = actor(obs_device, action=action_device)
+            # An inactive factor's logprob is a constant zero, so requesting one
+            # would silently dilute the mean instead of supervising anything.
+            eligible = _supervised_factor_mask(requested, out.factor_active)
             nll, fraction = safe_bc_nll(
-                out.factor_logprob, requested, strict=True,
+                out.factor_logprob, eligible, strict=True,
             )
-        if not bool(requested.any()):
+        if not bool(eligible.any()):
             continue
         optimizer.zero_grad(set_to_none=True)
         nll.backward()
@@ -3096,22 +2435,17 @@ def _evaluate_ti_actor_replay(
                 room_cap=room_cap, actions=True,
             ).items()
         }
-        requested_rows: list[torch.Tensor] = []
-        for index in selected:
-            eligible = replay[index][2]
-            padded = torch.zeros(
-                1, actor_cap, 6 + 2 * N_BODY_PART, dtype=torch.bool,
-            )
-            padded[:, : eligible.shape[1]].copy_(eligible)
-            requested_rows.append(padded)
-        requested = torch.cat(requested_rows).to(device)
+        requested = _pad_eligible_masks(
+            [replay[index][2] for index in selected], actor_cap=actor_cap,
+        ).to(device)
         if not bool(requested.any()):
             continue
         out = actor(obs_device, action=action_device)
+        eligible = _supervised_factor_mask(requested, out.factor_active)
         nll, legal = safe_bc_nll(
-            out.factor_logprob, requested, strict=True,
+            out.factor_logprob, eligible, strict=True,
         )
-        count = int(requested.sum())
+        count = int(eligible.sum())
         nll_sum += float(nll) * count
         legal_sum += float(legal) * count
         requested_count += count
@@ -3163,6 +2497,36 @@ def _pad_replay_tensors(
         key: torch.cat([padded(key, row[key]) for row in rows], dim=0)
         for key in rows[0]
     }
+
+
+def _pad_eligible_masks(
+    rows: list[torch.Tensor], *, actor_cap: int,
+) -> torch.Tensor:
+    """Batch per-row factor-eligibility masks on the shared replay padding path.
+
+    Masks are ``[1, actors, 6 + 2 * N_BODY_PART]`` bool tensors whose actor axis
+    is compacted per row exactly like that row's observation and action tensors,
+    so they must pad to the same minibatch maximum.  ``actions=True`` pads every
+    key on axis 1, which is why the target/room capacities are irrelevant here.
+    """
+    return _pad_replay_tensors(
+        [{"eligible": row} for row in rows],
+        actor_cap=actor_cap, target_cap=0, room_cap=0, actions=True,
+    )["eligible"]
+
+
+def _supervised_factor_mask(
+    eligible: torch.Tensor, factor_active: torch.Tensor,
+) -> torch.Tensor:
+    """Factors this teacher labelled that this action also actually consumes.
+
+    Row masks are padded to the minibatch's actor cap, while the promoted batch is
+    compacted to a live-actor capacity bucket, which is a prefix of that cap; the
+    model trims the action tensors it is handed exactly the same way.  Trim
+    identically and then AND, so a factor is supervised only where the teacher and
+    the ABI agree.
+    """
+    return eligible[:, : factor_active.shape[1]] & factor_active
 
 
 def _temporal_minibatch(
@@ -3338,9 +2702,7 @@ def _evaluate_nextlat(
 
 
 def _spawn_actor_batches(
-    replay: list[
-        tuple[str, int, dict[str, torch.Tensor], dict[str, torch.Tensor]]
-    ],
+    replay: list[SpawnReplayRow],
     *,
     minibatch: int,
     shuffle_generator: torch.Generator | None,
@@ -3349,7 +2711,7 @@ def _spawn_actor_batches(
     if not replay:
         return []
     by_stratum: dict[str, list[int]] = {}
-    for index, (stratum, _actor_index, _obs, _action) in enumerate(replay):
+    for index, (stratum, *_row) in enumerate(replay):
         by_stratum.setdefault(stratum, []).append(index)
     largest = max(len(indices) for indices in by_stratum.values())
     balanced: list[int] = []
@@ -3384,9 +2746,7 @@ def _spawn_actor_batches(
 
 def _spawn_actor_batch_loss(
     actor: Actor,
-    replay: list[
-        tuple[str, int, dict[str, torch.Tensor], dict[str, torch.Tensor]]
-    ],
+    replay: list[SpawnReplayRow],
     selected: list[int],
     *,
     device: torch.device,
@@ -3406,6 +2766,9 @@ def _spawn_actor_batch_loss(
     )
     obs_device = promote_obs_device(obs_host, device, non_blocking=False)
     action_device = {key: value.to(device) for key, value in action_host.items()}
+    eligible_device = _pad_eligible_masks(
+        [replay[index][4] for index in selected], actor_cap=actor_cap,
+    ).to(device)
     with (
         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         if use_bf16 else nullcontext()
@@ -3417,21 +2780,37 @@ def _spawn_actor_batch_loss(
         )
         row = torch.arange(len(selected), device=device)
         selected_factor_lp = out.factor_logprob[row, selected_actor]
-        selected_factor_active = out.factor_active[row, selected_actor]
-        _raw_nll, fraction = safe_bc_nll(
-            selected_factor_lp, selected_factor_active, strict=True,
+        # Supervise a factor only where this teacher labelled it and the chosen
+        # intent actually consumes it.
+        selected_eligible = (
+            out.factor_active[row, selected_actor]
+            & eligible_device[row, selected_actor]
         )
-        group_losses = [-selected_factor_lp[:, 0].mean()]
+        _raw_nll, fraction = safe_bc_nll(
+            selected_factor_lp, selected_eligible, strict=True,
+        )
+        group_losses: list[torch.Tensor] = []
+        type_eligible = selected_eligible[:, 0]
+        if bool(type_eligible.any()):
+            group_losses.append(-selected_factor_lp[type_eligible, 0].mean())
         chosen_type = action_device["types"][row, selected_actor, 0]
         positive = chosen_type == INTENT_TYPES.index("spawnCreep")
         if bool(positive.any()):
             count_lp = selected_factor_lp[positive, 6 : 6 + N_BODY_PART]
-            group_losses.append(-count_lp.sum(dim=-1).mean())
-            order_active = selected_factor_active[positive, 6 + N_BODY_PART :]
+            count_eligible = selected_eligible[positive, 6 : 6 + N_BODY_PART]
+            group_losses.append(-torch.where(
+                count_eligible, count_lp, torch.zeros_like(count_lp),
+            ).sum(dim=-1).mean())
+            order_eligible = selected_eligible[positive, 6 + N_BODY_PART :]
             order_lp = selected_factor_lp[positive, 6 + N_BODY_PART :]
             group_losses.append(-torch.where(
-                order_active, order_lp, torch.zeros_like(order_lp),
+                order_eligible, order_lp, torch.zeros_like(order_lp),
             ).sum(dim=-1).mean())
+        if not group_losses:
+            raise RuntimeError(
+                "spawn batch supervises no eligible factor; retention keeps only "
+                "rows carrying a labelled body or intent factor"
+            )
         nll = torch.stack(group_losses).mean()
     if not torch.isfinite(nll):
         raise FloatingPointError(f"non-finite spawn actor loss {nll}")
@@ -3441,9 +2820,7 @@ def _spawn_actor_batch_loss(
 def _train_spawn_replay(
     actor: Actor,
     optimizer: torch.optim.Optimizer,
-    replay: list[
-        tuple[str, int, dict[str, torch.Tensor], dict[str, torch.Tensor]]
-    ],
+    replay: list[SpawnReplayRow],
     *,
     device: torch.device,
     use_bf16: bool,
@@ -3580,9 +2957,7 @@ def _train_spawn_replay(
 @torch.inference_mode()
 def _evaluate_spawn_replay(
     actor: Actor,
-    replay: list[
-        tuple[str, int, dict[str, torch.Tensor], dict[str, torch.Tensor]]
-    ],
+    replay: list[SpawnReplayRow],
     *,
     device: torch.device,
     use_bf16: bool,
@@ -3726,29 +3101,6 @@ def _precision_resume_identity(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _actor_supplement_identity(args: argparse.Namespace) -> dict[str, Any]:
-    """Exact immutable supplement identity used by checkpoints and resumes."""
-    return {
-        "actor_supplement_kind": getattr(args, "actor_supplement_kind", None),
-        "actor_supplement_sha256": getattr(args, "actor_supplement_sha256", None),
-        "actor_supplement_schema_version": getattr(
-            args, "actor_supplement_schema_version", None,
-        ),
-        "actor_supplement_schema_sha256": getattr(
-            args, "actor_supplement_schema_sha256", None,
-        ),
-        "actor_supplement_source_sha256": getattr(
-            args, "actor_supplement_source_sha256", None,
-        ),
-        "actor_supplement_collector_sha256": getattr(
-            args, "actor_supplement_collector_sha256", None,
-        ),
-        "actor_supplement_collection_seeds": list(getattr(
-            args, "actor_supplement_collection_seeds", [],
-        )),
-    }
-
-
 def _joint_checkpoint(
     actor: Actor,
     critic: Critic,
@@ -3776,7 +3128,6 @@ def _joint_checkpoint(
     corpus_sha256: str,
     shuffle_generator: torch.Generator,
     rare_shuffle_generator: torch.Generator,
-    correction_shuffle_generator: torch.Generator,
     nextlat_shuffle_generator: torch.Generator,
     spawn_shuffle_generator: torch.Generator,
     nextlat_metrics: dict[str, float],
@@ -3795,7 +3146,6 @@ def _joint_checkpoint(
         ),
         "shuffle_rng_state": shuffle_generator.get_state(),
         "rare_shuffle_rng_state": rare_shuffle_generator.get_state(),
-        "correction_shuffle_rng_state": correction_shuffle_generator.get_state(),
         "nextlat_shuffle_rng_state": nextlat_shuffle_generator.get_state(),
         "spawn_shuffle_rng_state": spawn_shuffle_generator.get_state(),
         "meta": artifact_meta(
@@ -3806,12 +3156,6 @@ def _joint_checkpoint(
             partial=bool(partial),
             qualified=False,
             corpus_sha256=str(corpus_sha256),
-            dagger_corpus_sha256=getattr(args, "dagger_corpus_sha256", None),
-            dagger_corpus_schema_sha256=getattr(
-                args, "dagger_corpus_schema_sha256", None,
-            ),
-            **_actor_supplement_identity(args),
-            min_dagger_accuracy=args.min_dagger_accuracy,
             corpus_schema_sha256=getattr(args, "corpus_schema_sha256", None),
             corpus_collection_source_sha256=getattr(
                 args, "corpus_collection_source_sha256", None,
@@ -3861,7 +3205,6 @@ def _joint_checkpoint(
             actor_auxiliary_schedule=ACTOR_AUXILIARY_SCHEDULE,
             ti_bot_dir=getattr(args, "ti_bot_dir", None),
             ti_bot_source_sha256=getattr(args, "ti_bot_source_sha256", None),
-            validation_steps=args.validation_steps,
             holdout_seed_offset=args.holdout_seed_offset,
             closed_loop_steps=args.closed_loop_steps,
             evaluation_seed_offset=args.evaluation_seed_offset,
@@ -3870,7 +3213,7 @@ def _joint_checkpoint(
             rare_actor_intents=list(RARE_ACTOR_INTENTS),
             rare_actor_objective=(
                 "intent_balanced_actor_mean_semantic_factor_nll;"
-                "construction=intent+structure_type;claim=intent+target"
+                "construction=intent+structure_type+tile;claim=intent+target"
             ),
             max_rare_intent_nll=args.max_rare_intent_nll,
             min_rare_intent_accuracy=args.min_rare_intent_accuracy,
@@ -3932,35 +3275,14 @@ def _rare_intent_replay_qualified(
     )
 
 
-def _correction_source_qualified(
-    corpus_hist: dict[str, float],
-    *,
-    prefix: str,
-    artifact_sha256: str | None,
-    min_accuracy: float,
-) -> bool:
-    """Qualify one optional correction authority without conflating sources."""
-    if artifact_sha256 is None:
-        return True
-    return (
-        float(corpus_hist.get(f"_{prefix}_actor_rows", 0.0)) > 0
-        and float(corpus_hist.get(f"_{prefix}_actor_legal_frac", 0.0)) == 1.0
-        and np.isfinite(float(corpus_hist.get(
-            f"_{prefix}_actor_nll", float("nan"),
-        )))
-        and float(corpus_hist.get(f"_{prefix}_accuracy", 0.0)) >= min_accuracy
-        and float(corpus_hist.get(
-            f"_{prefix}_min_intent_accuracy", 0.0,
-        )) >= min_accuracy
-    )
+def _auxiliary_schedule_qualified(validation: dict[str, float]) -> bool:
+    """Validate persisted exact fused-lane geometry and collision-free capacity.
 
-
-def _auxiliary_schedule_qualified(
-    validation: dict[str, float], *, required: bool,
-) -> bool:
-    """Validate persisted exact fused-lane geometry and collision-free capacity."""
+    Every joint epoch persists this geometry, so an artifact that lacks it was
+    not produced by the fused schedule and cannot be qualified against it.
+    """
     prefix = "nextlat_train_"
-    names = ("correction", "rare", "spawn")
+    names = ("rare", "spawn")
     required_keys = {
         f"{prefix}optimizer_steps", f"{prefix}auxiliary_batches",
         f"{prefix}auxiliary_minibatch",
@@ -3968,7 +3290,7 @@ def _auxiliary_schedule_qualified(
         *(f"{prefix}{name}_exposures" for name in names),
     }
     if not required_keys.issubset(validation):
-        return not required
+        return False
     values = {key: float(validation[key]) for key in required_keys}
     if not all(np.isfinite(value) and value >= 0 and value.is_integer()
                for value in values.values()):
@@ -4009,23 +3331,13 @@ def _qualification_failures(
     total_claims: int,
     max_creeps: int,
     teacher_by_curriculum: dict[str, dict[str, float]],
+    teacher_spawn_bodies: dict[str, dict[str, Any]],
     validation: dict[str, float],
     closed_loop: dict[str, object],
 ) -> list[str]:
     empty_teacher = teacher_by_curriculum.get("empty", {})
     outpost_teacher = teacher_by_curriculum.get("seed_outpost", {})
-    teacher_invalid = sum(
-        float(metrics.get("invalid", 0))
-        for metrics in teacher_by_curriculum.values()
-    )
-    teacher_spawn_totals = {
-        key: sum(float(metrics.get(key, 0.0)) for metrics in teacher_by_curriculum.values())
-        for key in (
-            "spawn_labels", "spawn_budget_le_300", "spawn_budget_301_549",
-            "spawn_budget_550_649", "spawn_budget_ge_650",
-            "spawn_length_le_6", "spawn_length_7_15", "spawn_length_ge_16",
-        )
-    }
+    teacher_spawn_coverage = _teacher_spawn_coverage(teacher_by_curriculum)
 
     def relative_improvement(value: str, baseline: str) -> bool:
         learned = float(validation.get(value, float("nan")))
@@ -4090,42 +3402,24 @@ def _qualification_failures(
         for metrics in outpost_envs
     )
     outpost_success_rate = outpost_successes / max(1, len(outpost_envs))
-    spawn_validation_ok = all(
-        float(validation.get(f"validation_{stage}_labels", 0.0)) > 0
-        and float(validation.get(f"validation_{stage}_success", 0.0))
-        == float(validation.get(f"validation_{stage}_labels", 0.0))
-        and np.isfinite(float(validation.get(f"validation_{stage}_nll", float("nan"))))
-        and float(validation.get(f"validation_{stage}_nll", float("inf")))
-        <= args.max_spawn_validation_nll
-        for stage in SPAWN_CURRICULA
-    )
-    move, work, carry, claim = (0, 1, 2, 6)
-    expected_spawn = {
-        "spawn_flexible_300": [work, carry, move],
-        "spawn_miner_450": [work] * 4 + [move],
-        "spawn_hauler_3000": [carry, move] * 25,
-        "spawn_builder_650": [work, carry, carry, move, move] * 2,
-        "spawn_upgrader_550": [work, work, carry, move, work, work, carry],
-        "spawn_claimer_650": [claim, move],
-    }
-    for stage, parts in expected_spawn.items():
-        counts, order, _order_exact = _parts_to_count_order(parts)
-        expected_spawn[stage] = [
-            int(part)
-            for part in order.tolist()
-            for _ in range(int(counts[part]))
-        ]
-    closed_spawn_ok = all(
+    # What the spawn worlds evaluate is "does the policy choose the teacher's
+    # body in this world", so the reference is the body The International was
+    # measured choosing there, read from the corpus rows it was labelled into.
+    # The policy is probed over a window that reaches the teacher's own decision
+    # tick, and its first body in that window is the decision under test; later
+    # bodies are spawned into an economy the teacher never demonstrated and
+    # therefore have no measured reference at all.
+    closed_spawn_ok = (
         isinstance(closed_loop_stages, dict)
-        and float(closed_loop_stages.get(stage, {}).get("spawn_success", 0.0)) > 0
-        and closed_loop_stages.get(stage, {}).get("spawn_body_parts", [])
-        == expected_spawn[stage]
-        and bool(closed_loop_stages.get(stage, {}).get("spawn_body_parts_all", []))
+        and set(teacher_spawn_bodies) == set(SPAWN_CURRICULA)
         and all(
-            body == expected_spawn[stage]
-            for body in closed_loop_stages[stage]["spawn_body_parts_all"]
+            float(closed_loop_stages.get(stage, {}).get("spawn_success", 0.0)) > 0
+            and _spawn_body_matches(
+                closed_loop_stages.get(stage, {}).get("spawn_body_parts"),
+                teacher_spawn_bodies[stage],
+            )
+            for stage in SPAWN_CURRICULA
         )
-        for stage in SPAWN_CURRICULA
     )
     if hasattr(args, "max_aux_lifecycle_nll_ratio"):
         # Production records this immediately before the final fused epoch, so
@@ -4174,11 +3468,15 @@ def _qualification_failures(
                 "_spawn_replay_spawn_min_stratum_body_accuracy", 0.0,
             )) >= args.min_spawn_replay_accuracy
             and all(
-                float(corpus_hist.get(f"_spawn_replay_{stratum}", 0.0)) > 0
-                for stratum in (
-                    "budget_le300", "budget_301_549", "budget_550_649",
-                    "budget_ge650", "length_le6", "length_7_15", "length_ge16",
-                )
+                float(corpus_hist.get(f"_spawn_replay_budget_{bucket}", 0.0)) > 0
+                for bucket in SPAWN_BUDGET_BUCKETS
+            )
+            # Body length is required only where this economy can pay for it;
+            # `_spawn_replay_length_unreached_*` records the rest (see
+            # SPAWN_LENGTH_UNREACHED_BUCKETS).
+            and all(
+                float(corpus_hist.get(f"_spawn_replay_length_{bucket}", 0.0)) > 0
+                for bucket in SPAWN_LENGTH_REQUIRED_BUCKETS
             )
         ),
         "ti_actor_replay": (
@@ -4189,19 +3487,7 @@ def _qualification_failures(
                 and float(corpus_hist.get("_ti_actor_legal_coverage", 0.0)) >= 0.9
             )
         ),
-        "dagger_actor_replay": _correction_source_qualified(
-            corpus_hist, prefix="dagger",
-            artifact_sha256=getattr(args, "dagger_corpus_sha256", None),
-            min_accuracy=float(getattr(args, "min_dagger_accuracy", 0.8)),
-        ),
-        "actor_supplement_replay": _correction_source_qualified(
-            corpus_hist, prefix="actor_supplement",
-            artifact_sha256=getattr(args, "actor_supplement_sha256", None),
-            min_accuracy=float(getattr(args, "min_dagger_accuracy", 0.8)),
-        ),
-        "auxiliary_schedule_capacity": _auxiliary_schedule_qualified(
-            validation, required=hasattr(args, "actor_supplement"),
-        ),
+        "auxiliary_schedule_capacity": _auxiliary_schedule_qualified(validation),
         "scripted_lifecycle_replay": (
             float(corpus_hist.get("_lifecycle_replay_size", 0.0)) > 0
             and float(corpus_hist.get("_lifecycle_holdout_size", 0.0)) > 0
@@ -4217,7 +3503,6 @@ def _qualification_failures(
             f"rare_intent_{intent}": rare_intent_passes(intent)
             for intent in RARE_ACTOR_INTENTS
         },
-        "teacher_engine_legality": teacher_invalid == 0,
         "teacher_skill": skill > 0,
         "teacher_delivery": total_delivered >= args.min_teacher_delivery,
         "teacher_build": total_built >= args.min_teacher_build,
@@ -4227,7 +3512,11 @@ def _qualification_failures(
         # neutral-room remoting have separate observable curricula below; do
         # not conflate ownership expansion with ordinary remote harvesting.
         "empty_teacher_coverage": float(empty_teacher.get("transitions", 0)) > 0,
-        "empty_teacher_engine_legality": float(empty_teacher.get("invalid", 0)) == 0,
+        # `stepExpert` carries no intent summary, so teacher engine legality is
+        # not measurable from the expert wire: it is asserted at collection time
+        # instead (the labeller validates every factor against that tick's
+        # candidate masks, and the spawn contract requires the engine to have
+        # executed each labelled body).
         "empty_teacher_skill": float(empty_teacher.get("skill", 0)) > 0,
         "empty_teacher_delivery": (
             float(empty_teacher.get("delivery", 0)) >= args.min_teacher_delivery
@@ -4256,28 +3545,31 @@ def _qualification_failures(
             and float(outpost_teacher.get("remote_owned_peak", 0)) == 0
             and float(outpost_teacher.get("neutral_outposts", 0)) >= 1
         ),
-        "outpost_teacher_engine_legality": (
-            float(outpost_teacher.get("invalid", 0)) == 0
-        ),
         # Dedicated spawn scenarios broaden body supervision, while the empty
         # gates above still independently require an economy-funded expansion.
+        # Every count below is measured from the teacher's own labelled bodies.
+        # Energy-budget breadth is required outright; body-length breadth is
+        # required for the buckets this economy can fund, and the unreached ones
+        # are recorded in the checkpoint as a named coverage gap.
         "teacher_spawn_body_coverage": (
-            teacher_spawn_totals["spawn_labels"] >= len(SPAWN_CURRICULA)
+            teacher_spawn_coverage["teacher_spawn_labels"] >= len(SPAWN_CURRICULA)
             and all(
-                teacher_spawn_totals[key] > 0
-                for key in (
-                    "spawn_budget_le_300", "spawn_budget_301_549",
-                    "spawn_budget_550_649", "spawn_budget_ge_650",
-                    "spawn_length_le_6", "spawn_length_7_15", "spawn_length_ge_16",
-                )
+                teacher_spawn_coverage[f"teacher_spawn_budget_{bucket}"] > 0
+                for bucket in SPAWN_BUDGET_BUCKETS
+            )
+            and all(
+                teacher_spawn_coverage[f"teacher_spawn_length_{bucket}"] > 0
+                for bucket in SPAWN_LENGTH_REQUIRED_BUCKETS
             )
         ),
+        # Sourced from the TI factor-row evaluation of the final actor; the
+        # per-stage spawn body evidence now lives in `spawn_replay_semantics`
+        # (corpus rows) and `closed_loop_spawn_scenarios` (engine execution).
         "validation_actor_loss": np.isfinite(validation["validation_factor_nll"]),
         "validation_critic_loss": np.isfinite(
             validation["lifecycle_holdout_value_loss"]
         ),
         "validation_legality": validation["validation_legal_frac"] == 1.0,
-        "validation_spawn_scenarios": spawn_validation_ok,
         "nextlat_actor_beats_identity": (
             relative_improvement(
                 "nextlat_holdout_actor_mse",
@@ -4433,88 +3725,6 @@ def main() -> int:
     meta = corpus["meta"]
     data = corpus["data"]
     corpus_sha256 = str(corpus["integrity"]["corpus_sha256"])
-    dagger_corpus: dict[str, Any] | None = None
-    dagger_corpus_sha256: str | None = None
-    dagger_collection_seeds: set[int] = set()
-    if args.dagger_corpus is not None:
-        try:
-            from samples.rl.agent.dagger_corpus import load_dagger_corpus
-        except ImportError:
-            from agent.dagger_corpus import load_dagger_corpus
-        try:
-            dagger_corpus = load_dagger_corpus(
-                args.dagger_corpus,
-                verify_source=False,
-                expected_base_corpus_id=corpus_sha256,
-            )
-        except (OSError, RuntimeError, ValueError) as error:
-            raise SystemExit(
-                f"[joint] invalid DAgger corpus {args.dagger_corpus}: {error}"
-            ) from error
-        dagger_corpus_sha256 = str(
-            dagger_corpus["integrity"]["corpus_sha256"]
-        )
-        args.dagger_corpus_sha256 = dagger_corpus_sha256
-        args.dagger_corpus_schema_sha256 = dagger_corpus.get(
-            "corpus_schema_sha256"
-        )
-        dagger_collection_seeds = {
-            int(entry["seed"]) for entry in dagger_corpus["meta"]["env_map"]
-        }
-    else:
-        args.dagger_corpus_sha256 = None
-        args.dagger_corpus_schema_sha256 = None
-    actor_supplement: dict[str, Any] | None = None
-    supplement_collection_seeds: set[int] = set()
-    if args.actor_supplement is not None:
-        try:
-            from samples.rl.agent.outpost_actor_corpus import (
-                load_outpost_actor_corpus,
-            )
-        except ImportError:
-            from agent.outpost_actor_corpus import load_outpost_actor_corpus
-        try:
-            actor_supplement = load_outpost_actor_corpus(
-                args.actor_supplement,
-                verify_hashes=True,
-                verify_source=True,
-                expected_base_corpus_id=corpus_sha256,
-            )
-        except (OSError, RuntimeError, ValueError) as error:
-            raise SystemExit(
-                f"[joint] invalid actor supplement {args.actor_supplement}: {error}"
-            ) from error
-        supplement_meta = actor_supplement["meta"]
-        supplement_collection_seeds = {
-            int(entry["seed"]) for entry in supplement_meta["env_map"]
-        }
-        args.actor_supplement_kind = str(actor_supplement["kind"])
-        args.actor_supplement_sha256 = str(
-            actor_supplement["integrity"]["corpus_sha256"]
-        )
-        args.actor_supplement_schema_version = int(
-            actor_supplement["corpus_schema_version"]
-        )
-        args.actor_supplement_schema_sha256 = str(
-            actor_supplement["corpus_schema_sha256"]
-        )
-        args.actor_supplement_source_sha256 = str(
-            supplement_meta["collection_source_sha256"]
-        )
-        args.actor_supplement_collector_sha256 = str(
-            supplement_meta["collector_source_sha256"]
-        )
-        args.actor_supplement_collection_seeds = sorted(
-            supplement_collection_seeds
-        )
-    else:
-        args.actor_supplement_kind = None
-        args.actor_supplement_sha256 = None
-        args.actor_supplement_schema_version = None
-        args.actor_supplement_schema_sha256 = None
-        args.actor_supplement_source_sha256 = None
-        args.actor_supplement_collector_sha256 = None
-        args.actor_supplement_collection_seeds = []
     # The immutable corpus is an offline dataset, not executable code. Its
     # content hash, tensor/action schema, returns, and collection provenance are
     # validated by load_corpus; later collector refactors must not invalidate
@@ -4549,8 +3759,6 @@ def main() -> int:
     args.ti_bot_source_sha256 = meta.get("ti_bot_source_sha256")
     args.chunk = 0
 
-    if args.validation_steps >= args.max_episode:
-        raise SystemExit("[joint] validation-steps must be shorter than corpus max-episode")
     if args.global_epochs <= 0:
         raise SystemExit("[joint] global-epochs must be positive")
     if args.ti_critic_pretrain_epochs < 0:
@@ -4579,35 +3787,11 @@ def main() -> int:
         raise SystemExit("[joint] min-rare-intent-rows must be positive")
     if not 0.0 <= args.min_spawn_replay_accuracy <= 1.0:
         raise SystemExit("[joint] min-spawn-replay-accuracy must be in [0, 1]")
-    if not 0.0 <= args.min_dagger_accuracy <= 1.0:
-        raise SystemExit("[joint] min-dagger-accuracy must be in [0, 1]")
     if not 0.0 <= args.min_rare_intent_accuracy <= 1.0:
         raise SystemExit("[joint] min-rare-intent-accuracy must be in [0, 1]")
-    correction_seed_conflicts = _correction_seed_conflicts(
-        meta, dagger_seeds=dagger_collection_seeds,
-        supplement_seeds=supplement_collection_seeds,
-        evaluation_offset=args.evaluation_seed_offset,
-        num_envs=args.num_envs,
+    overlapping_evaluation_seeds = _evaluation_seed_overlap(
+        meta, offset=args.evaluation_seed_offset, num_envs=args.num_envs,
     )
-    overlapping_dagger_seeds = correction_seed_conflicts["dagger_base"]
-    if overlapping_dagger_seeds:
-        raise SystemExit(
-            "[joint] DAgger seeds overlap base train/holdout worlds: "
-            f"{sorted(overlapping_dagger_seeds)}"
-        )
-    overlapping_supplement_seeds = correction_seed_conflicts["supplement_base"]
-    if overlapping_supplement_seeds:
-        raise SystemExit(
-            "[joint] actor supplement seeds overlap base train/holdout worlds: "
-            f"{sorted(overlapping_supplement_seeds)}"
-        )
-    overlapping_correction_seeds = correction_seed_conflicts["dagger_supplement"]
-    if overlapping_correction_seeds:
-        raise SystemExit(
-            "[joint] DAgger and actor supplement collection seeds overlap: "
-            f"{sorted(overlapping_correction_seeds)}"
-        )
-    overlapping_evaluation_seeds = correction_seed_conflicts["evaluation"]
     if overlapping_evaluation_seeds:
         raise SystemExit(
             "[joint] evaluation seeds overlap collected train/holdout worlds: "
@@ -4657,33 +3841,16 @@ def main() -> int:
     returns_tn = train_split["returns_tn"]
     holdout_returns_tn = holdout_split["returns_tn"]
     spawn_replay = [
-        (str(row["stratum"]), int(row["actor_index"]), row["obs"], row["action"])
+        (
+            str(row["stratum"]), int(row["actor_index"]), row["obs"], row["action"],
+            row["eligible"],
+        )
         for row in data["spawn_replay"]
     ]
-    dagger_rows, dagger_actor_replay, dagger_spawn_replay = (
-        _route_correction_rows(
-            dagger_corpus["data"]["rows"] if dagger_corpus is not None else [],
-            source="dagger",
-        )
-    )
-    supplement_rows, supplement_actor_replay, supplement_spawn_replay = (
-        _route_correction_rows(
-            actor_supplement["data"]["rows"]
-            if actor_supplement is not None else [],
-            source="actor_supplement",
-        )
-    )
-    correction_actor_replay = [
-        *dagger_actor_replay,
-        *supplement_actor_replay,
-    ]
-    spawn_replay.extend(dagger_spawn_replay)
-    spawn_replay.extend(supplement_spawn_replay)
     mb = max(8, int(args.minibatch))
     try:
         preflight_geometry = _preflight_joint_geometry(
-            lifecycle_train, correction_actor_replay, rare_train_refs,
-            spawn_replay, minibatch=mb,
+            lifecycle_train, rare_train_refs, spawn_replay, minibatch=mb,
         )
     except ValueError as error:
         raise SystemExit(f"[joint] auxiliary schedule preflight failed: {error}") from error
@@ -4741,8 +3908,6 @@ def main() -> int:
     shuffle_generator.manual_seed(args.seed ^ 0x53485546)
     rare_shuffle_generator = torch.Generator(device="cpu")
     rare_shuffle_generator.manual_seed(args.seed ^ 0x52415245)
-    correction_shuffle_generator = torch.Generator(device="cpu")
-    correction_shuffle_generator.manual_seed(args.seed ^ 0x434F5252)
     nextlat_shuffle_generator = torch.Generator(device="cpu")
     nextlat_shuffle_generator.manual_seed(args.seed ^ 0x4E455854)
     spawn_shuffle_generator = torch.Generator(device="cpu")
@@ -4804,8 +3969,6 @@ def main() -> int:
             raise SystemExit(f"[joint] incompatible resume: {error}") from error
         continuation = {
             "corpus_sha256": corpus_sha256,
-            "dagger_corpus_sha256": dagger_corpus_sha256,
-            **_actor_supplement_identity(args),
             "minibatch": args.minibatch,
             "value_coef": args.value_coef,
             "lr_actor": args.lr_actor,
@@ -4819,7 +3982,6 @@ def main() -> int:
             "min_rare_intent_accuracy": args.min_rare_intent_accuracy,
             "min_rare_intent_rows": args.min_rare_intent_rows,
             "min_spawn_replay_accuracy": args.min_spawn_replay_accuracy,
-            "min_dagger_accuracy": args.min_dagger_accuracy,
             "evaluation_seed_offset": args.evaluation_seed_offset,
             "min_outpost_closed_loop_success_rate": (
                 args.min_outpost_closed_loop_success_rate
@@ -4857,10 +4019,6 @@ def main() -> int:
             raise SystemExit(
                 "[joint] continuation lacks dedicated rare-intent shuffle RNG state"
             )
-        if "correction_shuffle_rng_state" not in state:
-            raise SystemExit(
-                "[joint] continuation lacks dedicated correction shuffle RNG state"
-            )
         if "nextlat_shuffle_rng_state" not in state:
             raise SystemExit(
                 "[joint] continuation lacks dedicated NextLat shuffle RNG state"
@@ -4875,9 +4033,6 @@ def main() -> int:
         opt_c.load_state_dict(state["critic_opt"])
         shuffle_generator.set_state(state["shuffle_rng_state"].cpu())
         rare_shuffle_generator.set_state(state["rare_shuffle_rng_state"].cpu())
-        correction_shuffle_generator.set_state(
-            state["correction_shuffle_rng_state"].cpu()
-        )
         nextlat_shuffle_generator.set_state(state["nextlat_shuffle_rng_state"].cpu())
         spawn_shuffle_generator.set_state(state["spawn_shuffle_rng_state"].cpu())
         if state.get("torch_rng_state") is not None:
@@ -4921,10 +4076,6 @@ def main() -> int:
         f"scripted_train={len(lifecycle_train)} scripted_holdout={len(lifecycle_holdout)} "
         f"ti_factors={len(ti_actor_replay)} ti_critic_train={len(ti_critic_train)} "
         f"ti_critic_holdout={len(ti_critic_holdout)} "
-        f"dagger={len(dagger_actor_replay)} dagger_id={dagger_corpus_sha256} "
-        f"supplement_rows={len(supplement_rows)} "
-        f"supplement_exact={len(supplement_actor_replay)} "
-        f"supplement_id={args.actor_supplement_sha256} "
         f"rare_train={{{', '.join(f'{name}:{len(rare_train_refs[name])}' for name in RARE_ACTOR_INTENTS)}}} "
         f"rare_holdout={{{', '.join(f'{name}:{len(rare_holdout_refs[name])}' for name in RARE_ACTOR_INTENTS)}}} "
         f"nextlat_train={len(temporal_train)} nextlat_holdout={len(temporal_holdout)} "
@@ -4939,12 +4090,7 @@ def main() -> int:
         corpus_hist.get("_ti_actor_legal_coverage", float("nan"))
     )
     rare_actor_nll = rare_actor_legal = float("nan")
-    correction_actor_nll = correction_actor_legal = float("nan")
-    dagger_actor_nll = dagger_actor_legal = float("nan")
-    supplement_actor_nll = supplement_actor_legal = float("nan")
     spawn_diagnostics: dict[str, float] = {}
-    dagger_diagnostics: dict[str, float] = {}
-    supplement_diagnostics: dict[str, float] = {}
     epoch_nll = epoch_vloss = float("nan")
     ti_critic_loss = float("nan")
     nextlat_metrics: dict[str, float] = {}
@@ -4963,7 +4109,6 @@ def main() -> int:
             wall_s=time.time() - t0, corpus_sha256=corpus_sha256,
             shuffle_generator=shuffle_generator,
             rare_shuffle_generator=rare_shuffle_generator,
-            correction_shuffle_generator=correction_shuffle_generator,
             nextlat_shuffle_generator=nextlat_shuffle_generator,
             spawn_shuffle_generator=spawn_shuffle_generator,
             nextlat_metrics=nextlat_metrics,
@@ -5030,8 +4175,6 @@ def main() -> int:
                 nextlat_actor_coef=args.nextlat_actor_coef,
                 nextlat_critic_coef=args.nextlat_critic_coef,
                 nextlat_critic_kl_coef=args.nextlat_critic_kl_coef,
-                correction_replay=correction_actor_replay,
-                correction_shuffle_generator=correction_shuffle_generator,
                 rare_replay=rare_train_replay,
                 rare_refs_by_intent=rare_train_refs,
                 rare_shuffle_generator=rare_shuffle_generator,
@@ -5042,8 +4185,6 @@ def main() -> int:
                 f"train_{key}": float(value)
                 for key, value in epoch_nextlat.items()
             }
-            correction_actor_nll = float(epoch_nextlat["correction_nll"])
-            correction_actor_legal = float(epoch_nextlat["correction_legal"])
             rare_actor_nll = float(epoch_nextlat["rare_nll"])
             rare_actor_legal = float(epoch_nextlat["rare_legal"])
             spawn_nll = float(epoch_nextlat["spawn_nll"])
@@ -5054,7 +4195,6 @@ def main() -> int:
                 f"[joint] epoch {global_epoch}/{args.global_epochs} nll={epoch_nll:.4f} "
                 f"scripted_vloss={epoch_vloss:.5f} "
                 f"spawn_nll={spawn_nll:.4f} ti_actor_nll={ti_actor_nll:.4f} "
-                f"correction_nll={correction_actor_nll:.4f} "
                 f"rare_actor_nll={rare_actor_nll:.4f} "
                 f"nextlat={epoch_nextlat['actor_smooth_l1']:.4f}/"
                 f"{epoch_nextlat['critic_smooth_l1']:.4f}",
@@ -5069,11 +4209,6 @@ def main() -> int:
                 if final_training_epoch:
                     for name, value in phase_metrics.items():
                         writer.add_scalar(f"joint/{name}", value, global_epoch)
-                if correction_actor_replay:
-                    writer.add_scalar(
-                        "joint/correction_actor_nll", correction_actor_nll,
-                        global_epoch,
-                    )
             if global_epoch < args.global_epochs and (
                 global_epoch == 1 or global_epoch % 4 == 0
             ):
@@ -5134,29 +4269,13 @@ def main() -> int:
             **{
                 f"train_{key}": float(epoch_nextlat[key])
                 for key in (
-                    "optimizer_steps", "correction_exposures", "rare_exposures",
-                    "spawn_exposures", "correction_nll", "correction_legal",
+                    "optimizer_steps", "rare_exposures", "spawn_exposures",
                     "rare_nll", "rare_legal", "spawn_nll", "spawn_legal",
-                    "correction_batches", "rare_batches", "spawn_batches",
+                    "rare_batches", "spawn_batches",
                     "auxiliary_batches", "auxiliary_minibatch",
                 )
             },
         }
-        # Score each correction authority independently on the final actor.
-        if dagger_rows:
-            dagger_diagnostics = _evaluate_dagger_actor(
-                actor, dagger_rows, device=device, minibatch=mb,
-            )
-            dagger_actor_nll = float(dagger_diagnostics["nll"])
-            dagger_actor_legal = float(dagger_diagnostics["legal_frac"])
-        if supplement_rows:
-            supplement_diagnostics = _evaluate_dagger_actor(
-                actor, supplement_rows, device=device, minibatch=mb,
-            )
-            supplement_actor_nll = float(supplement_diagnostics["nll"])
-            supplement_actor_legal = float(
-                supplement_diagnostics["legal_frac"]
-            )
         spawn_diagnostics = _evaluate_spawn_replay(
             actor, spawn_replay, device=device, use_bf16=use_bf16,
             minibatch=mb,
@@ -5181,14 +4300,6 @@ def main() -> int:
             "_ti_actor_legal_coverage": float(ti_actor_coverage),
             "_rare_actor_train_nll": float(rare_actor_nll),
             "_rare_actor_train_legal_frac": float(rare_actor_legal),
-            "_dagger_actor_rows": float(len(dagger_rows)),
-            "_dagger_actor_nll": float(dagger_actor_nll),
-            "_dagger_actor_legal_frac": float(dagger_actor_legal),
-            "_actor_supplement_actor_rows": float(len(supplement_rows)),
-            "_actor_supplement_actor_nll": float(supplement_actor_nll),
-            "_actor_supplement_actor_legal_frac": float(
-                supplement_actor_legal
-            ),
             "_lifecycle_replay_nll": float(lifecycle_train_metrics["nll"]),
             "_lifecycle_replay_legal_frac": lifecycle_train_metrics["legal_frac"],
             "_lifecycle_replay_size": float(len(lifecycle_train)),
@@ -5197,10 +4308,6 @@ def main() -> int:
         })
         for name, value in spawn_diagnostics.items():
             corpus_hist[f"_spawn_replay_{name}"] = float(value)
-        for name, value in dagger_diagnostics.items():
-            corpus_hist[f"_dagger_{name}"] = float(value)
-        for name, value in supplement_diagnostics.items():
-            corpus_hist[f"_actor_supplement_{name}"] = float(value)
         lifecycle_strata = [sample.stratum for sample in lifecycle_train]
         for category in ("spawn", "harvest", "logistics", "construction", "control"):
             corpus_hist[f"_lifecycle_replay_{category}"] = float(sum(
@@ -5213,8 +4320,16 @@ def main() -> int:
             s.startswith("waitlegal:") for s in all_spawn_strata
         ))
         corpus_hist["_spawn_replay_wait_legal_strata"] = float(len(wait_strata))
-        for name, count in _spawn_replay_coverage(spawn_replay).items():
+        spawn_coverage = _spawn_replay_coverage(spawn_replay)
+        for name, count in spawn_coverage.items():
             corpus_hist[f"_spawn_replay_{name}"] = count
+        corpus_hist.update(_spawn_length_coverage_gap(
+            {
+                bucket: spawn_coverage[f"length_{bucket}"]
+                for bucket in SPAWN_LENGTH_BUCKETS
+            },
+            "_spawn_replay",
+        ))
 
         evaluation_seed = int(meta["seed"]) + args.evaluation_seed_offset
         validation_curricula = [
@@ -5222,30 +4337,50 @@ def main() -> int:
         ]
         if "seed_outpost" not in validation_curricula:
             validation_curricula.append("seed_outpost")
+        teacher_spawn_bodies = _teacher_contract_bodies(spawn_replay)
+        missing_contracts = sorted(set(SPAWN_CURRICULA) - set(teacher_spawn_bodies))
+        if missing_contracts:
+            raise SystemExit(
+                f"[joint] corpus lacks teacher spawn contract rows for {missing_contracts}"
+            )
+        # The policy is probed over a window that reaches the teacher's own
+        # decision tick, because that is the state its supervision came from:
+        # The International does not act on a world's opening ticks, so a
+        # single-tick probe would ask for a decision no row ever demonstrated.
+        contract_ticks = [
+            teacher_by_curriculum.get(stage, {}).get("spawn_label_tick")
+            for stage in SPAWN_CURRICULA
+        ]
+        if any(tick is None for tick in contract_ticks):
+            raise SystemExit(
+                "[joint] corpus spawn contract metrics lack the teacher's "
+                "spawn_label_tick; recollect the corpus with the TI contract collector"
+            )
+        spawn_probe_steps = 1 + max(int(tick) for tick in contract_ticks)
         validation_envs = VecScreepsEnv(
             args.num_envs, node=args.node, room=args.room,
             max_episode=args.max_episode, device=device,
             curriculum=",".join(validation_curricula), lean_meta=False,
             seed=evaluation_seed,
         )
+        # Retained for the closed-loop spawn probe: these worlds certify that the
+        # learned policy itself spawns each contract body in the engine.
         spawn_validation_envs = VecScreepsEnv(
-            len(SPAWN_CURRICULA), node=args.node, room=args.room, max_episode=2,
+            len(SPAWN_CURRICULA), node=args.node, room=args.room,
+            max_episode=spawn_probe_steps + 1,
             device=device, curriculum=",".join(SPAWN_CURRICULA), lean_meta=False,
             seed=evaluation_seed,
         )
         try:
-            validation = _validate_teacher_forced(
-                actor, critic, validation_envs, steps=args.validation_steps,
-                device=device, gamma=args.gamma,
-            )
-            spawn_validation = _validate_teacher_forced(
-                actor, critic, spawn_validation_envs, steps=1,
-                device=device, gamma=args.gamma,
-            )
-            validation.update({
-                key: value for key, value in spawn_validation.items()
-                if key.startswith("validation_spawn_")
-            })
+            # The scripted planner is an evaluation baseline only (see
+            # agent/eval_scripted.py); no scripted quantity may enter a loss or a
+            # qualification gate.  Teacher-forced actor validation is therefore the
+            # TI factor-row measurement on the final actor, which is the same
+            # measurement against the only teacher this pipeline has.
+            validation = {
+                "validation_factor_nll": float(ti_actor_nll),
+                "validation_legal_frac": float(ti_actor_coverage),
+            }
             validation.update({
                 "lifecycle_train_value_ev": float(lifecycle_train_metrics["ev"]),
                 "lifecycle_train_value_loss": float(lifecycle_train_metrics["value_loss"]),
@@ -5279,7 +4414,7 @@ def main() -> int:
                 actor, validation_envs, steps=args.closed_loop_steps, device=device,
             )
             spawn_closed_loop = _validate_closed_loop(
-                actor, spawn_validation_envs, steps=1, device=device,
+                actor, spawn_validation_envs, steps=spawn_probe_steps, device=device,
             )
             closed_loop.setdefault("closed_loop_by_curriculum", {}).update(
                 spawn_closed_loop.get("closed_loop_by_curriculum", {})
@@ -5296,10 +4431,14 @@ def main() -> int:
             total_delivered=total_delivered, total_built=total_built,
             total_claims=total_claims, max_creeps=max_creeps,
             teacher_by_curriculum=teacher_by_curriculum,
+            teacher_spawn_bodies=teacher_spawn_bodies,
             validation=validation, closed_loop=closed_loop,
         )
         result["meta"].update(validation)
         result["meta"].update(closed_loop)
+        result["meta"].update(_teacher_spawn_coverage(teacher_by_curriculum))
+        result["meta"]["teacher_spawn_bodies"] = teacher_spawn_bodies
+        result["meta"]["spawn_probe_steps"] = spawn_probe_steps
         result["meta"]["qualified"] = not failures
         result["meta"]["qualification_failures"] = failures
         atomic_torch_save(result, args.save)

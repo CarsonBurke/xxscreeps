@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from samples.rl.agent import teacher_snapshots as ts
+from samples.rl.agent.constants import SCHEMA
 from samples.rl.agent.env_client import ScreepsEnv as RealScreepsEnv
 from samples.rl.agent.state_reservoir import (
     LANE_TEACHER, OUTCOME_TEACHER, ReservoirConfig, StartStateReservoir,
@@ -165,6 +166,22 @@ def plan_info(env: FakeEnv, step: int) -> dict:
     return {}
 
 
+def configured_teacher_dir(tmp_path: Path) -> Path:
+    """A teacher bundle whose room radii match the observation ABI.
+
+    Collection refuses a teacher that outgrows the room slots, so a TI config
+    needs readable bundle constants rather than a bare path.
+    """
+    directory = tmp_path / "ti-dist"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "main.js").write_text("".join(
+        f"const {name} = {int(value)};\n"
+        for name, value in SCHEMA["teacher"].items()
+        if not name.startswith("_")
+    ))
+    return directory
+
+
 def make_config(tmp_path: Path, **overrides) -> ts.CollectorConfig:
     settings = dict(
         teacher="scripted",
@@ -301,7 +318,8 @@ def test_concurrent_offers_respect_the_shared_cap():
 def test_ti_collects_as_expert_and_verifies_as_learner(tmp_path, monkeypatch):
     envs = install_env(monkeypatch, info_for=plan_info)
     config = make_config(
-        tmp_path, teacher="ti", curricula=("alpha",), bot_dir=str(tmp_path / "ti-dist"),
+        tmp_path, teacher="ti", curricula=("alpha",),
+        bot_dir=str(configured_teacher_dir(tmp_path)),
     )
     result = ts.collect(config)
 
@@ -319,6 +337,25 @@ def test_ti_collects_as_expert_and_verifies_as_learner(tmp_path, monkeypatch):
     # One curriculum on two envs: the stratum cap is shared, not doubled.
     assert len(result.records) == 4
     assert result.histogram("event") == {"periodic": 2, "pre_spawn": 2}
+
+
+def test_ti_collection_refuses_a_teacher_wider_than_the_room_slots(tmp_path, monkeypatch):
+    """A teacher whose colony outgrows the observation cannot label states."""
+    install_env(monkeypatch, info_for=plan_info)
+    directory = configured_teacher_dir(tmp_path)
+    (directory / "main.js").write_text("".join(
+        f"const {name} = {int(value) + 4};\n"
+        for name, value in SCHEMA["teacher"].items()
+        if name == "maxScoutRoomDistance"
+    ) + "".join(
+        f"const {name} = {int(value)};\n"
+        for name, value in SCHEMA["teacher"].items()
+        if not name.startswith("_") and name != "maxScoutRoomDistance"
+    ))
+    with pytest.raises(ts.CollectorError, match="room slots"):
+        make_config(
+            tmp_path, teacher="ti", curricula=("alpha",), bot_dir=str(directory),
+        )
 
 
 def test_collect_writes_expected_manifest(tmp_path, monkeypatch):

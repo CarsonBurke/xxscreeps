@@ -61,6 +61,7 @@ def refresh_spawn_contracts(
         contract_metrics,
         node=node if node is not None else meta.get("node"),
         room=str(meta["room"]),
+        bot_dir=str(meta["ti_bot_dir"]),
         seed=int(meta["seed"]),
     )
     if len(contracts) != contract_count or set(contract_metrics) != set(SPAWN_CURRICULA):

@@ -2,11 +2,13 @@
 
 The expert can submit several engine intents for one creep in a tick, while the
 current policy has one macro slot.  This module never guesses: it emits a full
-label only when the submitted command is exactly representable, and preserves a
-raw spawn body when extra spawn arguments are outside the policy ABI. Downstream
-training always uses its exact counts and uses its order only when the sequence
-is representable as contiguous type blocks. Everything else carries an explicit rejection
-reason and remains useful for critic/representation training.
+label only when the submitted command's type is exactly one of our macro
+actions, which includes a spawn, because the arguments a spawn carries beyond
+its body are executor or engine concerns and not action factors here.  A spawn
+body is preserved raw: downstream training always uses its exact counts and uses
+its order only when the sequence is representable as contiguous type blocks.
+Everything else carries an explicit rejection reason and remains useful for
+critic/representation training.
 """
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .constants import (
+    AMOUNT_BINS,
     BODY_PART_TYPES,
     CONSTRUCTION_TYPES,
     INTENT_TYPES,
@@ -28,15 +31,40 @@ _DIRECT_TARGET_INTENTS = {
     "reserveController", "attackController", "dismantle",
 }
 
+# Logistics carry an amount. The executor reads amount bin 0 as "everything
+# available" (`legalAmount` returns the full capacity for a non-positive
+# request), so an expert command that omits the amount is exactly representable
+# rather than a guess. An explicit amount is representable only when it lands on
+# a bin value; anything else would silently change how much moves.
+_AMOUNT_TARGET_INTENTS = {"transfer", "withdraw"}
+_ENERGY_RESOURCE = "energy"
+_EVERYTHING_BIN = 0
+
+
+def _amount_bin(amount: Any) -> int | None:
+    """Bin index for an expert amount, or None when it is not representable."""
+    if amount is None:
+        return _EVERYTHING_BIN
+    if isinstance(amount, bool) or not isinstance(amount, int):
+        return None
+    if amount <= 0:
+        return None
+    return AMOUNT_BINS.index(amount) if amount in AMOUNT_BINS else None
+
 
 @dataclass(frozen=True)
 class TiLabel:
     actor_index: int | None
     intent: str | None
     target_index: int | None = None
+    # The candidate list is rebuilt every tick, so an index is only meaningful
+    # for the tick it came from. Retro-labelling an earlier tick needs the
+    # object identity to re-resolve against that tick's candidates.
+    target_id: str | None = None
     direction: int | None = None
     construction_type: int | None = None
     construction_tile: int | None = None
+    amount_index: int | None = None
     body_parts: tuple[int, ...] | None = None
     full_action: bool = False
     rejection: str | None = None
@@ -130,11 +158,15 @@ def translate_ti_intents(
                 except ValueError:
                     labels.append(TiLabel(ai, None, rejection="unsupported_body_part"))
                     continue
-                # TI supplies energy structure order and spawn directions that
-                # our ABI does not expose. Preserve the raw body so downstream
-                # code can supervise exact counts and only a representable block
-                # order; the complete spawn command is deliberately not exact.
-                labels.append(TiLabel(ai, "spawnCreep", body_parts=tokens, full_action=False))
+                # The type choice is exact: TI's `spawn` IS our `spawnCreep`
+                # macro action.  Its remaining arguments -- creep name, spawn
+                # direction, dry run, and the energy-structure order to drain --
+                # are executor and engine concerns rather than action factors of
+                # this ABI, so withholding the type would claim we do not know
+                # what the expert did, which is false.  The body itself is
+                # supervised separately through exact counts plus, when the raw
+                # sequence is contiguous type blocks, its order.
+                labels.append(TiLabel(ai, "spawnCreep", body_parts=tokens, full_action=True))
                 continue
             if intent == "move":
                 direction = args[0] if args else None
@@ -150,10 +182,31 @@ def translate_ti_intents(
                 elif intent not in INTENT_TYPES:
                     labels.append(TiLabel(ai, None, rejection="unsupported_intent"))
                 else:
-                    labels.append(TiLabel(ai, intent, target_index=ti, full_action=True))
+                    labels.append(TiLabel(
+                        ai, intent, target_index=ti, target_id=str(args[0]),
+                        full_action=True,
+                    ))
                 continue
-            # Amount-bearing logistics require an exact amount-bin and resource
-            # semantic proof; add them only with that pre-state contract.
+            if intent in _AMOUNT_TARGET_INTENTS:
+                ti = target_index.get(str(args[0])) if args else None
+                resource = args[1] if len(args) > 1 else None
+                bin_index = _amount_bin(args[2] if len(args) > 2 else None)
+                if ti is None:
+                    labels.append(TiLabel(ai, None, rejection="target_truncated"))
+                elif resource != _ENERGY_RESOURCE:
+                    labels.append(
+                        TiLabel(ai, None, rejection=f"unsupported_resource:{resource}"),
+                    )
+                elif bin_index is None:
+                    labels.append(
+                        TiLabel(ai, None, rejection=f"unrepresentable_amount:{intent}"),
+                    )
+                else:
+                    labels.append(TiLabel(
+                        ai, intent, target_index=ti, target_id=str(args[0]),
+                        amount_index=bin_index, full_action=True,
+                    ))
+                continue
             labels.append(TiLabel(ai, None, rejection=f"unsupported:{intent}"))
     return labels
 
