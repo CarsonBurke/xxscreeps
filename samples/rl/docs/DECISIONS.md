@@ -39,6 +39,14 @@ from 36 structure actors, balances 128 targets, carries room coordinates, and
 reports overflow. Capacity is still a tested contract, not proof that a
 scenario fits.
 
+The creep cap is a control limit, not only an observation limit. One action is
+issued per admitted actor slot, so a creep with no slot receives no intent and
+idles for that tick. A colony larger than `maxCreepActors` is therefore not
+merely partially observed, it is partially uncontrolled, and its idle creeps
+still consume the energy that built them. That makes the cap a bound on the
+largest economy any policy in this ABI can run, which is why cap sizing is a
+design decision measured against teacher colony size rather than a tuning knob.
+
 ## Representation
 
 ### Entity state is primary
@@ -146,6 +154,16 @@ intents are executed inside the engine rather than through our action path. The
 corpus gate that required them to be zero was therefore vacuous and was replaced
 by the liveness gate. Those counters remain in the scorecard as readings of the
 learner path, which is empty during teacher collection.
+
+Silence has a second cause with the same symptom, and separating them needs the
+world, not the bot's log. A healthy `seed_full` world lost its spawn at tick
+6,997 to an NPC invasion: 13 creeps then idled with full sources and no way to
+rebuild a 15,000-progress spawn, the teacher issued no intent for 31 ticks, and
+collection failed at tick 7,200 of 20,000 after 25 minutes. Nothing in the bot's
+console showed it. `TiLivenessGate` therefore records the trailing world states
+(`spawns`, `creeps`, `storedEnergy`, `rclMax`, `controlProgress`) and prints them
+with the failure, and `spawns` is carried in the observation metadata for exactly
+this purpose. A stall that reports `spawns=0` is a dead colony, not a broken bot.
 
 ### The teacher is configured to the observation, and collection asserts it
 
@@ -341,6 +359,17 @@ live trajectory.
   persisted global control level is reseeded on every boot, which is only safe
   because 20,000 ticks cannot fund a third room. Restoring a teacher state *as* a
   teacher, or raising the room capacity, would require capturing both.
+- NPC invasion waves are disabled in the RL environment (`game.invaders: false`,
+  re-enabled per process with `RL_INVADERS=1`). An invasion is scheduled by a
+  room's cumulative harvest against `INVADERS_ENERGY_GOAL`, so every productive
+  20,000-tick episode meets one in its second half, and this ABI supervises no
+  defense: the teacher does not build a tower at RCL3, and the measured outcome
+  was spawn loss and terminal colony decay in one of sixteen worlds. Keeping the
+  wave would inject a large unattributable negative tail into the value function
+  and fill the late-game corpus with a collapsing colony - the opposite of the
+  remoting and claiming behaviour the corpus exists to preserve. Defense enters
+  scope with tower actions, defender bodies, and a defense-aware teacher, and
+  invasions return with it.
 
 ## Current experimental evidence
 

@@ -261,6 +261,58 @@ Wait for successful collection and inspect the printed immutable content path.
 Then submit training as a second explicit stage; do not guess or automatically
 select a directory when multiple corpora exist.
 
+### Collection host budget
+
+Collection is the heaviest thing in this repository and it shares the machine.
+Submit it through `mlq` as above - never as a bare process, a `nohup`, or a
+supervised background job - because `mlq` is what serializes it against other
+local ML work. Measured on a 24-thread host at `--num-envs 16 --steps 20000`
+with `--temporal-replay-per-stratum 16`:
+
+| Quantity | Measured |
+|---|---|
+| collector peak RSS | ~9 GiB |
+| collector peak VSZ | ~26.5 GiB |
+| environment servers | 16 Node processes, ~650% CPU with the collector |
+| package CPU temperature | 93 °C, i.e. thermally unacceptable unpinned |
+| wall time | ~30 min per lifecycle split |
+
+All of it scales about linearly in `--num-envs`, so pin and de-prioritize the
+tree rather than trusting it to be polite:
+
+```bash
+mlq submit --name screeps-pretrain-corpus --priority 10 \
+  --max-parallel-runs 1 --cwd "$PWD" -- \
+  taskset -c 0-5 nice -n 19 python3 -m samples.rl.agent.pretrain_corpus …
+```
+
+Four rules come from failures, not caution:
+
+1. **Never bound it with `ulimit -Sv`.** The soft-limit advice above is for the
+   small CPU-only contract processes. A torch collector maps ~26.5 GiB of
+   address space at ~9 GiB resident, so a 24-30 GB soft cap kills it mid-split
+   with `DefaultCPUAllocator: can't allocate memory` while resident use is a
+   third of the host. Three collections died this way before the cap was
+   recognized as the cause. Bound *resident* memory with a cgroup
+   (`systemd-run --scope -p MemoryMax=…`) if a bound is needed at all.
+2. **`--num-envs` has a floor equal to the number of curriculum stages.**
+   `CorpusConfig.env_map` assigns stage `index % len(curricula)` per
+   environment, so five stages need at least five environments. Fewer silently
+   drops the tail stages, and a corpus without `seed_outpost` fails
+   `_validate_outpost_teacher_readiness` only after the whole collection is
+   done. Five environments is the cheapest legal collection.
+3. **Completed splits spill to disk.** `main` creates a `.spill-*` directory
+   beside `--output` on real storage - never `/tmp`, which is tmpfs here and
+   would charge the spill back to host memory - so peak memory tracks the
+   largest split instead of their sum. `SIGTERM` skips the cleanup, so a killed
+   collection leaves several GiB there to remove by hand. Spilled splits are
+   hash-identical to resident ones, so a corpus content address never depends on
+   host memory pressure.
+4. **Make the collection the preferred OOM victim on a shared host**
+   (`echo 900 > /proc/<pid>/oom_score_adj`, and 800 for the environment
+   servers). Losing a collection is cheap; losing a co-resident job that has
+   been running for hours is not.
+
 If only the six one-step spawn scenarios change without an observation/action
 ABI or long-lifecycle teacher change, derive a new immutable corpus rather than
 recollecting every teacher lifecycle and both TI streams:
@@ -493,19 +545,29 @@ Measured: 464 records, none dropped by restore verification, 1.92 MB, phases
 `replacement_due=103` and `remote_loaded_home=61`, and zero overflow rejections.
 
 The International, the label teacher, is a second and optional set. It plays
-well enough to outgrow the observation capacity, so it covers only the opening
-of the economy. Collect it with at most two concurrent environments:
+well enough to outgrow the observation capacity, so it covers the opening and
+middle of the economy only. `--num-envs` must be at least the number of
+curriculum stages - the collector fails closed with `cannot cover N curricula`
+rather than silently dropping the tail - so one environment per stage is both
+the floor and the cheapest legal run:
 
 ```bash
-python3 -m samples.rl.agent.teacher_snapshots \
-  --teacher ti --num-envs 2 --steps 6000 \
-  --curriculum empty,seed_outpost --seed 201 \
-  --per-stratum 8 --min-gap 64 \
-  --output samples/rl/runs/teacher-start-states
+mlq submit --name screeps-ti-start-states --max-parallel-runs 1 --cwd "$PWD" -- \
+  python3 -m samples.rl.agent.teacher_snapshots \
+    --teacher ti --num-envs 5 --steps 20000 \
+    --curriculum empty,seed_creep,seed_full,seed_claimer,seed_outpost \
+    --seed 201 --per-stratum 8 --min-gap 64 \
+    --output samples/rl/runs/teacher-start-states
 ```
 
-Measured: 22 records, phases `early=21 mid=1`, with 10,466 of 12,000 candidate
-ticks rejected because the world had already outgrown the observation capacity.
+Measured: 182 records, none dropped by restore verification, 1.75 MB, in about
+seven minutes of wall time. Phases `early=94 mid=82 late=6 endgame=0`, events
+`remote_at_source=79 remote_loaded_home=31 pre_claim=18 remote_outbound=14
+periodic=29 pre_spawn=6 replacement_due=5`, and **no admitted state past tick
+10,305**: 84,478 candidate ticks were rejected because the world had outgrown
+the observation capacity, against 9,850 for the minimum gap. So this set covers
+the remote cycle, the pre-claim decision, and replacement timing, but the phase
+the horizon actually ends in has no International bridge at all.
 Both limits are recorded in [`ROADMAP.md`](./ROADMAP.md#immediate-learning-blockers).
 
 The collector prints one content-addressed directory holding `manifest.json`

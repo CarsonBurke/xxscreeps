@@ -110,6 +110,30 @@ Before another substantial PPO continuation:
    `droppedCreepOnlyRooms`, and `hiddenCreepActors` distinguish data loss from
    correct budgeting, and `roomOverflow` fires only when a room with stake is
    dropped.
+
+   The cap decision now also gates start-state coverage, which is new
+   information: a bridge snapshot is admitted only if the restored state is
+   fully representable, so the caps decide how late a teacher state can be
+   captured at all. A five-env, 20,000-tick teacher collection kept 182 states
+   and **none past tick 10,305**: 94 `early`, 82 `mid`, 6 `late`, and an empty
+   `endgame` stratum, so the phase the horizon ends in has no teacher bridge at
+   all. Per-tick cap instrumentation over the
+   same five episodes puts 88.1% of teacher ticks over at least one cap, with
+   medians and maxima of 56-96/133 live creeps (64 slots), 90-205/237 candidate
+   targets (128 slots), and 4-5/6 visible rooms (4 slots). Covering the full
+   lifecycle therefore needs `maxCreepActors` 136, `maxTargets` 256, and
+   `maxRooms` 6, and `maxStructureActors` 36 is unused headroom - spawns plus
+   towers account for 2-6 actors at these levels - so it can pay for creep
+   slots. Until that is decided, the teacher bridge supplies mid-game states
+   only, and the late-window retention the reservoir exists to provide has to
+   come from policy snapshots.
+
+   Creep-slot admission is also arbitrary today: `encode.mjs` admits creeps in
+   lexicographic name order and stops at the cap, so which of the player's own
+   creeps become uncommandable is a name lottery rather than a relevance
+   ranking. Stake-ranked room slots already do this correctly; creep slots do
+   not. Fix the ordering in the same change as the cap decision, because both
+   alter the observation ABI and each one alone forces a re-collection.
 2. **Economic composition.** Prevent excess generalist/harvester production,
    ensure enough haulers recover dropped energy, and spawn/assign creeps for
    remote work. Record body-composition deficits, source utilization, ground energy, sink
@@ -208,6 +232,13 @@ The reservoir is established as necessary, not sufficient.
    segments start with cold caches by design, so every segment boundary pushes
    work back into the pathfinder; without these counters a start-state schedule
    can pay for its coverage in wall time invisibly.
+4. **Lane-mixed reward normalization.** One running RMS normalizes rewards
+   across every lane, and a restored mature colony earns far more per tick than
+   an empty room, so the shared scale is set mostly by late states and shrinks
+   early-game advantages. That may be harmless or even desirable for retention,
+   but it is unmeasured: log per-lane reward mean/RMS and per-lane advantage
+   magnitude, and only then decide between the shared normalizer, a per-lane
+   normalizer, and leaving advantage scale to the critic.
 
 ## Joint-policy ratio ablation
 
