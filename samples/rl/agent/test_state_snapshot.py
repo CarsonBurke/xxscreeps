@@ -192,6 +192,50 @@ class StateSnapshotEngineTest(unittest.TestCase):
             finally:
                 target.close()
 
+    def test_teacher_state_replays_identically_in_a_learner_session(self) -> None:
+        """A bridge-lane start must be reproducible even though the teacher is not.
+
+        The teacher's own decisions vary between identical runs, so a corpus of
+        teacher trajectories is a sample rather than a replay. The reservoir does
+        not inherit that: what it stores is a world, and a stored world reopened
+        without expert code must continue identically every time. If this fails,
+        bridge starts are unusable for matched comparisons.
+        """
+        with patch.dict(os.environ, {"RL_OBS_FMT": "bin"}), tempfile.TemporaryDirectory() as work:
+            path = str(Path(work) / "teacher.xsnp")
+            teacher = ScreepsEnv(
+                max_episode=20000, curriculum="seed_outpost", lean_meta=True,
+                seed=77, expert=True,
+            )
+            try:
+                teacher.reset()
+                for _ in range(300):
+                    teacher.step()
+                descriptor = teacher.snapshot(path, events=["periodic"])
+                self.assertGreater(descriptor["bytes"], 0)
+            finally:
+                teacher.close()
+
+            traces = []
+            for _ in range(2):
+                learner = ScreepsEnv(
+                    max_episode=20000, curriculum="empty", lean_meta=True, seed=5,
+                )
+                try:
+                    learner.reset()
+                    learner.restore(path)
+                    self.assertTrue(learner.last_info["restored"])
+                    self.assertFalse(learner.expert)
+                    trace = []
+                    for _ in range(60):
+                        obs, reward, _, _, _ = learner.step_scripted()
+                        trace.append((_obs_digest(obs), round(float(reward), 6)))
+                    traces.append(trace)
+                finally:
+                    learner.close()
+
+        self.assertEqual(traces[0], traces[1])
+
     def test_event_tags_cover_the_stratification_contract(self) -> None:
         """The environment must emit pre-decision tags, not only outcomes."""
         with patch.dict(os.environ, {"RL_OBS_FMT": "bin"}):

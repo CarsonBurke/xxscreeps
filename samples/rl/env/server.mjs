@@ -51,6 +51,20 @@ config.database.lock = null;
 if (!config.runner.sandbox) {
 	config.runner.sandbox = 'isolated';
 }
+// The expert bot runs in its own sandbox realm, so the scenario stream installed
+// below cannot reach it. Without a seeded generator inside that realm a fixed bot
+// on a fixed world diverges between runs, which makes a teacher corpus
+// unreproducible and a matched comparison meaningless.
+config.runner.randomSeed = Number(process.env.RL_SEED || 0) >>> 0;
+config.runner.deterministicCpu = true;
+// NPC invasion waves are scheduled by a room's cumulative harvest, so every
+// productive 20k-tick episode meets one in its second half. This ABI supervises
+// no defense: the invasion took the teacher's spawn at tick 6,997 of a healthy
+// seed_full world and left 13 creeps idling with no way to rebuild, which fails
+// collection as a stalled teacher. Economy runs are invasion-free; RL_INVADERS=1
+// restores stock engine behavior for defense work.
+const INVADERS = process.env.RL_INVADERS === '1';
+config.game.invaders = INVADERS;
 
 const USER = '100';
 const ROOM = process.env.RL_ROOM || 'W7N3';
@@ -118,7 +132,12 @@ function scenarioRandomSeed(seed) {
 }
 
 let scenarioRandomState = scenarioRandomSeed(SCENARIO_SEED);
+
+// A divergent draw count is the cheapest observable symptom of environment
+// nondeterminism: identical replicas must consume this stream identically.
+let scenarioRandomDraws = 0;
 Math.random = () => {
+	++scenarioRandomDraws;
 	scenarioRandomState ^= scenarioRandomState << 13;
 	scenarioRandomState ^= scenarioRandomState >>> 17;
 	scenarioRandomState ^= scenarioRandomState << 5;
@@ -1103,13 +1122,19 @@ function collectEconomyTelemetry(Game, observation, intentResults = null) {
 			buildProgressThisTick: 0, byType: {},
 		},
 		controller: { rclMax: 0, progress: 0, progressTotal: 0 },
+		// NPC invasions are generated from cumulative harvest, so a productive
+		// episode meets an adversary. Losing a spawn ends the economy, and that
+		// loss is invisible in sinks/sources: record it explicitly.
+		hostility: { hostileCreeps: 0, attackDamage: 0, destroyed: {} },
 	};
 
 	for (const room of Object.values(Game.rooms)) {
 		const events = room.getEventLog();
 		const harvestedBySource = {};
+		const destroyed = {};
 		let buildProgressThisTick = 0;
 		let completedThisTick = 0;
+		let attackDamage = 0;
 		for (const event of events) {
 			const amount = Number(event.data?.amount ?? event.amount ?? 0);
 			if (event.event === C.EVENT_HARVEST) {
@@ -1119,6 +1144,12 @@ function collectEconomyTelemetry(Game, observation, intentResults = null) {
 			if (event.event === C.EVENT_BUILD) {
 				buildProgressThisTick += amount;
 				if ((event.incomplete ?? event.data?.incomplete) === false) completedThisTick += 1;
+			}
+			if (event.event === C.EVENT_ATTACK) {
+				attackDamage += Number(event.data?.damage ?? event.damage ?? 0);
+			}
+			if (event.event === C.EVENT_OBJECT_DESTROYED) {
+				addCount(destroyed, String(event.data?.type ?? event.type ?? 'unknown'));
 			}
 		}
 
@@ -1283,6 +1314,11 @@ function collectEconomyTelemetry(Game, observation, intentResults = null) {
 			buildProgressThisTick,
 			byType: constructionByType,
 		};
+		const hostility = {
+			hostileCreeps: room.find(C.FIND_HOSTILE_CREEPS).length,
+			attackDamage,
+			destroyed,
+		};
 		rooms[room.name] = {
 			isHome,
 			owned,
@@ -1300,6 +1336,7 @@ function collectEconomyTelemetry(Game, observation, intentResults = null) {
 			sources,
 			sinks,
 			construction,
+			hostility,
 		};
 
 		if (owned) totals.ownedRooms += 1;
@@ -1316,6 +1353,11 @@ function collectEconomyTelemetry(Game, observation, intentResults = null) {
 		totals.creeps.spawning += spawningCreeps;
 		totals.creeps.productive += productiveCreeps;
 		totals.creeps.carriedEnergy += carriedEnergy;
+		totals.hostility.hostileCreeps += hostility.hostileCreeps;
+		totals.hostility.attackDamage += attackDamage;
+		for (const [ type, count ] of Object.entries(destroyed)) {
+			addCount(totals.hostility.destroyed, type, count);
+		}
 		if (managedEconomy) {
 			totals.droppedEnergy += droppedEnergy;
 			for (const key of [ 'count', 'remaining', 'capacity', 'harvestedThisTick',
@@ -1939,6 +1981,12 @@ async function stepExpert() {
 		session.shard.scratch.sMembers(userToIntentRoomsSetKey(USER)),
 		session.shard.scratch.sMembers(userToVisibleRoomsSetKey(USER)),
 	]);
+	// Set membership order follows insertion, and insertion order follows the
+	// completion order of concurrent room writes. A bot that iterates its rooms
+	// inherits that order, so an unsorted set makes a fixed bot replay a
+	// different game. Sorting costs nothing at four rooms.
+	ir.sort();
+	vr.sort();
 	capturedExpertIntents = null;
 	await session.instance.run(time, vr, ir);
 	const expertIntents = capturedExpertIntents;
@@ -1968,6 +2016,11 @@ async function stepExpert() {
 			expertActorMeta: CAPTURE_EXPERT_INTENTS ? expertPreMeta?.actorMeta : undefined,
 			expertTargetMeta: CAPTURE_EXPERT_INTENTS ? expertPreMeta?.targetMeta : undefined,
 			expertRoomNames: CAPTURE_EXPERT_INTENTS ? expertPreMeta?.roomNames : undefined,
+			// Identical replicas must consume the shared scenario stream identically.
+			// A divergent draw count is the earliest observable symptom of engine
+			// nondeterminism, well before the world visibly differs.
+			expertRandomDraws: scenarioRandomDraws,
+			expertRandomState: scenarioRandomState,
 			...extras,
 		},
 	};
@@ -2285,5 +2338,5 @@ if (CMD_FMT === 'json') {
 console.error(
 	`[rl-env] ready room=${ROOM} maxEpisode=${MAX_EPISODE} headful=${HEADFUL} ` +
 	`tickMs=${HEADFUL_TICK_MS} cmdFmt=${CMD_FMT} obsFmt=${OBS_FMT} ` +
-	`expertDefault=${DEFAULT_EXPERT_BOT}`,
+	`invaders=${INVADERS} expertDefault=${DEFAULT_EXPERT_BOT}`,
 );
