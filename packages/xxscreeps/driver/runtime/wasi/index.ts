@@ -51,6 +51,46 @@ function writeASCII(buffer: Uint8Array, offset: number, value: string) {
 	return offset + length + 1;
 }
 
+/**
+ * Virtual clock for the player realm's WASM, or `undefined` for host time.
+ *
+ * A reproducible run virtualizes `Date.now`, `Game.cpu`, and `Math.random`, but
+ * a bot's WASM reads time through WASI instead, and `process.hrtime` /
+ * `process.cpuUsage` are host time. Rust planners budget their work by elapsed
+ * time, so on a loaded host each replica of one deterministic world plans a
+ * different amount and the runs diverge - silently, because nothing errors.
+ *
+ * Each reading advances the timeline by a fixed step, exactly as virtual CPU
+ * accounting does: a bot that loops until its budget elapses must still
+ * terminate, and it must terminate after the same number of iterations.
+ */
+let virtualWasiNanos: bigint | undefined;
+let virtualWasiBase: (() => bigint) | undefined;
+const VIRTUAL_WASI_STEP = 50_000n;
+
+export function installDeterministicWasiClock(base: () => bigint) {
+	virtualWasiBase = base;
+	virtualWasiNanos = base();
+}
+
+function virtualWasiTime() {
+	const base = virtualWasiBase!();
+	const stepped = virtualWasiNanos! + VIRTUAL_WASI_STEP;
+	virtualWasiNanos = base > stepped ? base : stepped;
+	return virtualWasiNanos;
+}
+
+function hostWasiTime(clockId: number) {
+	switch (clockId) {
+		case C.realtime: return BigInt(Date.now()) * 1000000n;
+		case C.monotonic: return process.hrtime.bigint();
+		default: {
+			const usage = process.cpuUsage();
+			return BigInt(usage.user + usage.system);
+		}
+	}
+}
+
 // Methods which will be imported into WASM must be bound to the instance, since they will lose
 // `this` context. It's also required that they are enumerable, in order to be exported to the
 // module.
@@ -133,17 +173,15 @@ export class WASI {
 		let now: bigint;
 		switch (clockId) {
 			case C.realtime:
-				now = BigInt(Date.now()) * 1000000n;
-				break;
 			case C.monotonic:
-				now = process.hrtime.bigint();
-				break;
 			case C.process_cputime_id:
-			case C.thread_cputime_id: {
-				const usage = process.cpuUsage();
-				now = BigInt(usage.user + usage.system);
+			case C.thread_cputime_id:
+				// One virtual timeline covers all four clocks in a reproducible run:
+				// host time in any of them makes the player's WASM branch on load.
+				now = virtualWasiBase === undefined
+					? hostWasiTime(clockId)
+					: virtualWasiTime();
 				break;
-			}
 			default:
 				return C.inval;
 		}

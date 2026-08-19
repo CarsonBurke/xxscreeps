@@ -17,6 +17,12 @@ export interface InitializationPayload {
 	 * world. Left undefined the sandbox keeps the platform generator.
 	 */
 	randomSeed?: number;
+	/**
+	 * Replace the player realm's wall clock with one that advances a fixed step
+	 * per simulated tick. Bots write real timestamps into memory and branch on
+	 * measured tick length, so host time otherwise leaks into a replay.
+	 */
+	deterministicClock?: boolean;
 }
 
 export interface TickPayload {
@@ -26,6 +32,12 @@ export interface TickPayload {
 		tickLimit: number;
 		/** Report a virtual `getUsed` instead of wall-clock elapsed time. */
 		deterministic?: boolean;
+		/**
+		 * Wall-clock milliseconds after which the sandbox aborts the tick. This is a
+		 * runaway-loop guard; `tickLimit` is the billed budget. Reproducible runs keep
+		 * the two apart so host load cannot decide whether a tick's intents survive.
+		 */
+		wallTimeout?: number;
 	};
 	roomBlobs: Readonly<Uint8Array>[];
 	time: number;

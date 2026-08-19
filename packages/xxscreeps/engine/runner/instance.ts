@@ -49,6 +49,7 @@ export class PlayerInstance {
 
 	private sandbox: Sandbox | undefined;
 	private stale = false;
+	private sandboxGeneration = 0;
 	private readonly channel;
 	private readonly codeChannel;
 	private readonly consoleEval: Exclude<TickPayload['eval'], undefined> = [];
@@ -136,6 +137,13 @@ export class PlayerInstance {
 	}
 
 	async run(this: PlayerInstance, time: number, visibleRooms: string[], intentRooms: string[]) {
+		// Room sets arrive in storage order, which depends on the order concurrent
+		// room finalizers happened to write them. That order decides `Game.rooms`
+		// key order in the player realm, and bots iterate their rooms, so two
+		// identical runs would branch on host scheduling. Sort both sets: the room
+		// names are a handful of short strings and the cost is once per tick.
+		visibleRooms = [ ...visibleRooms ].sort();
+		intentRooms = [ ...intentRooms ].sort();
 		const result = await (async () => {
 			// Dispose the current sandbox if the user has pushed new code
 			const wasStale = this.stale;
@@ -143,13 +151,23 @@ export class PlayerInstance {
 				this.reset();
 			}
 
-			// If there's no sandbox load the required data and initialize
+			// A fresh sandbox loses everything the bot cached in `global`, and bots
+			// rebuild plans from scratch when that cache is empty. Under a
+			// reproducible run that is a behavior change with no record, so say so.
 			if (!this.sandbox) {
+				if (this.sandboxGeneration > 0 && config.runner.deterministicCpu) {
+					console.error(
+						`[reproducible] sandbox restart ${this.sandboxGeneration} for ` +
+						`'${this.username}' at tick ${time}: cached bot state is gone`,
+					);
+				}
+				++this.sandboxGeneration;
 				const payload: InitializationPayload = {
 					userId: this.userId,
 					shardName: this.shard.name,
 					terrainBlob: this.world.terrainBlob,
 					randomSeed: config.runner.randomSeed,
+					deterministicClock: config.runner.deterministicCpu === true,
 				} as never;
 				const [ codeBlob ] = await Promise.all([
 					this.branchName == null ? undefined : Code.loadBlobs(this.shard.db, this.userId, this.branchName),
@@ -158,9 +176,9 @@ export class PlayerInstance {
 				payload.codeBlob = codeBlob;
 				this.sandbox = await createSandbox(this.userId, payload);
 			}
-
 			// Skip the tick if this reset was the player's fault
 			if (wasStale) {
+				console.error(`[tick-skip] '${this.username}' tick ${time}: sandbox was stale`);
 				return;
 			}
 
@@ -175,6 +193,12 @@ export class PlayerInstance {
 						limit: kCPU,
 						tickLimit: Math.min(config.runner.cpu.tickLimit, bucket),
 						deterministic: config.runner.deterministicCpu === true,
+						// The sandbox aborts a tick on wall-clock time. Billing that same
+						// limit makes host load decide whether a tick's intents survive, so
+						// reproducible mode keeps only a runaway-loop guard.
+						wallTimeout: config.runner.deterministicCpu
+							? config.runner.cpu.runawayTimeout
+							: Math.min(config.runner.cpu.tickLimit, bucket),
 					},
 					time,
 				};
@@ -243,6 +267,10 @@ export class PlayerInstance {
 				this.connectors.save(payload),
 			]);
 		} else {
+			console.error(
+				`[tick-drop] '${this.username}' tick ${time}: ` +
+				`${result === undefined ? 'internal error' : result.result}`,
+			);
 			if (result) {
 				// Severe error, user loses a tick
 				this.stale = true;
@@ -268,6 +296,15 @@ export class PlayerInstance {
 						fd: 2,
 						data: `Script timed out${result.stack == null ? '' : `; ${result.stack}`}`,
 					} ])));
+				}
+				// A dropped tick publishes no intents, so the world advances without the
+				// player. That silently rewrites a replay, and only a console channel
+				// records it, so reproducible mode fails instead of continuing.
+				if (config.runner.deterministicCpu) {
+					throw new Error(
+						`reproducible tick ${time} dropped for '${this.username}': ` +
+						`${result.result}${result.result === 'timedOut' && result.stack != null ? `; ${result.stack}` : ''}`,
+					);
 				}
 			}
 			// Publish empty results to move processing along

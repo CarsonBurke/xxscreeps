@@ -234,9 +234,18 @@ export function simulate(rooms: Record<string, (room: Room) => void>) {
 					roomInstances = nextRoomInstances;
 					intentsByRoom.clear();
 
-					// Second phase
-					await Promise.all(Fn.map(contexts.values(), context => context.finalize(false)));
+					// Second phase. Finalizers allocate ids and write shared user state, so
+					// running them concurrently lets host scheduling pick the order those
+					// writes and id draws interleave. A simulated shard must replay, so
+					// finalize in the same room order every run.
+					for (const roomName of [ ...contexts.keys() ].sort()) {
+						await contexts.get(roomName)!.finalize(false);
+					}
+					const extraRooms: string[] = [];
 					for await (const roomName of consumeSet(shard.scratch, finalizeExtraRoomsSetKey(time))) {
+						extraRooms.push(roomName);
+					}
+					for (const roomName of extraRooms.sort()) {
 						const room = roomInstances.get(roomName) ?? await shard.loadRoom(roomName);
 						const context = new RoomProcessor(shard, world, room, time);
 						await context.process(true);

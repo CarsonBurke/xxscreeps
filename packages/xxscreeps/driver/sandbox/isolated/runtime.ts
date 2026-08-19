@@ -37,6 +37,7 @@ class IsolatedCPU implements CPU {
 	// own cost sees the same sequence on every replay. Monotonic by construction,
 	// so a loop waiting for the budget to be consumed still terminates.
 	#virtual = 0;
+	readonly #heapLimit = 256 * 1024 * 1024;
 
 	constructor(data: TickPayload) {
 		this.bucket = data.cpu.bucket;
@@ -46,7 +47,26 @@ class IsolatedCPU implements CPU {
 		this.#deterministic = data.cpu.deterministic ?? false;
 	}
 
-	getHeapStatistics = () => isolate.getHeapStatisticsSync();
+	// Heap occupancy is a function of garbage-collection timing, and player code
+	// divides by these fields, so a reproducible run reports a fixed plausible
+	// heap rather than the real one. Zeros are wrong here: a ratio of zeros is
+	// NaN and silently changes which branch player code takes.
+	getHeapStatistics = () => this.#deterministic
+		? {
+			total_heap_size: 16 * 1024 * 1024,
+			total_heap_size_executable: 1024 * 1024,
+			total_physical_size: 16 * 1024 * 1024,
+			total_available_size: (this.#heapLimit) - 16 * 1024 * 1024,
+			used_heap_size: 8 * 1024 * 1024,
+			heap_size_limit: this.#heapLimit,
+			malloced_memory: 1024 * 1024,
+			peak_malloced_memory: 2 * 1024 * 1024,
+			does_zap_garbage: 0,
+			number_of_native_contexts: 1,
+			number_of_detached_contexts: 0,
+			externally_allocated_size: 0,
+		} as ivm.HeapStatistics
+		: isolate.getHeapStatisticsSync();
 
 	getUsed = () => this.#deterministic
 		? (this.#virtual += 0.05)

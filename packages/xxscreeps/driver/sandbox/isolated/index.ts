@@ -126,7 +126,7 @@ export class IsolatedSandbox implements Sandbox {
 				[ args ], {
 					arguments: { copy: true },
 					result: { copy: true },
-					timeout: args.cpu.tickLimit,
+					timeout: args.cpu.wallTimeout ?? args.cpu.tickLimit,
 				});
 			if (completion.result === 'success') {
 				const totalTime = this.isolate.cpuTime;

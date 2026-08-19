@@ -220,6 +220,14 @@ export interface RunnerCPUConfig {
 	 * @default: 500
 	 */
 	tickLimit?: number;
+
+	/**
+	 * Wall-clock milliseconds before a tick is aborted when `deterministicCpu` is
+	 * set. A reproducible run bills a virtual clock, so this remains only as a
+	 * runaway-loop guard and must sit far above any real tick cost.
+	 * @default 30000
+	 */
+	runawayTimeout?: number;
 }
 
 export interface Config {
@@ -300,6 +308,7 @@ export const defaults = {
 			bucket: 10000,
 			memoryLimit: 256,
 			tickLimit: 500,
+			runawayTimeout: 30000,
 		},
 		migrationTimeout: 50,
 		// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion

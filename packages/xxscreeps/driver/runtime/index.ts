@@ -2,6 +2,7 @@ import type { TickCompletion } from '../sandbox/index.js';
 import type { InitializationPayload, TickPayload, TickResult } from 'xxscreeps/engine/runner/index.js';
 import type { Nullable } from 'xxscreeps/functional/types.js';
 import { inspect } from 'node:util';
+import * as C from 'xxscreeps/game/constants/index.js';
 import * as RoomSchema from 'xxscreeps/engine/db/room.js';
 import * as Code from 'xxscreeps/engine/db/user/code-schema.js';
 import { Fn } from 'xxscreeps/functional/fn.js';
@@ -11,6 +12,7 @@ import { flushGlobals } from 'xxscreeps/game/runtime.js';
 import { detach } from 'xxscreeps/schema/buffer-object.js';
 import { setupConsole } from './console.js';
 import { makeEnvironment } from './module.js';
+import { installDeterministicWasiClock } from './wasi/index.js';
 import { flush, print, resultPrefix } from './print.js';
 
 export type Compiler<Type = any> = {
@@ -98,12 +100,60 @@ function installDeterministicRandom(seed: number) {
 	};
 }
 
+/**
+ * Deterministic wall clock for the player realm.
+ *
+ * `Math.random` and CPU accounting are not the only nondeterministic inputs a
+ * bot reads. Real time enters bot memory and bot decisions - The International
+ * stores `Date.now()` deltas in `Memory.stats`, which changes serialized memory
+ * content between otherwise identical runs - so a reproducible run bills a
+ * virtual clock that advances one second per simulated tick. Both `Date.now`
+ * and bare `new Date()` are covered, because overriding the static alone leaves
+ * the constructor reading host time.
+ */
+const CLOCK_EPOCH = 1_600_000_000_000;
+const CLOCK_TICK_MS = 1000;
+let virtualNow = CLOCK_EPOCH;
+
+function installDeterministicClock() {
+	// A proxy keeps every real `Date` overload, static and prototype intact and
+	// only replaces the three paths that read the host clock. `Date()` called as
+	// a function ignores its arguments and returns a string for the current
+	// time, so it needs its own trap: without one a bot reading `Date()` still
+	// samples host time.
+	globalThis.Date = new Proxy(Date, {
+		apply: target => new target(virtualNow).toString(),
+		construct: (target, args, newTarget) => Reflect.construct(
+			target, args.length === 0 ? [ virtualNow ] : args, newTarget,
+		),
+		get: (target, property, receiver) => property === 'now'
+			? () => virtualNow
+			: Reflect.get(target, property, receiver),
+	});
+	const timing: unknown = Reflect.get(globalThis, 'performance');
+	if (timing !== null && typeof timing === 'object' && 'now' in timing) {
+		Reflect.set(timing, 'now', () => virtualNow - CLOCK_EPOCH);
+		// `timeOrigin` is the absolute base for `now()`; leaving it on host time
+		// makes `timeOrigin + now()` a real timestamp again.
+		Reflect.defineProperty(timing, 'timeOrigin', {
+			configurable: true, enumerable: true, value: CLOCK_EPOCH, writable: false,
+		});
+	}
+	// A bot's WASM reads time through WASI, not `Date`, and Rust planners budget
+	// their work by elapsed time. Leaving that on host time makes the amount of
+	// planning a function of host load.
+	installDeterministicWasiClock(() => BigInt(virtualNow - CLOCK_EPOCH) * 1000000n);
+}
+
 export function initialize(compiler: Compiler, evaluate: Evaluate, data: InitializationPayload) {
 	// Set up environment
 	flushGlobals();
 	setupConsole(print);
 	if (data.randomSeed !== undefined) {
 		installDeterministicRandom(data.randomSeed);
+	}
+	if (data.deterministicClock === true) {
+		installDeterministicClock();
 	}
 
 	// Load terrain
@@ -124,6 +174,7 @@ export function tick(data: TickPayload, player = (fn: () => void) => fn()): Tick
 	try {
 		// Initialize rooms and data about users in those rooms
 		const { time } = data;
+		virtualNow = CLOCK_EPOCH + time * CLOCK_TICK_MS;
 		const rooms = data.roomBlobs.map(blob => {
 			const room = RoomSchema.read(blob);
 			room['#initialize']();
@@ -212,7 +263,21 @@ export function tick(data: TickPayload, player = (fn: () => void) => fn()): Tick
 			}
 		}
 
-		// Write room intents into blobs
+		// Write room intents into blobs. Intents recorded against a room this tick
+		// did not load cannot be published, and the engine would advance the world
+		// without them, so report them rather than dropping them quietly.
+		const loadedRooms: Record<string, true> = {};
+		for (const { name } of rooms) {
+			loadedRooms[name] = true;
+		}
+		for (const roomName of Object.keys(intents.intentsByRoom)) {
+			if (!loadedRooms[roomName]) {
+				console.error(
+					`[dropped-intents] tick ${time}: intents for '${roomName}' cannot be ` +
+					`published; loaded rooms are [${Object.keys(loadedRooms).join(', ')}]`,
+				);
+			}
+		}
 		tickResult.intentPayloads = Fn.pipe(
 			rooms,
 			$$ => Fn.map($$, ({ name }) => {
